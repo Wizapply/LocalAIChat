@@ -1,0 +1,2360 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AI CHAT</title>
+<link rel="icon" type="image/jpeg" href="aiicon.jpg" />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg-primary: #0a0a0f;
+    --bg-secondary: #12121a;
+    --bg-tertiary: #1a1a26;
+    --bg-hover: #22222e;
+    --surface: #1e1e2a;
+    --surface-raised: #252535;
+    --border: #2a2a3a;
+    --border-active: #4a4a6a;
+    --text-primary: #e8e8f0;
+    --text-secondary: #9898b0;
+    --text-muted: #6a6a82;
+    --accent: #34d399;
+    --accent-hover: #5eead4;
+    --accent-dim: rgba(52, 211, 153, 0.12);
+    --accent-glow: rgba(52, 211, 153, 0.25);
+    --green: #4ade80;
+    --green-dim: rgba(74, 222, 128, 0.12);
+    --orange: #fb923c;
+    --orange-dim: rgba(251, 146, 60, 0.12);
+    --red: #f87171;
+    --red-dim: rgba(248, 113, 113, 0.12);
+    --radius: 12px;
+    --radius-sm: 8px;
+    --radius-lg: 16px;
+    --shadow: 0 4px 24px rgba(0,0,0,0.4);
+    --font-sans: 'IBM Plex Sans JP', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--font-sans);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  .app-layout {
+    display: grid;
+    grid-template-columns: 340px minmax(0, 1fr);
+    height: 100vh;
+  }
+
+  /* ── Sidebar ── */
+  .sidebar {
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .sidebar-header {
+    padding: 20px 20px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+
+  .logo-icon {
+    width: 36px; height: 36px;
+    background: url("aiicon.jpg") center/contain no-repeat;
+    border-radius: var(--radius-sm);
+  }
+
+  .logo-text {
+    font-size: 18px; font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+
+  .logo-text span { color: var(--text-muted); font-weight: 400; font-size: 13px; margin-left: 6px; }
+
+  /* ── Settings ── */
+  .settings-group {
+    display: flex; flex-direction: column; gap: 10px;
+  }
+
+  .setting-row {
+    display: flex; flex-direction: column; gap: 4px;
+  }
+
+  .setting-label {
+    font-size: 11px; font-weight: 500; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+
+  .setting-input {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px 12px;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  .setting-input:focus { border-color: var(--accent); }
+
+  select.setting-input {
+    cursor: pointer;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%236a6a82'%3E%3Cpath d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    padding-right: 30px;
+  }
+
+  /* ── Documents Panel ── */
+  .docs-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .docs-header {
+    padding: 12px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .docs-header-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .docs-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    display: flex; align-items: center; gap: 8px;
+  }
+
+  .docs-count {
+    background: var(--accent-dim);
+    color: var(--accent);
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 10px;
+    font-weight: 600;
+  }
+
+  .docs-actions {
+    display: flex;
+    gap: 6px;
+  }
+
+  .upload-btn {
+    background: var(--accent-dim);
+    color: var(--accent);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    padding: 5px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: var(--font-sans);
+    white-space: nowrap;
+  }
+
+  .upload-btn:hover { background: var(--accent-glow); border-color: var(--accent); }
+
+  .docs-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+  }
+
+  .docs-list::-webkit-scrollbar { width: 4px; }
+  .docs-list::-webkit-scrollbar-track { background: transparent; }
+  .docs-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  .doc-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    transition: background 0.15s;
+    cursor: default;
+  }
+
+  .doc-item:hover { background: var(--bg-hover); }
+
+  .doc-info { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+
+  .doc-icon {
+    width: 32px; height: 32px;
+    background: var(--green-dim);
+    color: var(--green);
+    border-radius: var(--radius-sm);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px;
+    flex-shrink: 0;
+  }
+
+  .doc-meta { min-width: 0; }
+
+  .doc-name {
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .doc-stats {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  .doc-remove {
+    background: none; border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 4px;
+    font-size: 16px;
+    line-height: 1;
+    transition: all 0.15s;
+    opacity: 0;
+  }
+
+  .doc-item:hover .doc-remove { opacity: 1; }
+  .doc-remove:hover { color: var(--red); background: var(--red-dim); }
+
+  /* ── Document Loading ── */
+  .doc-item.loading { opacity: 0.85; }
+
+  .doc-icon.loading-icon {
+    background: var(--orange-dim);
+    color: var(--orange);
+    position: relative;
+  }
+
+  .doc-icon.loading-icon::after {
+    content: '';
+    position: absolute;
+    inset: 3px;
+    border: 2px solid transparent;
+    border-top-color: var(--orange);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .doc-progress {
+    margin-top: 6px;
+    height: 3px;
+    background: var(--bg-tertiary);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .doc-progress-bar {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 2px;
+    transition: width 0.3s ease;
+  }
+
+  .doc-progress-text {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: 3px;
+  }
+
+  .drop-zone {
+    margin: 8px;
+    padding: 28px;
+    border: 2px dashed var(--border);
+    border-radius: var(--radius);
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 13px;
+    transition: all 0.2s;
+  }
+
+  .drop-zone.active {
+    border-color: var(--accent);
+    background: var(--accent-dim);
+    color: var(--accent);
+  }
+
+  .drop-zone-icon { font-size: 28px; margin-bottom: 8px; }
+  .drop-zone-sub { font-size: 11px; margin-top: 4px; color: var(--text-muted); }
+
+  /* ── Chat History ── */
+  .chat-history-panel {
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    max-height: 220px;
+    flex-shrink: 0;
+  }
+
+  .chat-history-header {
+    padding: 10px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .chat-history-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .new-chat-btn {
+    background: var(--accent-dim);
+    color: var(--accent);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    padding: 4px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: var(--font-sans);
+    transition: all 0.2s;
+  }
+
+  .new-chat-btn:hover { border-color: var(--accent); background: var(--accent-glow); }
+
+  .chat-history-list {
+    overflow-y: auto;
+    padding: 0 8px 8px;
+    flex: 1;
+  }
+
+  .chat-history-list::-webkit-scrollbar { width: 4px; }
+  .chat-history-list::-webkit-scrollbar-track { background: transparent; }
+  .chat-history-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  .chat-history-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background 0.15s;
+    gap: 8px;
+  }
+
+  .chat-history-item:hover { background: var(--bg-hover); }
+  .chat-history-item.active { background: var(--accent-dim); }
+
+  .chat-history-item-info {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .chat-history-item-title {
+    font-size: 12px;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .chat-history-item-meta {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  .chat-history-item-delete {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px;
+    border-radius: 4px;
+    opacity: 0;
+    transition: all 0.15s;
+    flex-shrink: 0;
+  }
+
+  .chat-history-item:hover .chat-history-item-delete { opacity: 1; }
+  .chat-history-item-delete:hover { color: var(--red); background: var(--red-dim); }
+
+  .chat-history-empty {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-align: center;
+    padding: 12px;
+  }
+
+  /* ── Right Sidebar (GPU) ── */
+  .right-sidebar {
+    position: fixed;
+    top: 0; right: 0; bottom: 0;
+    width: 300px;
+    background: var(--bg-secondary);
+    border-left: 1px solid var(--border);
+    z-index: 100;
+    transform: translateX(100%);
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .right-sidebar.open {
+    transform: translateX(0);
+    box-shadow: -4px 0 32px rgba(0, 0, 0, 0.5);
+  }
+
+  .right-sidebar-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    z-index: 90;
+    backdrop-filter: blur(2px);
+  }
+
+  .right-sidebar-overlay.open {
+    display: block;
+    animation: fadeIn 0.25s ease;
+  }
+
+  .right-sidebar-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+
+  .gpu-panel-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+  }
+
+  .gpu-panel-body::-webkit-scrollbar { width: 4px; }
+  .gpu-panel-body::-webkit-scrollbar-track { background: transparent; }
+  .gpu-panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  /* ── GPU Panel Content ── */
+  .gpu-panel-title {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .gpu-live-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    animation: pulse-dot 2s infinite;
+  }
+
+  .gpu-header-dot {
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    margin-right: 2px;
+    vertical-align: middle;
+  }
+
+  .gpu-btn-active {
+    border-color: var(--accent) !important;
+    color: var(--accent) !important;
+  }
+
+  .gpu-card {
+    margin-bottom: 16px;
+  }
+
+  .gpu-card:last-child { margin-bottom: 0; }
+
+  .gpu-card-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+  }
+
+  .gpu-stats-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .gpu-stat {
+    background: var(--bg-tertiary);
+    border-radius: var(--radius-sm);
+    padding: 8px 12px;
+  }
+
+  .gpu-stat-label {
+    font-size: 9px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .gpu-stat-value {
+    font-size: 16px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    margin-top: 2px;
+  }
+
+  .gpu-stat-value.normal { color: var(--green); }
+  .gpu-stat-value.warn { color: var(--orange); }
+  .gpu-stat-value.hot { color: var(--red); }
+
+  .gpu-vram-bar {
+    height: 4px;
+    background: var(--bg-primary);
+    border-radius: 2px;
+    margin-top: 6px;
+    overflow: hidden;
+  }
+
+  .gpu-vram-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.5s ease;
+  }
+
+  .gpu-offline {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
+    padding: 24px 8px;
+  }
+
+  /* ── Chat Area ── */
+  .chat-area {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    min-width: 0;
+    background: var(--bg-primary);
+  }
+
+  .chat-header {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--bg-secondary);
+    flex-shrink: 0;
+  }
+
+  .chat-header-left {
+    display: flex; align-items: center; gap: 12px;
+  }
+
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--red);
+    transition: background 0.3s;
+  }
+
+  .status-dot.connected { background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+  .chat-header-title { font-size: 14px; font-weight: 500; }
+
+  .clear-btn {
+    background: none; border: 1px solid var(--border);
+    color: var(--text-muted);
+    border-radius: var(--radius-sm);
+    padding: 6px 12px;
+    font-size: 12px;
+    cursor: pointer;
+    font-family: var(--font-sans);
+    transition: all 0.15s;
+  }
+
+  .clear-btn:hover { border-color: var(--red); color: var(--red); }
+
+  /* ── Messages ── */
+  .messages-container {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  .messages-container::-webkit-scrollbar { width: 6px; }
+  .messages-container::-webkit-scrollbar-track { background: transparent; }
+  .messages-container::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  .message {
+    display: flex;
+    gap: 14px;
+    max-width: 820px;
+    min-width: 0;
+    animation: fadeIn 0.3s ease;
+  }
+
+  .msg-content {
+    min-width: 0;
+    flex: 1;
+    overflow-x: hidden;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .message.user { align-self: flex-end; flex-direction: row-reverse; }
+
+  .msg-avatar {
+    width: 34px; height: 34px;
+    border-radius: var(--radius-sm);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; font-weight: 600;
+    flex-shrink: 0;
+  }
+
+  .msg-avatar.assistant-av {
+    background: url("aiicon.jpg") center/contain no-repeat;
+    background-color: #fff;
+    border-radius: var(--radius-sm);
+  }
+
+  .msg-avatar.user-av {
+    background: var(--surface-raised);
+    color: var(--text-secondary);
+  }
+
+  .msg-bubble {
+    padding: 14px 18px;
+    border-radius: var(--radius);
+    font-size: 14px;
+    line-height: 1.7;
+    word-break: break-word;
+    overflow-x: auto;
+    min-width: 0;
+  }
+
+  .msg-bubble.user-bubble {
+    white-space: pre-wrap;
+  }
+
+  /* ── Markdown Styles ── */
+  .msg-bubble h1, .msg-bubble h2, .msg-bubble h3, .msg-bubble h4 {
+    margin: 16px 0 8px;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+
+  .msg-bubble h1:first-child, .msg-bubble h2:first-child,
+  .msg-bubble h3:first-child, .msg-bubble h4:first-child { margin-top: 0; }
+
+  .msg-bubble h1 { font-size: 1.4em; }
+  .msg-bubble h2 { font-size: 1.2em; }
+  .msg-bubble h3 { font-size: 1.05em; }
+
+  .msg-bubble p { margin: 8px 0; }
+  .msg-bubble p:first-child { margin-top: 0; }
+  .msg-bubble p:last-child { margin-bottom: 0; }
+
+  .msg-bubble ul, .msg-bubble ol {
+    margin: 8px 0;
+    padding-left: 24px;
+  }
+
+  .msg-bubble li { margin: 4px 0; }
+  .msg-bubble li > p { margin: 2px 0; }
+
+  .msg-bubble blockquote {
+    border-left: 3px solid var(--accent);
+    margin: 10px 0;
+    padding: 4px 14px;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  }
+
+  .msg-bubble code {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    background: var(--bg-tertiary);
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: var(--accent);
+  }
+
+  .msg-bubble pre {
+    margin: 12px 0;
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    background: #0d1117;
+    border: 1px solid var(--border);
+  }
+
+  .code-block-wrapper {
+    overflow: hidden;
+  }
+
+  .msg-bubble pre code {
+    display: block;
+    padding: 14px 16px;
+    background: none;
+    color: var(--text-primary);
+    font-size: 13px;
+    line-height: 1.6;
+    overflow-x: auto;
+    white-space: pre;
+  }
+
+  .code-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 14px;
+    background: var(--bg-tertiary);
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+  }
+
+  .code-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .copy-btn, .run-btn {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 11px;
+    padding: 2px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: var(--font-sans);
+    transition: all 0.15s;
+  }
+
+  .copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .copy-btn.copied { border-color: var(--green); color: var(--green); }
+
+  .run-btn { border-color: var(--green); color: var(--green); }
+  .run-btn:hover { background: var(--green-dim); }
+  .run-btn.running {
+    opacity: 0.6;
+    cursor: wait;
+  }
+
+  .code-output {
+    border-top: 1px solid var(--border);
+    background: #0d1117;
+  }
+
+  .code-output-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 14px;
+    background: var(--bg-tertiary);
+    border-bottom: 1px solid var(--border);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+  }
+
+  .code-output-header.success { color: var(--green); }
+  .code-output-header.error { color: var(--red); }
+
+  .code-output-header .exit-code {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 400;
+  }
+
+  .code-output-body {
+    padding: 10px 16px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+
+  .code-output-body.stderr { color: var(--red); }
+
+  .terminal-input-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px 10px;
+    background: #0d1117;
+    border-top: 1px dashed var(--border);
+  }
+
+  .terminal-prompt {
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+
+  .terminal-stdin {
+    flex: 1;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    padding: 4px 2px;
+    outline: none;
+  }
+
+  .terminal-stdin:focus { border-bottom-color: var(--accent); }
+
+  .terminal-send-btn {
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: var(--font-sans);
+    transition: all 0.15s;
+    flex-shrink: 0;
+  }
+
+  .terminal-send-btn:hover { background: var(--accent-glow); }
+
+  .terminal-kill-btn {
+    background: var(--red-dim);
+    border: 1px solid var(--red);
+    color: var(--red);
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: var(--font-sans);
+    flex-shrink: 0;
+  }
+
+  .msg-bubble table {
+    border-collapse: collapse;
+    margin: 10px 0;
+    width: 100%;
+    font-size: 13px;
+  }
+
+  .msg-bubble th, .msg-bubble td {
+    border: 1px solid var(--border);
+    padding: 8px 12px;
+    text-align: left;
+  }
+
+  .msg-bubble th {
+    background: var(--bg-tertiary);
+    font-weight: 600;
+  }
+
+  .msg-bubble hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 16px 0;
+  }
+
+  .msg-bubble a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+
+  .msg-bubble a:hover { text-decoration: underline; }
+
+  /* ── Message Actions ── */
+  .msg-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+
+  .message:hover .msg-actions { opacity: 1; }
+
+  .msg-action-btn {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 11px;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-family: var(--font-sans);
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .msg-action-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-dim);
+  }
+
+  .msg-bubble strong { font-weight: 600; }
+  .msg-bubble em { font-style: italic; }
+
+  /* ── LaTeX (KaTeX) ── */
+  .msg-bubble .katex-display {
+    margin: 14px 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 8px 0;
+  }
+
+  .msg-bubble .katex-display > .katex {
+    font-size: 1.1em;
+  }
+
+  .msg-bubble .katex {
+    font-size: 1.05em;
+  }
+
+  .message.assistant .msg-bubble {
+    background: var(--surface);
+    border: 1px solid var(--border);
+  }
+
+  .message.user .msg-bubble {
+    background: var(--accent-dim);
+    border: 1px solid rgba(52, 211, 153, 0.2);
+    color: var(--text-primary);
+  }
+
+  .msg-context {
+    margin-top: 10px;
+    padding: 10px 14px;
+    background: var(--bg-tertiary);
+    border-radius: var(--radius-sm);
+    border-left: 3px solid var(--accent);
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .msg-context-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--accent);
+    margin-bottom: 4px;
+  }
+
+  /* ── Thinking Block ── */
+  .thinking-block {
+    margin-bottom: 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    background: var(--bg-tertiary);
+  }
+
+  .thinking-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 14px;
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 500;
+    font-family: var(--font-sans);
+    cursor: pointer;
+    transition: all 0.15s;
+    text-align: left;
+  }
+
+  .thinking-toggle:hover { color: var(--text-secondary); background: var(--bg-hover); }
+
+  .thinking-toggle-icon {
+    display: inline-block;
+    transition: transform 0.2s;
+    font-size: 10px;
+  }
+
+  .thinking-toggle-icon.open { transform: rotate(90deg); }
+
+  .thinking-label-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--orange);
+    flex-shrink: 0;
+    animation: pulse-dot 2s infinite;
+  }
+
+  .thinking-label-dot.done { animation: none; background: var(--text-muted); }
+
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  .thinking-content {
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+    line-height: 1.7;
+    color: var(--text-muted);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+
+  .thinking-content::-webkit-scrollbar { width: 4px; }
+  .thinking-content::-webkit-scrollbar-track { background: transparent; }
+  .thinking-content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  .thinking-indicator {
+    display: flex; align-items: center; gap: 6px;
+    padding: 14px 18px;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+
+  .thinking-dots span {
+    display: inline-block;
+    width: 6px; height: 6px;
+    background: var(--text-muted);
+    border-radius: 50%;
+    animation: bounce 1.2s infinite;
+  }
+
+  .thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
+  .thinking-dots span:nth-child(3) { animation-delay: 0.3s; }
+
+  @keyframes bounce {
+    0%, 60%, 100% { transform: translateY(0); }
+    30% { transform: translateY(-6px); }
+  }
+
+  .welcome-screen {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    color: var(--text-muted);
+    padding: 40px;
+    text-align: center;
+  }
+
+  .welcome-icon {
+    width: 64px; height: 64px;
+    background: url("aiicon.jpg") center/contain no-repeat;
+    border-radius: var(--radius-lg);
+    box-shadow: 0 8px 32px var(--accent-glow);
+  }
+
+  .welcome-title { font-size: 22px; font-weight: 600; color: var(--text-primary); }
+  .welcome-sub { font-size: 14px; max-width: 440px; line-height: 1.6; }
+
+  .welcome-hints {
+    display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; justify-content: center;
+  }
+
+  .hint-chip {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 8px 16px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .hint-chip:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-dim);
+  }
+
+  /* ── Input Area (Claude-style) ── */
+  .input-area {
+    padding: 12px 24px 20px;
+    background: var(--bg-primary);
+    flex-shrink: 0;
+  }
+
+  .input-card {
+    max-width: 820px;
+    margin: 0 auto;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    transition: border-color 0.2s, box-shadow 0.2s;
+    overflow: hidden;
+  }
+
+  .input-card:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-dim);
+  }
+
+  .input-box {
+    width: 100%;
+    background: transparent;
+    border: none;
+    padding: 16px 20px 8px;
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    outline: none;
+    resize: none;
+    min-height: 56px;
+    max-height: 200px;
+    line-height: 1.6;
+  }
+
+  .input-box::placeholder { color: var(--text-muted); }
+
+  .input-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px 12px;
+  }
+
+  .input-toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .toolbar-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    width: 36px; height: 36px;
+    border-radius: var(--radius-sm);
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    font-size: 18px;
+    transition: all 0.15s;
+  }
+
+  .toolbar-btn:hover { background: var(--bg-hover); color: var(--text-secondary); }
+
+  .send-btn {
+    width: 40px; height: 40px;
+    background: var(--accent);
+    border: none;
+    border-radius: var(--radius);
+    color: #fff;
+    font-size: 18px;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.2s;
+    flex-shrink: 0;
+  }
+
+  .send-btn:hover { background: var(--accent-hover); transform: scale(1.04); }
+  .send-btn:disabled { opacity: 0.3; cursor: not-allowed; transform: none; }
+
+  .stop-btn {
+    width: 40px; height: 40px;
+    background: var(--red);
+    border: none;
+    border-radius: var(--radius);
+    color: #fff;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.2s;
+    flex-shrink: 0;
+  }
+
+  .stop-btn:hover { background: #ef4444; transform: scale(1.04); }
+
+  .stop-icon {
+    width: 14px; height: 14px;
+    background: #fff;
+    border-radius: 2px;
+  }
+
+  .input-hint {
+    text-align: center;
+    padding: 6px 0 0;
+    font-size: 11px;
+    color: var(--text-muted);
+    max-width: 820px;
+    margin: 0 auto;
+  }
+
+  .error-toast {
+    position: fixed;
+    bottom: 80px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--red-dim);
+    border: 1px solid var(--red);
+    color: var(--red);
+    padding: 10px 20px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    z-index: 100;
+    animation: fadeIn 0.3s ease;
+  }
+
+  /* ── Mobile Menu Button ── */
+  .menu-btn {
+    display: none;
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    border-radius: var(--radius-sm);
+    width: 36px; height: 36px;
+    cursor: pointer;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    transition: all 0.15s;
+    flex-shrink: 0;
+  }
+
+  .menu-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  .sidebar-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    z-index: 90;
+    backdrop-filter: blur(4px);
+  }
+
+  /* ── Responsive ── */
+  @media (max-width: 768px) {
+    .app-layout { grid-template-columns: 1fr; }
+    .menu-btn { display: flex; }
+
+    .sidebar {
+      position: fixed;
+      top: 0; left: 0; bottom: 0;
+      width: 320px;
+      z-index: 100;
+      transform: translateX(-100%);
+      transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      box-shadow: none;
+    }
+
+    .sidebar.open {
+      transform: translateX(0);
+      box-shadow: 4px 0 32px rgba(0, 0, 0, 0.5);
+    }
+
+    .sidebar-overlay.open {
+      display: block;
+      animation: fadeIn 0.25s ease;
+    }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback } = React;
+
+// ─── Utility: テキストをチャンクに分割 ───
+function chunkText(text, chunkSize = 500, overlap = 100) {
+  const chunks = [];
+  let start = 0;
+  while (start < text.length) {
+    const end = Math.min(start + chunkSize, text.length);
+    chunks.push(text.slice(start, end));
+    start += chunkSize - overlap;
+  }
+  return chunks;
+}
+
+// ─── Utility: コサイン類似度 ───
+function cosineSim(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-10);
+}
+
+// ─── Marked.js 設定 ───
+marked.setOptions({
+  breaks: true,
+  gfm: true,
+});
+
+// ─── カスタムRenderer: コードブロックにヘッダー追加 ───
+const renderer = new marked.Renderer();
+renderer.code = function(arg1, arg2) {
+  // marked v12+: arg1 = { text, lang } / older: arg1 = code, arg2 = lang
+  const text = (typeof arg1 === 'object' && arg1 !== null) ? (arg1.text || arg1.code || '') : (arg1 || '');
+  const language = (typeof arg1 === 'object' && arg1 !== null) ? (arg1.lang || arg1.language || '') : (arg2 || '');
+  let highlighted;
+  if (language && hljs.getLanguage(language)) {
+    try { highlighted = hljs.highlight(text, { language }).value; } catch { highlighted = text; }
+  } else {
+    try { highlighted = hljs.highlightAuto(text).value; } catch { highlighted = text; }
+  }
+  const id = 'code-' + Math.random().toString(36).slice(2, 9);
+  const isPython = /^py(thon[23]?)?$/.test(language);
+  const runBtnHtml = isPython
+    ? '<button class="run-btn" onclick="runPython(\'' + id + '\', this)">▶ 実行</button>'
+    : '';
+  return '<div class="code-block-wrapper"><div class="code-header"><span>' + (language || 'code') + '</span><div class="code-header-actions">' + runBtnHtml + '<button class="copy-btn" onclick="copyCode(this, \'' + id + '\')">コピー</button></div></div><pre><code id="' + id + '" class="hljs language-' + language + '">' + highlighted + '</code></pre><div id="output-' + id + '"></div></div>';
+};
+marked.use({ renderer });
+
+// ─── コピー関数（グローバル）───
+window.copyCode = function(btn, id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  navigator.clipboard.writeText(el.textContent).then(() => {
+    btn.textContent = 'コピー済';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'コピー'; btn.classList.remove('copied'); }, 2000);
+  });
+};
+
+// ─── Python 実行関数（グローバル）───
+window.runPython = function(codeId, btn) {
+  const codeEl = document.getElementById(codeId);
+  const outputEl = document.getElementById('output-' + codeId);
+  if (!codeEl || !outputEl) return;
+
+  const code = codeEl.textContent;
+  btn.textContent = '⏳ 実行中...';
+  btn.classList.add('running');
+  btn.disabled = true;
+
+  // WebSocket接続
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(protocol + '//' + location.host + '/ws/python');
+  const outputId = 'term-body-' + codeId;
+  const inputId = 'term-input-' + codeId;
+  const inputRowId = 'term-input-row-' + codeId;
+
+  // 初期UI
+  outputEl.innerHTML =
+    '<div class="code-output">' +
+      '<div class="code-output-header" style="color:var(--orange)"><span>⏳ 実行中...</span><button class="terminal-kill-btn" onclick="killPython(\'' + codeId + '\')">■ 停止</button></div>' +
+      '<div class="code-output-body" id="' + outputId + '"></div>' +
+      '<div class="terminal-input-row" id="' + inputRowId + '">' +
+        '<span class="terminal-prompt">›</span>' +
+        '<input class="terminal-stdin" id="' + inputId + '" placeholder="入力してEnter..." />' +
+        '<button class="terminal-send-btn" onclick="sendStdin(\'' + codeId + '\')">送信</button>' +
+      '</div>' +
+    '</div>';
+
+  // stdin入力のEnterキー対応
+  setTimeout(() => {
+    const inp = document.getElementById(inputId);
+    if (inp) {
+      inp.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); sendStdin(codeId); }
+      });
+      inp.focus();
+    }
+  }, 50);
+
+  // WebSocketを要素に紐付け
+  outputEl._ws = ws;
+
+  ws.onopen = function() {
+    ws.send(JSON.stringify({ type: 'run', code: code }));
+  };
+
+  ws.onmessage = function(event) {
+    const msg = JSON.parse(event.data);
+    const body = document.getElementById(outputId);
+    if (!body) return;
+
+    if (msg.type === 'stdout') {
+      body.innerHTML += escapeHtml(msg.data);
+      body.scrollTop = body.scrollHeight;
+    }
+    if (msg.type === 'stderr') {
+      body.innerHTML += '<span style="color:var(--red)">' + escapeHtml(msg.data) + '</span>';
+      body.scrollTop = body.scrollHeight;
+    }
+    if (msg.type === 'exit') {
+      const isError = msg.exitCode !== 0;
+      // ヘッダーを完了に更新
+      const header = outputEl.querySelector('.code-output-header');
+      if (header) {
+        header.className = 'code-output-header ' + (isError ? 'error' : 'success');
+        header.innerHTML = '<span>' + (isError ? '❌ エラー' : '✅ 実行完了') + '</span><span class="exit-code">exit: ' + msg.exitCode + '</span>';
+      }
+      // 入力欄を非表示
+      const inputRow = document.getElementById(inputRowId);
+      if (inputRow) inputRow.style.display = 'none';
+      // ボタン復帰
+      btn.textContent = '▶ 実行';
+      btn.classList.remove('running');
+      btn.disabled = false;
+      ws.close();
+    }
+  };
+
+  ws.onerror = function() {
+    outputEl.innerHTML = '<div class="code-output"><div class="code-output-header error">❌ WebSocket接続エラー</div></div>';
+    btn.textContent = '▶ 実行';
+    btn.classList.remove('running');
+    btn.disabled = false;
+  };
+
+  ws.onclose = function() {
+    outputEl._ws = null;
+  };
+};
+
+// ─── stdin 送信 ───
+window.sendStdin = function(codeId) {
+  const outputEl = document.getElementById('output-' + codeId);
+  const inputEl = document.getElementById('term-input-' + codeId);
+  const bodyEl = document.getElementById('term-body-' + codeId);
+  if (!outputEl || !inputEl || !outputEl._ws) return;
+
+  const value = inputEl.value;
+  inputEl.value = '';
+
+  // 入力をターミナルに表示
+  if (bodyEl) {
+    bodyEl.innerHTML += '<span style="color:var(--accent)">' + escapeHtml(value) + '</span>\n';
+    bodyEl.scrollTop = bodyEl.scrollHeight;
+  }
+
+  outputEl._ws.send(JSON.stringify({ type: 'stdin', data: value }));
+  inputEl.focus();
+};
+
+// ─── プロセス停止 ───
+window.killPython = function(codeId) {
+  const outputEl = document.getElementById('output-' + codeId);
+  if (outputEl && outputEl._ws) {
+    outputEl._ws.send(JSON.stringify({ type: 'kill' }));
+  }
+};
+
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ─── LaTeX レンダリング ───
+function renderLatex(text) {
+  if (!text || typeof katex === 'undefined') return text;
+
+  const placeholders = [];
+  let idx = 0;
+
+  function placeholder(html) {
+    const key = '\x00MATH' + (idx++) + '\x00';
+    placeholders.push({ key, html });
+    return key;
+  }
+
+  function renderKatex(expr, displayMode) {
+    try {
+      return katex.renderToString(expr, { displayMode, throwOnError: false, trust: true });
+    } catch {
+      return '<code>' + escapeHtml(expr) + '</code>';
+    }
+  }
+
+  // コードブロック保護: ```...``` をプレースホルダーに退避
+  const codeBlocks = [];
+  let cbIdx = 0;
+  text = text.replace(/```[\s\S]*?```/g, (m) => {
+    const k = '\x00CODE' + (cbIdx++) + '\x00';
+    codeBlocks.push({ key: k, text: m });
+    return k;
+  });
+
+  // インラインコード保護: `...` をプレースホルダーに退避
+  const inlineCodes = [];
+  let icIdx = 0;
+  text = text.replace(/`[^`\n]+`/g, (m) => {
+    const k = '\x00IC' + (icIdx++) + '\x00';
+    inlineCodes.push({ key: k, text: m });
+    return k;
+  });
+
+  // ブロック数式: $$ ... $$ or \[ ... \]
+  text = text.replace(/\$\$([\s\S]+?)\$\$/g, (_, expr) => placeholder(renderKatex(expr.trim(), true)));
+  text = text.replace(/\\\[([\s\S]+?)\\\]/g, (_, expr) => placeholder(renderKatex(expr.trim(), true)));
+
+  // インライン数式: $ ... $ or \( ... \)（ただし $5 や $10 のような通貨表記は除外）
+  text = text.replace(/(?<!\$)\$(?!\$)(?!\d+\s)(.+?)(?<!\$)\$(?!\$)/g, (_, expr) => placeholder(renderKatex(expr.trim(), false)));
+  text = text.replace(/\\\(([\s\S]+?)\\\)/g, (_, expr) => placeholder(renderKatex(expr.trim(), false)));
+
+  // コードブロック・インラインコードを復元
+  inlineCodes.forEach(({ key, text: t }) => { text = text.replace(key, t); });
+  codeBlocks.forEach(({ key, text: t }) => { text = text.replace(key, t); });
+
+  // Markdown変換
+  let html;
+  try { html = marked.parse(text); } catch { html = text; }
+
+  // 数式プレースホルダーを復元
+  placeholders.forEach(({ key, html: h }) => { html = html.replace(key, h); });
+
+  return html;
+}
+
+// ─── MarkdownContent コンポーネント ───
+function MarkdownContent({ content }) {
+  const ref = useRef(null);
+
+  const html = React.useMemo(() => {
+    if (!content) return '';
+    return renderLatex(content);
+  }, [content]);
+
+  return React.createElement('div', {
+    ref,
+    dangerouslySetInnerHTML: { __html: html },
+  });
+}
+
+// ─── ThinkingBlock: 折りたたみ表示 ───
+function ThinkingBlock({ thinking, isStreaming }) {
+  const [open, setOpen] = useState(false);
+  const contentRef = useRef(null);
+
+  useEffect(() => {
+    if (open && contentRef.current) {
+      contentRef.current.scrollTop = contentRef.current.scrollHeight;
+    }
+  }, [thinking, open]);
+
+  if (!thinking) return null;
+
+  return (
+    <div className="thinking-block">
+      <button className="thinking-toggle" onClick={() => setOpen(!open)}>
+        <span className={`thinking-toggle-icon ${open ? 'open' : ''}`}>▶</span>
+        <span className={`thinking-label-dot ${isStreaming ? '' : 'done'}`} />
+        {isStreaming ? '思考中...' : '思考プロセス'}
+      </button>
+      {open && (
+        <div className="thinking-content" ref={contentRef}>{thinking}</div>
+      )}
+    </div>
+  );
+}
+
+function App() {
+  // ─── アプリ設定 (config.json) ───
+  const [appConfig, setAppConfig] = useState({
+    appName: 'WIZAPPLY AI CHAT',
+    logoMain: 'WIZAPPLY',
+    logoSub: 'AI CHAT',
+    welcomeMessage: 'ドキュメントをアップロードしてRAGベースの質問応答を行うか、自由にチャットを開始できます。',
+    welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
+    accentColor: '#34d399',
+  });
+
+  // ─── Ollama接続先（変更する場合はここを編集）───
+  const [ollamaUrl] = useState('');
+  const [chatModel, setChatModel] = useState('gemma4:31b');
+  const embedModel = 'nomic-embed-text:latest';
+  const [availableModels, setAvailableModels] = useState([]);
+  const [connected, setConnected] = useState(false);
+
+  const [documents, setDocuments] = useState([]); // { name, text, chunks, embeddings }
+  const ragEnabled = true; // RAGはドキュメントがあれば常に有効
+  const [topK, setTopK] = useState(10);
+  const [numCtx, setNumCtx] = useState(32768);
+
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [dragActive, setDragActive] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [embeddingJobs, setEmbeddingJobs] = useState([]); // { name, current, total }
+  const [gpuData, setGpuData] = useState([]);
+  const [gpuPanelOpen, setGpuPanelOpen] = useState(false);
+  const [chatId, setChatId] = useState(() => Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+  const [chatList, setChatList] = useState([]);
+  const [chatTitle, setChatTitle] = useState('');
+  const saveTimerRef = useRef(null);
+
+  const messagesEndRef = useRef(null);
+  const inputRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const abortRef = useRef(null);
+
+  // ─── モデル一覧取得 ───
+  const fetchModels = useCallback(async () => {
+    try {
+      const res = await fetch(`${ollamaUrl}/api/tags`);
+      if (!res.ok) throw new Error();
+      const data = await res.json();
+      const names = (data.models || []).map(m => m.name);
+      setAvailableModels(names);
+      setConnected(true);
+      if (!chatModel && names.length > 0) setChatModel(names[0]);
+    } catch {
+      setConnected(false);
+      setAvailableModels([]);
+    }
+  }, [ollamaUrl]);
+
+  useEffect(() => { fetchModels(); }, [fetchModels]);
+
+  // ─── GPU 監視 (SSE) ───
+  useEffect(() => {
+    const evtSource = new EventSource('/sse/gpu');
+    evtSource.onmessage = (e) => {
+      try { setGpuData(JSON.parse(e.data)); } catch {}
+    };
+    evtSource.onerror = () => { setGpuData([]); };
+    return () => evtSource.close();
+  }, []);
+
+  // ─── Embedding取得 ───
+  async function getEmbedding(text) {
+    const res = await fetch(`${ollamaUrl}/api/embed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: embedModel, input: text }),
+    });
+    if (!res.ok) throw new Error('Embedding取得に失敗しました');
+    const data = await res.json();
+    return data.embeddings?.[0] || data.embedding;
+  }
+
+  // ─── ドキュメント追加 ───
+  async function addDocument(name, text) {
+    const chunks = chunkText(text);
+    const jobId = Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+    setError('');
+    setEmbeddingJobs(prev => [...prev, { id: jobId, name, current: 0, total: chunks.length }]);
+    try {
+      const embeddings = [];
+      for (let i = 0; i < chunks.length; i++) {
+        const emb = await getEmbedding(chunks[i]);
+        embeddings.push(emb);
+        setEmbeddingJobs(prev => prev.map(j => j.id === jobId ? { ...j, current: i + 1 } : j));
+      }
+      setDocuments(prev => [...prev, { name, text, chunks, embeddings }]);
+    } catch (e) {
+      setError(`ドキュメント「${name}」のEmbedding生成に失敗: ${e.message}`);
+    } finally {
+      setEmbeddingJobs(prev => prev.filter(j => j.id !== jobId));
+    }
+  }
+
+  // ─── RAG検索 ───
+  async function retrieveContext(query) {
+    if (!ragEnabled || documents.length === 0) return [];
+    try {
+      const qEmb = await getEmbedding(query);
+      const scored = [];
+      for (const doc of documents) {
+        for (let i = 0; i < doc.chunks.length; i++) {
+          scored.push({
+            chunk: doc.chunks[i],
+            docName: doc.name,
+            score: cosineSim(qEmb, doc.embeddings[i]),
+          });
+        }
+      }
+      scored.sort((a, b) => b.score - a.score);
+      return scored.slice(0, topK);
+    } catch {
+      return [];
+    }
+  }
+
+  // ─── 生成停止 ───
+  function stopGeneration() {
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
+  }
+
+  // ─── チャット送信 ───
+  async function sendMessage() {
+    const text = input.trim();
+    if (!text || isLoading || !chatModel) return;
+
+    const userMsg = { role: 'user', content: text };
+    setMessages(prev => [...prev, userMsg]);
+    setInput('');
+    setIsLoading(true);
+    setError('');
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      // RAG コンテキスト取得
+      const contexts = await retrieveContext(text);
+      let systemPrompt = 'あなたは親切で知識豊富なAIアシスタントです。日本語で回答してください。';
+      if (contexts.length > 0) {
+        const ctxText = contexts.map((c, i) => `[資料${i + 1}: ${c.docName}]\n${c.chunk}`).join('\n\n');
+        systemPrompt += `\n\n以下の参考資料に基づいて回答してください。資料に無い情報は推測であることを明示してください。\n\n${ctxText}`;
+      }
+
+      // Ollama API呼び出し（ストリーミング）
+      const history = [...messages, userMsg].slice(-20).map(m => ({
+        role: m.role, content: m.content,
+      }));
+
+      const res = await fetch(`${ollamaUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: chatModel,
+          messages: [{ role: 'system', content: systemPrompt }, ...history],
+          stream: true,
+          options: { num_ctx: numCtx },
+        }),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) throw new Error(`API Error: ${res.status}`);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let assistantContent = '';
+      let assistantThinking = '';
+      const contextInfo = contexts.length > 0 ? contexts : null;
+
+      setMessages(prev => [...prev, { role: 'assistant', content: '', thinking: '', contexts: contextInfo }]);
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n').filter(Boolean);
+        for (const line of lines) {
+          try {
+            const json = JSON.parse(line);
+            // Ollama API の thinking フィールド対応
+            if (json.message?.thinking) {
+              assistantThinking += json.message.thinking;
+            }
+            if (json.message?.content) {
+              assistantContent += json.message.content;
+            }
+            // content内の <think> タグ対応 (DeepSeek R1等)
+            let displayContent = assistantContent;
+            let displayThinking = assistantThinking;
+            const thinkMatch = assistantContent.match(/^<think>([\s\S]*?)(<\/think>)?([\s\S]*)$/);
+            if (thinkMatch) {
+              const tagThinking = thinkMatch[1] || '';
+              const closed = !!thinkMatch[2];
+              const afterThink = thinkMatch[3] || '';
+              displayThinking = (assistantThinking + tagThinking).trim();
+              displayContent = closed ? afterThink.trim() : '';
+            }
+            setMessages(prev => {
+              const copy = [...prev];
+              copy[copy.length - 1] = {
+                role: 'assistant',
+                content: displayContent,
+                thinking: displayThinking,
+                contexts: contextInfo,
+              };
+              return copy;
+            });
+          } catch {}
+        }
+      }
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        // 停止ボタンで中断 — エラー表示しない
+      } else {
+        setError(e.message);
+      }
+    } finally {
+      abortRef.current = null;
+      setIsLoading(false);
+    }
+  }
+
+  // ─── ファイルハンドリング ───
+  function handleFiles(files) {
+    for (const file of files) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        addDocument(file.name, e.target.result);
+      };
+      reader.readAsText(file);
+    }
+  }
+
+  function handleDrop(e) {
+    e.preventDefault();
+    setDragActive(false);
+    handleFiles(e.dataTransfer.files);
+  }
+
+  // ─── 応答をMarkdownとしてダウンロード ───
+  function downloadMarkdown(content, index) {
+    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `response_${index + 1}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // ─── 応答をドキュメントに追加 ───
+  function addResponseToDocuments(content, index) {
+    const name = `AI応答_${index + 1}.md`;
+    addDocument(name, content);
+  }
+
+  // ─── 自動スクロール ───
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  // ─── チャット履歴管理 ───
+  async function loadChatList() {
+    try {
+      const res = await fetch('/chats');
+      if (res.ok) setChatList(await res.json());
+    } catch {}
+  }
+
+  async function saveChat(id, msgs, title) {
+    if (!msgs || msgs.length === 0) return;
+    const autoTitle = title || msgs.find(m => m.role === 'user')?.content?.slice(0, 40) || '無題';
+    try {
+      await fetch(`/chats/${id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: autoTitle,
+          messages: msgs,
+        }),
+      });
+      loadChatList();
+    } catch {}
+  }
+
+  async function loadChat(id) {
+    try {
+      const res = await fetch(`/chats/${id}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setChatId(id);
+      setChatTitle(data.title || '');
+      setMessages(data.messages || []);
+    } catch {}
+  }
+
+  function newChat() {
+    setChatId(Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+    setChatTitle('');
+    setMessages([]);
+    setDocuments([]);
+  }
+
+  async function deleteChat(id) {
+    try {
+      await fetch(`/chats/${id}`, { method: 'DELETE' });
+      if (chatId === id) newChat();
+      loadChatList();
+    } catch {}
+  }
+
+  // 初回読み込み（コンフィグ + チャット一覧 + グローバル設定）
+  useEffect(() => {
+    loadChatList();
+    (async () => {
+      try {
+        const [cfgRes, setRes] = await Promise.all([fetch('/config'), fetch('/settings')]);
+        if (cfgRes.ok) {
+          const cfg = await cfgRes.json();
+          setAppConfig(prev => ({ ...prev, ...cfg }));
+          document.title = cfg.appName || 'WIZAPPLY AI CHAT';
+          if (cfg.accentColor) {
+            const hex = cfg.accentColor;
+            const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+            document.documentElement.style.setProperty('--accent', hex);
+            document.documentElement.style.setProperty('--accent-dim', `rgba(${r},${g},${b},0.12)`);
+            document.documentElement.style.setProperty('--accent-glow', `rgba(${r},${g},${b},0.25)`);
+          }
+        }
+        if (setRes.ok) {
+          const s = await setRes.json();
+          if (s.chatModel) setChatModel(s.chatModel);
+          if (s.topK) setTopK(s.topK);
+          if (s.numCtx) setNumCtx(s.numCtx);
+        }
+      } catch {}
+    })();
+  }, []);
+
+  // グローバル設定の自動保存（変更時）
+  const settingsInitRef = useRef(false);
+  useEffect(() => {
+    if (!settingsInitRef.current) { settingsInitRef.current = true; return; }
+    const t = setTimeout(async () => {
+      try {
+        await fetch('/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chatModel, topK, numCtx }),
+        });
+      } catch {}
+    }, 500);
+    return () => clearTimeout(t);
+  }, [chatModel, topK, numCtx]);
+
+  // メッセージ変更時に自動保存（1.5秒デバウンス）
+  useEffect(() => {
+    if (messages.length === 0) return;
+    if (isLoading) return;
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      saveChat(chatId, messages, chatTitle);
+    }, 1500);
+    return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
+  }, [messages, isLoading]);
+
+  // ─── エラー自動消去 ───
+  useEffect(() => {
+    if (error) {
+      const t = setTimeout(() => setError(''), 5000);
+      return () => clearTimeout(t);
+    }
+  }, [error]);
+
+  const totalChunks = documents.reduce((s, d) => s + d.chunks.length, 0);
+
+  return (
+    <div className="app-layout">
+      {/* ── Sidebar Overlay ── */}
+      <div className={`sidebar-overlay ${sidebarOpen ? 'open' : ''}`} onClick={() => setSidebarOpen(false)} />
+
+      {/* ── Sidebar ── */}
+      <div className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
+        <div className="sidebar-header">
+          <div className="logo">
+            <div className="logo-icon"></div>
+            <div className="logo-text">{appConfig.logoMain} <span>{appConfig.logoSub}</span></div>
+          </div>
+          <div className="settings-group">
+            <div className="setting-row">
+              <span className="setting-label">チャットモデル</span>
+              <select className="setting-input" value={chatModel} onChange={e => setChatModel(e.target.value)}>
+                {availableModels.length === 0 && <option value="">未接続</option>}
+                {availableModels.map(m => <option key={m} value={m}>{m}</option>)}
+              </select>
+            </div>
+            <div className="setting-row">
+              <span className="setting-label">Top-K 取得数</span>
+              <input
+                className="setting-input"
+                type="number"
+                min="1"
+                max="10"
+                value={topK}
+                onChange={e => setTopK(parseInt(e.target.value) || 10)}
+              />
+            </div>
+            <div className="setting-row">
+              <span className="setting-label">コンテキストサイズ</span>
+              <select className="setting-input" value={numCtx} onChange={e => setNumCtx(parseInt(e.target.value))}>
+                {[2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144].map(v => (
+                  <option key={v} value={v}>{(v / 1024).toFixed(0)}K ({v.toLocaleString()})</option>
+                ))}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        {/* ── Chat History ── */}
+        <div className="chat-history-panel">
+          <div className="chat-history-header">
+            <span className="chat-history-title">チャット履歴</span>
+            <button className="new-chat-btn" onClick={newChat}>+ 新規</button>
+          </div>
+          <div className="chat-history-list">
+            {chatList.length === 0 ? (
+              <div className="chat-history-empty">履歴なし</div>
+            ) : (
+              chatList.map(c => (
+                <div
+                  key={c.id}
+                  className={`chat-history-item ${c.id === chatId ? 'active' : ''}`}
+                  onClick={() => loadChat(c.id)}
+                >
+                  <div className="chat-history-item-info">
+                    <div className="chat-history-item-title">{c.title}</div>
+                    <div className="chat-history-item-meta">
+                      {c.messageCount}件 · {c.updatedAt ? new Date(c.updatedAt).toLocaleDateString('ja-JP') : ''}
+                    </div>
+                  </div>
+                  <button
+                    className="chat-history-item-delete"
+                    onClick={e => { e.stopPropagation(); deleteChat(c.id); }}
+                  >×</button>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        {/* ── Documents ── */}
+        <div className="docs-panel">
+          <div className="docs-header">
+            <div className="docs-header-top">
+              <div className="docs-title">
+                ドキュメント
+                {documents.length > 0 && <span className="docs-count">{documents.length}件 / {totalChunks}チャンク</span>}
+              </div>
+            </div>
+            <div className="docs-actions">
+              <button className="upload-btn" onClick={() => fileInputRef.current?.click()}>
+                + アップロード
+              </button>
+              {documents.length > 0 && (
+                <button className="upload-btn" style={{ background: 'var(--red-dim)', color: 'var(--red)' }} onClick={() => setDocuments([])}>
+                  すべて削除
+                </button>
+              )}
+            </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept=".txt,.md,.csv,.json,.log,.html,.xml,.py,.js,.ts,.java,.c,.cpp,.rs,.go"
+              style={{ display: 'none' }}
+              onChange={e => { handleFiles(e.target.files); e.target.value = ''; }}
+            />
+          </div>
+
+          <div className="docs-list">
+            {embeddingJobs.map((job) => (
+              <div key={job.id} className="doc-item loading">
+                <div className="doc-info">
+                  <div className="doc-icon loading-icon"></div>
+                  <div className="doc-meta">
+                    <div className="doc-name">{job.name}</div>
+                    <div className="doc-progress">
+                      <div className="doc-progress-bar" style={{ width: `${(job.current / job.total) * 100}%` }} />
+                    </div>
+                    <div className="doc-progress-text">
+                      Embedding生成中... {job.current}/{job.total} チャンク
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+            {documents.map((doc, i) => (
+              <div key={i} className="doc-item">
+                <div className="doc-info">
+                  <div className="doc-icon">📄</div>
+                  <div className="doc-meta">
+                    <div className="doc-name">{doc.name}</div>
+                    <div className="doc-stats">{doc.chunks.length}チャンク · {(doc.text.length / 1000).toFixed(1)}K文字</div>
+                  </div>
+                </div>
+                <button className="doc-remove" onClick={() => setDocuments(prev => prev.filter((_, j) => j !== i))}>×</button>
+              </div>
+            ))}
+          </div>
+
+          <div
+            className={`drop-zone ${dragActive ? 'active' : ''}`}
+            onDragOver={e => { e.preventDefault(); setDragActive(true); }}
+            onDragLeave={() => setDragActive(false)}
+            onDrop={handleDrop}
+          >
+            <div className="drop-zone-icon">📂</div>
+            ファイルをドラッグ＆ドロップ
+            <div className="drop-zone-sub">txt, md, csv, json, コードファイル 対応</div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Chat Area ── */}
+      <div className="chat-area">
+        <div className="chat-header">
+          <div className="chat-header-left">
+            <button className="menu-btn" onClick={() => setSidebarOpen(!sidebarOpen)}>☰</button>
+            <div className={`status-dot ${connected ? 'connected' : ''}`} />
+            <span className="chat-header-title">
+              {connected ? chatModel || 'モデル未選択' : 'Ollama未接続'}
+            </span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+            <button className="clear-btn" onClick={newChat}>新規チャット</button>
+            <button className={`clear-btn ${gpuPanelOpen ? 'gpu-btn-active' : ''}`} onClick={() => setGpuPanelOpen(!gpuPanelOpen)}>
+              {gpuData.length > 0 && <span className="gpu-header-dot" />}
+              GPU
+            </button>
+          </div>
+        </div>
+
+        <div className="messages-container">
+          {messages.length === 0 ? (
+            <div className="welcome-screen">
+              <div className="welcome-icon"></div>
+              <div className="welcome-title">{appConfig.appName}</div>
+              <div className="welcome-sub">
+                {appConfig.welcomeMessage}
+              </div>
+              <div className="welcome-hints">
+                {appConfig.welcomeHints.map(h => (
+                  <div key={h} className="hint-chip" onClick={() => { setInput(h); inputRef.current?.focus(); }}>{h}</div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            messages.map((msg, i) => (
+              <div key={i} className={`message ${msg.role}`}>
+                <div className={`msg-avatar ${msg.role === 'assistant' ? 'assistant-av' : 'user-av'}`}>
+                  {msg.role === 'assistant' ? '' : 'U'}
+                </div>
+                <div className="msg-content">
+                  {msg.thinking && (
+                    <ThinkingBlock
+                      thinking={msg.thinking}
+                      isStreaming={isLoading && i === messages.length - 1 && !msg.content}
+                    />
+                  )}
+                  {msg.role === 'assistant' ? (
+                    <div className="msg-bubble"><MarkdownContent content={msg.content} /></div>
+                  ) : (
+                    <div className="msg-bubble user-bubble">{msg.content}</div>
+                  )}
+                  {msg.role === 'assistant' && msg.content && !(isLoading && i === messages.length - 1) && (
+                    <div className="msg-actions">
+                      <button className="msg-action-btn" onClick={() => downloadMarkdown(msg.content, i)}>
+                        📥 ダウンロード
+                      </button>
+                      <button className="msg-action-btn" onClick={() => addResponseToDocuments(msg.content, i)}>
+                        📄 ドキュメントに追加
+                      </button>
+                    </div>
+                  )}
+                  {msg.contexts && (() => {
+                    const grouped = {};
+                    msg.contexts.forEach(c => {
+                      if (!grouped[c.docName]) {
+                        grouped[c.docName] = { bestScore: c.score, count: 1 };
+                      } else {
+                        grouped[c.docName].count++;
+                        if (c.score > grouped[c.docName].bestScore) grouped[c.docName].bestScore = c.score;
+                      }
+                    });
+                    const entries = Object.entries(grouped);
+                    return (
+                      <div className="msg-context">
+                        <div className="msg-context-label">参照した資料</div>
+                        {entries.map(([name, info], j) => (
+                          <div key={j} style={{ marginTop: j > 0 ? 6 : 0 }}>
+                            <strong>{name}</strong> (類似度: {(info.bestScore * 100).toFixed(1)}%){info.count > 1 && ` — ${info.count}チャンク参照`}
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            ))
+          )}
+          {isLoading && messages[messages.length - 1]?.role !== 'assistant' && (
+            <div className="message assistant">
+              <div className="msg-avatar assistant-av"></div>
+              <div className="thinking-indicator">
+                <div className="thinking-dots"><span /><span /><span /></div>
+                考え中...
+              </div>
+            </div>
+          )}
+          <div ref={messagesEndRef} />
+        </div>
+
+        <div className="input-area">
+          <div className="input-card">
+            <textarea
+              ref={inputRef}
+              className="input-box"
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
+              placeholder={connected ? 'メッセージを入力...' : 'Ollamaに接続してください...'}
+              rows={1}
+              disabled={!connected}
+              onInput={e => { e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px'; }}
+            />
+            <div className="input-toolbar">
+              <div className="input-toolbar-left">
+                <button className="toolbar-btn" title="ドキュメントを追加" onClick={() => fileInputRef.current?.click()}>
+                  📎
+                </button>
+              </div>
+              {isLoading ? (
+                <button className="stop-btn" onClick={stopGeneration} title="生成を停止">
+                  <div className="stop-icon" />
+                </button>
+              ) : (
+                <button className="send-btn" onClick={sendMessage} disabled={!input.trim() || !connected}>
+                  ➤
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="input-hint">Shift + Enter で改行</div>
+        </div>
+      </div>
+
+      {/* ── Right Sidebar: GPU Monitor ── */}
+      <div className={`right-sidebar-overlay ${gpuPanelOpen ? 'open' : ''}`} onClick={() => setGpuPanelOpen(false)} />
+      <div className={`right-sidebar ${gpuPanelOpen ? 'open' : ''}`}>
+        <div className="right-sidebar-header">
+          <div className="gpu-panel-title" style={{ margin: 0 }}>
+            {gpuData.length > 0 && <span className="gpu-live-dot" />}
+            GPU モニター
+          </div>
+          <button className="clear-btn" onClick={() => setGpuPanelOpen(false)}>✕</button>
+        </div>
+        <div className="gpu-panel-body">
+          {gpuData.length === 0 ? (
+            <div className="gpu-offline">rocm-smi 未検出</div>
+          ) : (
+            gpuData.map((gpu, gi) => {
+              const vramPct = gpu.vramPct || 0;
+              const tempClass = gpu.temp >= 90 ? 'hot' : gpu.temp >= 70 ? 'warn' : 'normal';
+              const hotspotClass = gpu.tempHotspot >= 100 ? 'hot' : gpu.tempHotspot >= 80 ? 'warn' : 'normal';
+              const usageClass = gpu.usage >= 90 ? 'hot' : gpu.usage >= 60 ? 'warn' : 'normal';
+              const vramClass = vramPct >= 90 ? 'hot' : vramPct >= 70 ? 'warn' : 'normal';
+              const vramColor = vramPct >= 90 ? 'var(--red)' : vramPct >= 70 ? 'var(--orange)' : 'var(--green)';
+              return (
+                <div key={gi} className="gpu-card">
+                  {gpuData.length > 1 && <div className="gpu-card-label">{gpu.name || `GPU ${gi}`} ({gpu.id})</div>}
+                  <div className="gpu-stats-grid">
+                    <div className="gpu-stat">
+                      <div className="gpu-stat-label">使用率</div>
+                      <div className={`gpu-stat-value ${usageClass}`}>{gpu.usage}%</div>
+                    </div>
+                    <div className="gpu-stat">
+                      <div className="gpu-stat-label">温度 (Edge)</div>
+                      <div className={`gpu-stat-value ${tempClass}`}>{gpu.temp}°C</div>
+                    </div>
+                    <div className="gpu-stat">
+                      <div className="gpu-stat-label">電力</div>
+                      <div className="gpu-stat-value normal">{gpu.power}W</div>
+                    </div>
+                    {gpu.tempHotspot > 0 && (
+                      <div className="gpu-stat">
+                        <div className="gpu-stat-label">温度 (Hotspot)</div>
+                        <div className={`gpu-stat-value ${hotspotClass}`}>{gpu.tempHotspot}°C</div>
+                      </div>
+                    )}
+                    <div className="gpu-stat">
+                      <div className="gpu-stat-label">SCLK</div>
+                      <div className="gpu-stat-value normal">{gpu.sclk || 'N/A'}{gpu.sclk ? 'MHz' : ''}</div>
+                    </div>
+                    <div className="gpu-stat">
+                      <div className="gpu-stat-label">MCLK</div>
+                      <div className="gpu-stat-value normal">{gpu.mclk || 'N/A'}{gpu.mclk ? 'MHz' : ''}</div>
+                    </div>
+                  </div>
+                  <div className="gpu-stat" style={{ marginTop: 8 }}>
+                    <div className="gpu-stat-label">VRAM {gpu.vramUsedMB || 0}MB / {gpu.vramTotalMB || 0}MB ({vramPct}%)</div>
+                    <div className="gpu-vram-bar">
+                      <div className="gpu-vram-fill" style={{ width: `${vramPct}%`, background: vramColor }} />
+                    </div>
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+
+      {error && <div className="error-toast">{error}</div>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

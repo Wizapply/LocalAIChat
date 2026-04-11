@@ -1,0 +1,8 @@
+{
+  "appName": "WIZAPPLY AI CHAT",
+  "logoMain": "WIZAPPLY",
+  "logoSub": "AI CHAT",
+  "welcomeMessage": "ドキュメントをアップロードしてRAGベースの質問応答を行うか、自由にチャットを開始できます。",
+  "welcomeHints": ["ドキュメントを要約して", "この資料の要点は？", "〇〇について教えて"],
+  "accentColor": "#34d399"
+}

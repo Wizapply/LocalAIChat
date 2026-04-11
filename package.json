@@ -1,0 +1,23 @@
+{
+  "name": "wizapply-ai-chat",
+  "version": "1.0.0",
+  "description": "WIZAPPLY AI CHAT - Ollama RAG Chat Server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": ["ollama", "rag", "chat", "llm", "ai", "gpu-monitor"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "ws": "^8.17.0"
+  }
+}
