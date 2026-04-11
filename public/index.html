@@ -271,6 +271,33 @@
     to { transform: rotate(360deg); }
   }
 
+  .chat-loading-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(17, 24, 39, 0.75);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    z-index: 50;
+    backdrop-filter: blur(4px);
+  }
+
+  .chat-loading-spinner {
+    width: 36px;
+    height: 36px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+
+  .chat-loading-text {
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+
   .doc-progress {
     margin-top: 6px;
     height: 3px;
@@ -574,6 +601,7 @@
     height: 100vh;
     min-width: 0;
     background: var(--bg-primary);
+    position: relative;
   }
 
   .chat-header {
@@ -1625,6 +1653,10 @@ function App() {
     welcomeMessage: 'ドキュメントをアップロードしてRAGベースの質問応答を行うか、自由にチャットを開始できます。',
     welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
     accentColor: '#34d399',
+    ragTopK: 10,
+    topK: 40,
+    topP: 0.9,
+    temperature: 0.7,
   });
 
   // ─── Ollama接続先（変更する場合はここを編集）───
@@ -1636,7 +1668,6 @@ function App() {
 
   const [documents, setDocuments] = useState([]); // { name, text, chunks, embeddings }
   const ragEnabled = true; // RAGはドキュメントがあれば常に有効
-  const [topK, setTopK] = useState(10);
   const [numCtx, setNumCtx] = useState(32768);
 
   const [messages, setMessages] = useState([]);
@@ -1651,6 +1682,7 @@ function App() {
   const [chatId, setChatId] = useState(() => Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
   const [chatList, setChatList] = useState([]);
   const [chatTitle, setChatTitle] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
   const saveTimerRef = useRef(null);
 
   const messagesEndRef = useRef(null);
@@ -1735,7 +1767,7 @@ function App() {
         }
       }
       scored.sort((a, b) => b.score - a.score);
-      return scored.slice(0, topK);
+      return scored.slice(0, appConfig.ragTopK);
     } catch {
       return [];
     }
@@ -1759,6 +1791,7 @@ function App() {
     setInput('');
     setIsLoading(true);
     setError('');
+    autoScrollRef.current = true;
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -1784,7 +1817,7 @@ function App() {
           model: chatModel,
           messages: [{ role: 'system', content: systemPrompt }, ...history],
           stream: true,
-          options: { num_ctx: numCtx },
+          options: { num_ctx: numCtx, top_k: appConfig.topK, top_p: appConfig.topP, temperature: appConfig.temperature },
         }),
         signal: controller.signal,
       });
@@ -1885,8 +1918,52 @@ function App() {
   }
 
   // ─── 自動スクロール ───
+  const containerRef = useRef(null);
+  const autoScrollRef = useRef(true);    // 自動スクロール有効フラグ
+  const programScrollRef = useRef(false); // プログラムによるスクロール中フラグ
+
+  // ユーザーが上にスクロールしたら自動追従を停止
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const el = containerRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      if (programScrollRef.current) return; // プログラムスクロールは無視
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+      autoScrollRef.current = atBottom;
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, []);
+
+  // ストリーミング中は rAF で追従（smooth を使わず直接操作）
+  useEffect(() => {
+    if (!isLoading) return;
+    let raf;
+    const tick = () => {
+      const el = containerRef.current;
+      if (el && autoScrollRef.current) {
+        programScrollRef.current = true;
+        el.scrollTop = el.scrollHeight;
+        programScrollRef.current = false;
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [isLoading]);
+
+  // 新メッセージ追加時（非ストリーミング時）のスクロール
+  useEffect(() => {
+    if (isLoading) return;
+    if (!autoScrollRef.current) return;
+    requestAnimationFrame(() => {
+      const el = containerRef.current;
+      if (el) {
+        programScrollRef.current = true;
+        el.scrollTop = el.scrollHeight;
+        programScrollRef.current = false;
+      }
+    });
   }, [messages]);
 
   // ─── チャット履歴管理 ───
@@ -1898,7 +1975,7 @@ function App() {
   }
 
   async function saveChat(id, msgs, title) {
-    if (!msgs || msgs.length === 0) return;
+    if ((!msgs || msgs.length === 0) && documents.length === 0) return;
     const autoTitle = title || msgs.find(m => m.role === 'user')?.content?.slice(0, 40) || '無題';
     try {
       await fetch(`/chats/${id}`, {
@@ -1907,6 +1984,7 @@ function App() {
         body: JSON.stringify({
           title: autoTitle,
           messages: msgs,
+          documents: documents.map(d => ({ name: d.name, text: d.text, chunks: d.chunks, embeddings: d.embeddings })),
         }),
       });
       loadChatList();
@@ -1914,6 +1992,7 @@ function App() {
   }
 
   async function loadChat(id) {
+    setChatLoading(true);
     try {
       const res = await fetch(`/chats/${id}`);
       if (!res.ok) return;
@@ -1921,7 +2000,10 @@ function App() {
       setChatId(id);
       setChatTitle(data.title || '');
       setMessages(data.messages || []);
-    } catch {}
+      setDocuments(data.documents || []);
+    } catch {} finally {
+      setChatLoading(false);
+    }
   }
 
   function newChat() {
@@ -1960,7 +2042,6 @@ function App() {
         if (setRes.ok) {
           const s = await setRes.json();
           if (s.chatModel) setChatModel(s.chatModel);
-          if (s.topK) setTopK(s.topK);
           if (s.numCtx) setNumCtx(s.numCtx);
         }
       } catch {}
@@ -1976,23 +2057,23 @@ function App() {
         await fetch('/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chatModel, topK, numCtx }),
+          body: JSON.stringify({ chatModel, numCtx }),
         });
       } catch {}
     }, 500);
     return () => clearTimeout(t);
-  }, [chatModel, topK, numCtx]);
+  }, [chatModel, numCtx]);
 
-  // メッセージ変更時に自動保存（1.5秒デバウンス）
+  // メッセージ・ドキュメント変更時に自動保存（1.5秒デバウンス）
   useEffect(() => {
-    if (messages.length === 0) return;
+    if (messages.length === 0 && documents.length === 0) return;
     if (isLoading) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
       saveChat(chatId, messages, chatTitle);
     }, 1500);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [messages, isLoading]);
+  }, [messages, documents, isLoading]);
 
   // ─── エラー自動消去 ───
   useEffect(() => {
@@ -2025,17 +2106,6 @@ function App() {
               </select>
             </div>
             <div className="setting-row">
-              <span className="setting-label">Top-K 取得数</span>
-              <input
-                className="setting-input"
-                type="number"
-                min="1"
-                max="10"
-                value={topK}
-                onChange={e => setTopK(parseInt(e.target.value) || 10)}
-              />
-            </div>
-            <div className="setting-row">
               <span className="setting-label">コンテキストサイズ</span>
               <select className="setting-input" value={numCtx} onChange={e => setNumCtx(parseInt(e.target.value))}>
                 {[2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144].map(v => (
@@ -2065,7 +2135,7 @@ function App() {
                   <div className="chat-history-item-info">
                     <div className="chat-history-item-title">{c.title}</div>
                     <div className="chat-history-item-meta">
-                      {c.messageCount}件 · {c.updatedAt ? new Date(c.updatedAt).toLocaleDateString('ja-JP') : ''}
+                      {c.messageCount}件{c.docCount > 0 ? ` · ${c.docCount}文書` : ''} · {c.updatedAt ? new Date(c.updatedAt).toLocaleDateString('ja-JP') : ''}
                     </div>
                   </div>
                   <button
@@ -2153,6 +2223,12 @@ function App() {
 
       {/* ── Chat Area ── */}
       <div className="chat-area">
+        {chatLoading && (
+          <div className="chat-loading-overlay">
+            <div className="chat-loading-spinner" />
+            <div className="chat-loading-text">チャットを読み込み中…</div>
+          </div>
+        )}
         <div className="chat-header">
           <div className="chat-header-left">
             <button className="menu-btn" onClick={() => setSidebarOpen(!sidebarOpen)}>☰</button>
@@ -2170,7 +2246,7 @@ function App() {
           </div>
         </div>
 
-        <div className="messages-container">
+        <div className="messages-container" ref={containerRef}>
           {messages.length === 0 ? (
             <div className="welcome-screen">
               <div className="welcome-icon"></div>

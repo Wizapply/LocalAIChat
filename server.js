@@ -21,6 +21,10 @@ const DEFAULT_CONFIG = {
   welcomeMessage: 'ドキュメントをアップロードしてRAGベースの質問応答を行うか、自由にチャットを開始できます。',
   welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
   accentColor: '#34d399',
+  ragTopK: 10,
+  topK: 40,
+  topP: 0.9,
+  temperature: 0.7,
 };
 function loadConfig() {
   try {
@@ -373,6 +377,7 @@ app.get('/chats', (req, res) => {
           title: data.title || '無題',
           updatedAt: data.updatedAt || data.createdAt || '',
           messageCount: (data.messages || []).length,
+          docCount: (data.documents || []).length,
         };
       } catch { return null; }
     }).filter(Boolean);
