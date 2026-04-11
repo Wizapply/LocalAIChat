@@ -1,9 +1,9 @@
-# WIZAPPLY AI CHAT
+# LOCAL AI CHAT
 
 Ollama連携のRAG（検索拡張生成）チャットWebアプリケーション。  
 ローカルLLMを使ったプライベートなAIアシスタントをブラウザから利用できます。
 
-![screenshot](docs/screenshot.png)
+![screenshot](docs/image.png)
 
 ## 特徴
 
