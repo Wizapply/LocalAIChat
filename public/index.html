@@ -917,6 +917,74 @@
     flex-shrink: 0;
   }
 
+  /* ── Code Preview (Three.js / HTML) ── */
+  .preview-btn { border-color: #60a5fa; color: #60a5fa; }
+  .preview-btn:hover { background: rgba(96, 165, 250, 0.12); }
+
+  .code-preview-container {
+    border-top: 1px solid var(--border);
+    background: #000;
+    position: relative;
+  }
+
+  .code-preview-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 14px;
+    background: var(--bg-tertiary);
+    border-bottom: 1px solid var(--border);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+    color: #60a5fa;
+  }
+
+  .code-preview-close {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 11px;
+    padding: 1px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: var(--font-sans);
+  }
+
+  .code-preview-close:hover { border-color: var(--red); color: var(--red); }
+
+  .code-preview-iframe {
+    width: 100%;
+    height: 400px;
+    border: none;
+    display: block;
+    background: #000;
+  }
+
+  .code-preview-resize {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 14px;
+    background: var(--bg-tertiary);
+    border-top: 1px solid var(--border);
+  }
+
+  .code-preview-resize button {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: var(--font-sans);
+  }
+
+  .code-preview-resize button:hover { border-color: var(--accent); color: var(--accent); }
+  .code-preview-resize button.active { border-color: #60a5fa; color: #60a5fa; }
+
   .msg-bubble table {
     border-collapse: collapse;
     margin: 10px 0;
@@ -1541,10 +1609,15 @@ renderer.code = function(arg1, arg2) {
   }
   const id = 'code-' + Math.random().toString(36).slice(2, 9);
   const isPython = /^py(thon[23]?)?$/.test(language);
-  const runBtnHtml = isPython
-    ? '<button class="run-btn" onclick="runPython(\'' + id + '\', this)">▶ 実行</button>'
-    : '';
-  return '<div class="code-block-wrapper"><div class="code-header"><span>' + (language || 'code') + '</span><div class="code-header-actions">' + runBtnHtml + '<button class="copy-btn" onclick="copyCode(this, \'' + id + '\')">コピー</button></div></div><pre><code id="' + id + '" class="hljs language-' + language + '">' + highlighted + '</code></pre><div id="output-' + id + '"></div></div>';
+  const isPreviewable = /^(html|threejs|three\.js|3d|webgl|canvas)$/.test(language);
+  let actionBtns = '';
+  if (isPython) {
+    actionBtns += '<button class="run-btn" onclick="runPython(\'' + id + '\', this)">▶ 実行</button>';
+  }
+  if (isPreviewable) {
+    actionBtns += '<button class="run-btn preview-btn" onclick="runPreview(\'' + id + '\', this)">▶ プレビュー</button>';
+  }
+  return '<div class="code-block-wrapper"><div class="code-header"><span>' + (language || 'code') + '</span><div class="code-header-actions">' + actionBtns + '<button class="copy-btn" onclick="copyCode(this, \'' + id + '\')">コピー</button></div></div><pre><code id="' + id + '" class="hljs language-' + language + '">' + highlighted + '</code></pre><div id="output-' + id + '"></div></div>';
 };
 marked.use({ renderer });
 
@@ -1552,12 +1625,27 @@ marked.use({ renderer });
 window.copyCode = function(btn, id) {
   const el = document.getElementById(id);
   if (!el) return;
-  navigator.clipboard.writeText(el.textContent).then(() => {
+  const text = el.textContent;
+  const onSuccess = () => {
     btn.textContent = 'コピー済';
     btn.classList.add('copied');
     setTimeout(() => { btn.textContent = 'コピー'; btn.classList.remove('copied'); }, 2000);
-  });
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(onSuccess).catch(() => fallbackCopy(text, onSuccess));
+  } else {
+    fallbackCopy(text, onSuccess);
+  }
 };
+function fallbackCopy(text, cb) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0;';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); cb(); } catch {}
+  document.body.removeChild(ta);
+}
 
 // ─── Python 実行関数（グローバル）───
 window.runPython = function(codeId, btn) {
@@ -1676,6 +1764,133 @@ window.killPython = function(codeId) {
   const outputEl = document.getElementById('output-' + codeId);
   if (outputEl && outputEl._ws) {
     outputEl._ws.send(JSON.stringify({ type: 'kill' }));
+  }
+};
+
+// ─── コードプレビュー（Three.js / HTML）───
+window.runPreview = function(codeId, btn) {
+  const codeEl = document.getElementById(codeId);
+  const outputEl = document.getElementById('output-' + codeId);
+  if (!codeEl || !outputEl) return;
+
+  // 既にプレビュー中なら閉じる
+  if (outputEl.querySelector('.code-preview-container')) {
+    outputEl.innerHTML = '';
+    btn.textContent = '▶ プレビュー';
+    return;
+  }
+
+  const code = codeEl.textContent;
+  btn.textContent = '✕ 閉じる';
+
+  // Three.js CDN（正規URL）
+  const THREE_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';
+  const ORBIT_CDN = 'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js';
+  const threeScriptTags = '<script src="' + THREE_CDN + '"><\/script>'
+    + '<script src="' + ORBIT_CDN + '"><\/script>'
+    + '<script>window.OrbitControls=THREE.OrbitControls;<\/script>';
+
+  const needsThree = /THREE[\.\(]/i.test(code);
+
+  // LLMが生成した壊れたThree.js読み込みタグを除去する正規表現
+  const badThreeRe = /<script[^>]*src=["'][^"']*(?:three|THREE)[^"']*["'][^>]*><\/script>/gi;
+
+  let htmlContent = code;
+
+  // コードが完全なHTMLでない場合、ラッピング
+  if (!/<html[\s>]/i.test(code)) {
+    const hasScript = /<script/i.test(code);
+    let body = code;
+
+    // LLMが生成した壊れたThree.js scriptタグを除去
+    if (needsThree) {
+      body = body.replace(badThreeRe, '');
+    }
+
+    // スクリプトタグなし = JSコードそのもの
+    if (!hasScript && !/<body/i.test(body)) {
+      body = '<script>' + body + '<\/script>';
+    }
+
+    htmlContent = '<!DOCTYPE html><html><head><meta charset="utf-8">'
+      + '<style>body{margin:0;overflow:hidden;background:#000;}canvas{display:block;}</style>'
+      + (needsThree ? threeScriptTags : '')
+      + '</head><body>' + body + '</body></html>';
+  } else {
+    // 完全なHTML — LLMのThree.jsタグを正規CDNに強制置換
+    if (needsThree) {
+      // 既存のThree.js読み込みタグを全て除去
+      htmlContent = htmlContent.replace(badThreeRe, '');
+      // head内に正規CDNを注入
+      if (/<head[^>]*>/i.test(htmlContent)) {
+        htmlContent = htmlContent.replace(/<head[^>]*>/i, '$&' + threeScriptTags);
+      } else {
+        htmlContent = htmlContent.replace(/<html[^>]*>/i, '$&<head>' + threeScriptTags + '</head>');
+      }
+    }
+  }
+
+  // import文をグローバルTHREEに書き換え（ESM → UMD対応）
+  htmlContent = htmlContent.replace(/import\s+\*\s+as\s+THREE\s+from\s+['"][^'"]*['"]\s*;?/g, '// THREE is loaded globally');
+  htmlContent = htmlContent.replace(/import\s+THREE\s+from\s+['"][^'"]*['"]\s*;?/g, '// THREE is loaded globally');
+  // three/examples, three/addons 等のimportはコメント化（シムで定義済み）— from 'three' より先に処理
+  htmlContent = htmlContent.replace(/import\s+\{[^}]*\}\s+from\s+['"][^'"]*(?:examples|addons|jsm?|controls)[^'"]*['"]\s*;?/g,
+    '// import removed (loaded globally)');
+  htmlContent = htmlContent.replace(/import\s+\{\s*([^}]+)\}\s+from\s+['"]three['"]\s*;?/g, 'const { $1 } = THREE;');
+  // type="module" を除去（UMDで読み込むため）
+  htmlContent = htmlContent.replace(/<script\s+type=["']module["']/gi, '<script');
+  const errorHelper = '<script>'
+    + 'window.onerror=function(m,s,l,c,e){'
+    + 'var d=document.createElement("div");'
+    + 'd.style.cssText="position:fixed;bottom:0;left:0;right:0;background:rgba(220,40,40,0.9);color:#fff;padding:8px 12px;font:12px monospace;z-index:9999;white-space:pre-wrap;";'
+    + 'd.textContent="Error: "+m+"\\n  at line "+l;'
+    + 'document.body.appendChild(d);'
+    + 'setTimeout(function(){d.remove()},8000);'
+    + '};'
+    + '<\/script>';
+  htmlContent = htmlContent.replace(/<\/body>/i, errorHelper + '</body>');
+
+  outputEl.innerHTML =
+    '<div class="code-preview-container">'
+    + '<div class="code-preview-header">'
+    + '<span>プレビュー</span>'
+    + '<div style="display:flex;gap:6px;align-items:center;">'
+    + '<div class="code-preview-resize">'
+    + '<button onclick="resizePreview(\'' + codeId + '\',300)" title="小">S</button>'
+    + '<button class="active" onclick="resizePreview(\'' + codeId + '\',400)" title="中">M</button>'
+    + '<button onclick="resizePreview(\'' + codeId + '\',600)" title="大">L</button>'
+    + '<button onclick="resizePreview(\'' + codeId + '\',800)" title="特大">XL</button>'
+    + '</div>'
+    + '<button class="code-preview-close" onclick="closePreview(\'' + codeId + '\')">✕</button>'
+    + '</div>'
+    + '</div>'
+    + '<iframe class="code-preview-iframe" id="preview-' + codeId + '" sandbox="allow-scripts"></iframe>'
+    + '</div>';
+
+  const iframe = document.getElementById('preview-' + codeId);
+  iframe.srcdoc = htmlContent;
+};
+
+window.closePreview = function(codeId) {
+  const outputEl = document.getElementById('output-' + codeId);
+  if (outputEl) outputEl.innerHTML = '';
+  // ボタンを元に戻す
+  const wrapper = document.getElementById(codeId)?.closest('.code-block-wrapper');
+  if (wrapper) {
+    const btn = wrapper.querySelector('.preview-btn');
+    if (btn) btn.textContent = '▶ プレビュー';
+  }
+};
+
+window.resizePreview = function(codeId, height) {
+  const iframe = document.getElementById('preview-' + codeId);
+  if (iframe) iframe.style.height = height + 'px';
+  // ボタンのactive状態更新
+  const container = iframe?.closest('.code-preview-container');
+  if (container) {
+    container.querySelectorAll('.code-preview-resize button').forEach(b => {
+      b.classList.toggle('active', parseInt(b.getAttribute('onclick').match(/\d+/)?.[0]) === height);
+    });
   }
 };
 

@@ -1,19 +1,17 @@
 <div align="center">
-
 # LOCAL AI CHAT
 
-**ローカルLLMチャット**
+**社内などのローカル AIチャット**
 
 ローカルLLMを使ったプライベートなAIアシスタント。  
-ドキュメントRAG・画像入力・GPU監視・Python実行をブラウザから。
+ドキュメントRAG・画像入力・Three.jsプレビュー・GPU監視・Python実行をブラウザから。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
 [![Ollama](https://img.shields.io/badge/Ollama-Local%20LLM-000000?logo=ollama)](https://ollama.com/)
 
 <!-- スクリーンショット -->
-<img src="docs/image.png" alt="LOCAL AI CHAT" width="800" />
-
+<img src="docs/image.png" alt="WIZAPPLY AI CHAT" width="800" />
 </div>
 
 ---
@@ -33,7 +31,14 @@ LLM: 検索結果に基づいて回答を生成
 ```
 
 ### 🖼️ 画像入力（Vision）
-画像をペースト・アップロードしてビジョンモデル（gemma3, llava 等）に質問できます。
+画像をペースト・アップロード・ドラッグ＆ドロップでビジョンモデル（gemma3, llava 等）に質問できます。  
+複数画像の同時送信、会話履歴内の画像参照にも対応。
+
+### 🎮 Three.js / HTMLプレビュー
+AIが生成したThree.jsやHTMLコードをチャット内でワンクリックプレビュー。  
+Three.js CDNの自動注入、ESM→UMDの自動変換、LLMが生成する壊れたURLの自動修正に対応。
+
+対応言語指定: ` ```html ` ` ```threejs ` ` ```three.js ` ` ```3d ` ` ```webgl ` ` ```canvas `
 
 ### 📊 リアルタイムGPU監視
 AMD（rocm-smi）/ NVIDIA（nvidia-smi）を自動検出し、使用率・温度・電力・VRAM をリアルタイム表示。
@@ -44,8 +49,8 @@ AMD（rocm-smi）/ NVIDIA（nvidia-smi）を自動検出し、使用率・温度
 ### 💬 その他
 - **ストリーミング応答** — リアルタイム表示、途中停止可能
 - **Thinking表示** — `<think>`タグ / `message.thinking` の折りたたみ表示
-- **Markdown / LaTeX** — コードハイライト、数式レンダリング
-- **チャット履歴** — メッセージ＋ドキュメント＋Embeddingをサーバーに保存
+- **Markdown / LaTeX** — コードハイライト（GitHub Dark）、KaTeX数式レンダリング
+- **チャット履歴** — メッセージ＋ドキュメント＋Embeddingをサーバーに保存・復元
 - **カスタマイズ** — アプリ名・テーマカラー・推論パラメータを `config.json` で設定
 - **レスポンシブUI** — モバイル対応ダークテーマ
 
@@ -60,15 +65,15 @@ AMD（rocm-smi）/ NVIDIA（nvidia-smi）を自動検出し、使用率・温度
 curl -fsSL https://ollama.com/install.sh | sh
 
 # モデルのダウンロード
-ollama pull gemma4:31b          # チャット用（例）
+ollama pull gemma3:12b          # チャット用（例）
 ollama pull nomic-embed-text    # Embedding用（RAG必須）
 ```
 
 ### 2. セットアップ
 
 ```bash
-git clone https://github.com/Wizapply/LocalAIChat.git
-cd LocalAIChat
+git clone https://github.com/<your-username>/wizapply-ai-chat.git
+cd wizapply-ai-chat
 npm install
 ```
 
@@ -91,6 +96,7 @@ wizapply-ai-chat/
 ├── server.js          # Express + WebSocket サーバー
 ├── package.json
 ├── config.json        # アプリ設定（名前・カラー・推論パラメータ）
+├── DESIGN.md          # AI向け設計ドキュメント
 ├── public/
 │   ├── index.html     # フロントエンド（React SPA）
 │   └── aiicon.jpg     # アイコン画像（任意）
@@ -191,7 +197,7 @@ PORT=8080 npm start
 ```bash
 sudo tee /etc/systemd/system/wizapply.service << EOF
 [Unit]
-Description=LOCAL AI CHAT
+Description=WIZAPPLY AI CHAT
 After=network.target ollama.service
 
 [Service]
@@ -239,7 +245,7 @@ sudo ufw allow 3000/tcp
 
 | レイヤー | 技術 |
 |:--|:--|
-| フロントエンド | React (CDN/Babel) · marked.js · highlight.js · KaTeX |
+| フロントエンド | React (CDN/Babel) · marked.js · highlight.js · KaTeX · Three.js (r128) |
 | バックエンド | Node.js · Express · WebSocket (ws) |
 | AI | Ollama · nomic-embed-text · Agentic RAG (Tool Calling) |
 
@@ -247,5 +253,5 @@ sudo ufw allow 3000/tcp
 
 ## 📝 ライセンス
 
-[MIT](LICENSE)
-※ほとんどAIで生成されています。
+[MIT](LICENSE)  
+※ほとんどAIにて作成されました。

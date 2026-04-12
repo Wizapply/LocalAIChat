@@ -1,4 +1,4 @@
-# WIZAPPLY AI CHAT — 設計ドキュメント
+# LOCAL AI CHAT — 設計ドキュメント
 
 > このドキュメントはAIアシスタントがプロジェクトを理解し、修正・拡張を行うためのリファレンスです。
 
@@ -6,7 +6,7 @@
 
 ## 1. プロジェクト概要
 
-Ollama連携のAgentic RAGチャットWebアプリ。ローカルLLMを使い、ドキュメントRAG・画像入力・GPU監視・Python実行をブラウザから利用できる。
+Ollama連携のAgentic RAGチャットWebアプリ。ローカルLLMを使い、ドキュメントRAG・画像入力・Three.jsプレビュー・GPU監視・Python実行をブラウザから利用できる。
 
 - **単一HTMLアプリ**: フロントエンドは `public/index.html` 1ファイル（React/Babel CDN、ビルド不要）
 - **サーバー**: `server.js` 1ファイル（Express + WebSocket）
@@ -17,16 +17,17 @@ Ollama連携のAgentic RAGチャットWebアプリ。ローカルLLMを使い、
 ## 2. ファイル構成
 
 ```
-wizapply-ai-chat/
+LocalAIChat/
 ├── server.js              # バックエンド（Express + WS）  ~460行
 ├── package.json            # express, ws のみ
 ├── config.json             # アプリ設定（名前・カラー・推論パラメータ）
 ├── public/
-│   ├── index.html          # フロントエンド全体（CSS + React/Babel）  ~2800行
+│   ├── index.html          # フロントエンド全体（CSS + React/Babel）  ~3040行
 │   └── aiicon.jpg          # アイコン画像（favicon・ロゴ・AIアバター）
 ├── chats/                  # チャット履歴JSON（自動作成、.gitignore済）
 ├── settings.json           # ユーザー設定（自動作成、.gitignore済）
 ├── README.md
+├── DESIGN.md               # このファイル
 ├── LICENSE                 # MIT
 └── .gitignore
 ```
@@ -45,6 +46,7 @@ wizapply-ai-chat/
 │  │ 設定      │ │ メッセージ│ │ パネル    │ │ テキスト+画像     │  │
 │  │ チャット履歴│ │ Thinking │ │ (SSE)    │ │ ペースト/D&D     │  │
 │  │ ドキュメント│ │ RAG参照  │ │          │ │                  │  │
+│  │           │ │ 3Dプレビュー│          │ │                  │  │
 │  └──────────┘ └──────────┘ └──────────┘ └──────────────────┘  │
 └──────────┬────────────────────┬────────────────────┬──────────┘
            │ HTTP               │ SSE                │ WebSocket
@@ -94,11 +96,10 @@ app.use('/api', ...)
 ```
 
 - `http.request` で `OLLAMA_HOST:OLLAMA_PORT` へ転送
-- `express.json()` はこのルートに適用しない（リクエストボディをそのままパイプするため）
 - ストリーミング対応（`res.pipe`）
 - ログ出力: メソッド、パス、IPアドレス
 
-**注意**: `express.json()` をグローバルに適用するとOllamaプロキシのリクエストボディを消費するため、`/chats/:id` と `/settings` のみ `jsonParser` ミドルウェアを適用。
+**注意**: `express.json()` をグローバルに適用するとOllamaプロキシのリクエストボディを消費する。`jsonParser` は `POST /chats/:id` と `POST /settings` のみに適用。
 
 ### 4.4 WebSocket: Python実行
 
@@ -166,13 +167,15 @@ app.use('/api', ...)
 
 ```
 <head>
-  ├── CSS（~1400行） — ダークテーマ、レスポンシブ
+  ├── CSS（~1500行） — ダークテーマ、レスポンシブ、プレビューUI
   └── CDN読み込み
 </head>
 <body>
   <div id="root" />
   <script type="text/babel">
     ├── ユーティリティ関数（chunkText, cosineSim, escapeHtml, renderLatex）
+    ├── Markdownカスタムレンダラー（コードブロック: コピー/Python実行/プレビューボタン）
+    ├── グローバル関数（copyCode, fallbackCopy, runPython, killPython, runPreview, closePreview, resizePreview）
     ├── MarkdownContent コンポーネント
     ├── ThinkingBlock コンポーネント
     └── App コンポーネント（メイン）
@@ -190,6 +193,7 @@ app.use('/api', ...)
 | marked | 12.0.1 | Markdownレンダリング |
 | highlight.js | 11.9.0 | コードハイライト（github-darkテーマ） |
 | KaTeX | 0.16.9 | LaTeX数式レンダリング |
+| Three.js | r128 | 3Dプレビュー（iframeに動的注入） |
 | IBM Plex Sans JP | — | 本文フォント |
 | JetBrains Mono | — | コードフォント |
 
@@ -209,9 +213,11 @@ App
 │   │   ├── ウェルカム画面（メッセージ0件時）
 │   │   └── メッセージ一覧
 │   │       ├── ThinkingBlock（折りたたみ）
-│   │       ├── Agent Activity（検索クエリ表示）
+│   │       ├── Agent Activity（検索クエリ・件数表示）
 │   │       ├── ユーザーメッセージ（テキスト + 画像サムネイル）
 │   │       ├── アシスタントメッセージ（MarkdownContent）
+│   │       │   ├── コードブロック（コピー / Python実行 / プレビューボタン）
+│   │       │   └── Three.js / HTMLプレビュー（sandbox iframe）
 │   │       ├── アクション（ダウンロード、ドキュメントに追加）
 │   │       └── 参照資料（グループ化表示）
 │   ├── 入力エリア
@@ -264,9 +270,9 @@ interface Document {
 interface Message {
   role: 'user' | 'assistant';
   content: string;
-  thinking?: string;          // Thinking表示用
-  contexts?: RagResult[];     // 参照した資料
-  images?: ChatImage[];       // ユーザーが添付した画像
+  thinking?: string;             // Thinking表示用
+  contexts?: RagResult[];        // 参照した資料
+  images?: ChatImage[];          // ユーザーが添付した画像
   searchQueries?: SearchQuery[]; // Agenticの検索クエリ
   agentStatus?: string | null;   // Agentステータス表示
 }
@@ -355,10 +361,10 @@ LLMが自律的に検索するかどうかを判断する方式。
 ```
 
 **UI表示フロー**:
-- 「ツール判断中...」→「"クエリ"を検索中...」→「1回検索完了」→ ストリーミング開始
+- 「ツール判断中...」→「"クエリ"を検索中...」→ ストリーミング開始
 
 **制約**:
-- 検索は1ターン1回（ループなし — 2回目の非ストリーミング呼び出しで応答が止まる問題を回避）
+- 検索は1ターンで1回の判断（ループなし — 非ストリーミング呼び出しの2回目で応答が止まる問題を回避）
 - LLMが1回のtool_callsで複数検索を返した場合は全て実行
 - ツール呼び出し非対応モデルでは `ragMode: "always"` を使用
 
@@ -407,25 +413,122 @@ File → FileReader.readAsDataURL → base64抽出 → chatImages state
 
 ---
 
-## 8. 自動スクロール
+## 8. Three.js / HTMLプレビュー
 
-### 8.1 課題
+### 8.1 対応言語
+
+コードブロックの言語指定が以下にマッチする場合、**▶ プレビュー** ボタンを表示:
+
+```
+/^(html|threejs|three\.js|3d|webgl|canvas)$/
+```
+
+### 8.2 実行関数: `runPreview()`
+
+sandboxed iframe（`sandbox="allow-scripts"`）内でコードを実行する。
+
+### 8.3 自動処理パイプライン
+
+```
+LLMのコード出力
+  ↓
+1. LLMが生成した壊れたThree.js scriptタグを正規表現で全除去
+   正規表現: /<script[^>]*src=["'][^"']*(?:three|THREE)[^"']*["'][^>]*><\/script>/gi
+  ↓
+2. 正規CDNを注入
+   - three.js r128 (cdnjs.cloudflare.com)
+   - OrbitControls (cdn.jsdelivr.net)
+   - グローバルシム: window.OrbitControls = THREE.OrbitControls
+  ↓
+3. ESM → UMD 変換（順序重要）
+   a. import * as THREE from '...'  → コメント化
+   b. import THREE from '...'       → コメント化
+   c. import { X } from 'three/examples/...'  → コメント化（シムで定義済み）
+   d. import { X, Y } from 'three'  → const { X, Y } = THREE;
+   e. <script type="module">        → <script>
+  ↓
+4. コード未完全HTML時のラッピング
+   - <html>/<head>/<body> 自動付与
+   - body { margin:0; overflow:hidden; background:#000 } 自動付与
+   - JSのみのコードは <script> で囲む
+  ↓
+5. エラーヘルパー注入
+   - window.onerror でiframe内のエラーを赤オーバーレイ表示（8秒で消去）
+  ↓
+6. iframe.srcdoc に設定
+```
+
+### 8.4 UI機能
+
+- **サイズ変更**: S(300px) / M(400px) / L(600px) / XL(800px)
+- **閉じる**: ✕ボタンまたは▶プレビューボタン再クリック
+- **エラー表示**: iframe内の `window.onerror` でオーバーレイ表示
+
+### 8.5 Three.js バージョン注意
+
+r128（UMDビルド）を使用。r142以降の API（`CapsuleGeometry` 等）は使用不可。`THREE.OrbitControls` として登録される（ESMの `import` ではなくグローバル）。
+
+---
+
+## 9. コードブロック処理
+
+### 9.1 カスタムレンダラー
+
+`marked.Renderer` の `code` メソッドをオーバーライド。
+
+```
+コードブロック検出
+  → highlight.js でハイライト
+  → ヘッダー生成（言語名 + アクションボタン）
+     ├── Python → ▶ 実行 ボタン
+     ├── html/threejs/3d/webgl/canvas → ▶ プレビュー ボタン
+     └── 全て → コピー ボタン
+  → <pre><code id="code-xxxxx"> でラップ
+  → 出力エリア <div id="output-xxxxx"> を付与
+```
+
+### 9.2 コピー機能
+
+```javascript
+window.copyCode(btn, id)
+  → HTTPS: navigator.clipboard.writeText()
+  → HTTP:  fallbackCopy() — textarea + document.execCommand('copy')
+```
+
+HTTP環境（`http://` ドメイン）では `navigator.clipboard` が使えないため、`window.isSecureContext` を判定してフォールバック。
+
+### 9.3 Python実行
+
+```javascript
+window.runPython(codeId, btn)
+  → WebSocket /ws/python に接続
+  → コード送信 → stdout/stderr をリアルタイム表示
+  → stdin入力対応（テキストボックス + 送信ボタン）
+  → 停止ボタン → __STOP__ 送信 → SIGKILL
+```
+
+---
+
+## 10. 自動スクロール
+
+### 10.1 課題
 
 ストリーミング中に `scrollIntoView({ behavior: 'smooth' })` を毎チャンク呼ぶと、スムーズアニメーションが追いつかず途中で止まる。また `scrollTop = scrollHeight` がブラウザの `scroll` イベントを発火させ、ユーザーの手動スクロールと誤判定される。
 
-### 8.2 解決策
+### 10.2 解決策
 
 ```
 autoScrollRef    — 自動スクロール有効フラグ
 programScrollRef — プログラムスクロール中フラグ
 
 scroll イベント:
-  programScrollRef が true → 無視
-  bottom付近なら autoScrollRef = true
+  programScrollRef が true → 無視（プログラムによるスクロール）
+  bottom付近(80px以内)なら autoScrollRef = true
   上にスクロールしたら autoScrollRef = false
 
 ストリーミング中:
-  rAF ループで scrollTop = scrollHeight（programScrollRef で保護）
+  rAF ループで毎フレーム scrollTop = scrollHeight
+  （programScrollRef で保護してscrollイベントと競合しない）
 
 メッセージ送信時:
   autoScrollRef = true にリセット
@@ -433,14 +536,14 @@ scroll イベント:
 
 ---
 
-## 9. チャット履歴
+## 11. チャット履歴
 
-### 9.1 保存タイミング
+### 11.1 保存タイミング
 
 - メッセージ・ドキュメント変更時（1.5秒デバウンス、生成中は保存しない）
 - `POST /chats/:id` に `{ title, messages, documents }` を送信
 
-### 9.2 保存データ
+### 11.2 保存データ
 
 ```json
 {
@@ -458,7 +561,7 @@ scroll イベント:
 }
 ```
 
-### 9.3 グローバル設定（settings.json）
+### 11.3 グローバル設定（settings.json）
 
 - チャットモデルとコンテキストサイズのみ
 - ブラウザから変更時に0.5秒デバウンスで自動保存
@@ -466,31 +569,31 @@ scroll イベント:
 
 ---
 
-## 10. CSS設計
+## 12. CSS設計
 
-### 10.1 テーマ
+### 12.1 テーマ
 
 ダークテーマ固定。CSS変数で定義。`config.json` の `accentColor` から `--accent`, `--accent-dim`, `--accent-glow` を動的に上書き。
 
-### 10.2 レイアウト
+### 12.2 レイアウト
 
 ```
 .app-layout: CSS Grid — grid-template-columns: 340px minmax(0, 1fr)
   ├── .sidebar: 左サイドバー（固定幅340px）
-  ├── .chat-area: メインチャット（flex column, height: 100vh）
+  ├── .chat-area: メインチャット（flex column, height: 100vh, position: relative）
   │   ├── .chat-header: flex-shrink: 0
   │   ├── .messages-container: flex: 1, overflow-y: auto, min-height: 0
   │   └── .input-area: flex-shrink: 0
   └── .right-sidebar: GPUパネル（固定幅320px、右からスライドイン）
 ```
 
-### 10.3 レスポンシブ（768px以下）
+### 12.3 レスポンシブ（768px以下）
 
 - `.app-layout`: `grid-template-columns: 1fr`
 - サイドバー: オーバーレイスライドイン（ハンバーガーメニュー）
 - GPUパネル: オーバーレイスライドイン
 
-### 10.4 レイアウト修正の注意点
+### 12.4 レイアウト修正の注意点
 
 - `.app-layout` の `minmax(0, 1fr)` が重要。`1fr` のみだとコンテンツがはみ出す
 - `.msg-content` には `min-width: 0; overflow-x: hidden` が必須
@@ -500,40 +603,39 @@ scroll イベント:
 
 ---
 
-## 11. Markdown / LaTeX レンダリング
+## 13. Markdown / LaTeX レンダリング
 
-### 11.1 処理順序
+### 13.1 処理順序
 
 ```
 content
   → コードブロック内の$を保護（__DOLLAR_INLINE__ / __DOLLAR_DISPLAY__）
   → renderLatex() — $...$ / $$...$$ / \(...\) / \[...\] を KaTeX でレンダリング
-  → marked.parse() — Markdownレンダリング
+  → marked.parse() — Markdownレンダリング（カスタムレンダラー適用）
   → highlight.js — コードハイライト
   → コピーボタン追加（各コードブロック）
   → Pythonコードブロックに「▶ 実行」ボタン追加
+  → html/threejs等に「▶ プレビュー」ボタン追加
 ```
 
-### 11.2 markedカスタムレンダラー
+### 13.2 markedカスタムレンダラー
 
-- コードレンダラー: highlight.js適用、言語表示、コピーボタン、Python実行ボタン
-- 引数形式: v12+（オブジェクト）と旧バージョン（位置引数）の両方に対応
+- 引数形式: v12+（オブジェクト `{ text, lang }`）と旧バージョン（位置引数 `code, lang`）の両方に対応
 
 ---
 
-## 12. Thinking表示
+## 14. Thinking表示
 
-### 12.1 対応形式
+### 14.1 対応形式
 
 | 形式 | ソース |
 |:--|:--|
 | `message.thinking` フィールド | Ollama APIのネイティブthinking |
 | `<think>...</think>` タグ | DeepSeek R1等のコンテンツ内タグ |
 
-### 12.2 パース処理
+### 14.2 パース処理
 
 ```javascript
-// content内の<think>タグ
 const thinkMatch = content.match(/^<think>([\s\S]*?)(<\/think>)?([\s\S]*)$/);
 if (thinkMatch) {
   displayThinking = (apiThinking + tagThinking).trim();
@@ -546,36 +648,48 @@ if (thinkMatch) {
 
 ---
 
-## 13. 拡張時の注意事項
+## 15. 拡張時の注意事項
 
-### 13.1 express.json() の適用範囲
+### 15.1 express.json() の適用範囲
 
 `express.json()` をグローバルに適用するとOllamaプロキシのリクエストボディを消費する。`jsonParser` は個別ルートにのみ適用すること。
 
-### 13.2 ストリーミング応答の処理
+### 15.2 ストリーミング応答の処理
 
 `streamResponse()` 関数に共通化済み。新しいモードを追加する場合はこの関数を再利用。
 
-### 13.3 チャット保存のデバウンス
+### 15.3 チャット保存のデバウンス
 
 `isLoading` 中は保存しない。ストリーミング中にメッセージが高頻度更新されるため、生成完了後に1.5秒後保存。
 
-### 13.4 Embeddingモデル
+### 15.4 Embeddingモデル
 
 `nomic-embed-text:latest` 固定（ソースコード内定数）。変更する場合は `embedModel` 変数を修正。
 
-### 13.5 Agentic RAGのモデル互換性
+### 15.5 Agentic RAGのモデル互換性
 
 Ollamaの `tools` パラメータ（Tool Calling）対応が必要。非対応モデルでは `ragMode: "always"` に切り替え。
 
-### 13.6 画像保存
+### 15.6 画像保存
 
 チャット履歴に画像をbase64で保存するため、大量の画像を含むチャットはJSONファイルが大きくなる。`jsonParser` の `limit` は `10mb` に設定済み。
 
-### 13.7 rocm-smiのキー名
+### 15.7 Three.jsプレビューのバージョン
+
+r128（UMDビルド）を使用。LLMがESMの `import` 構文や壊れたCDN URLを出力しても自動変換・修正される。r142以降のAPIは使用不可。
+
+### 15.8 コピー機能のHTTP対応
+
+`navigator.clipboard` はHTTPS必須。HTTP環境では `document.execCommand('copy')` にフォールバック。`window.isSecureContext` で判定。
+
+### 15.9 rocm-smiのキー名
 
 ROCmバージョンによりJSONキー名が異なる。現在のパーサーは以下のキー名に最適化:
 - `GPU use (%)`, `Temperature (Sensor edge) (C)`, `Temperature (Sensor junction) (C)`
 - `sclk clock speed:`, `mclk clock speed:`（括弧内Mhz）
 - `VRAM Total Memory (B)`, `VRAM Total Used Memory (B)`
 - 電力キーは部分一致（`/power/i` かつ `/(W)/`）
+
+### 15.10 自動スクロールの実装
+
+`programScrollRef` フラグでプログラムスクロールとユーザースクロールを分離。ストリーミング中は `requestAnimationFrame` ループで `scrollTop` を直接操作（`scrollIntoView` のスムーズアニメーションは使わない）。
