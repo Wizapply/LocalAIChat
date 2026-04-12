@@ -1327,6 +1327,94 @@
     margin: 0 auto;
   }
 
+  /* ── Image Preview (Input Area) ── */
+  .image-preview-bar {
+    display: flex;
+    gap: 8px;
+    padding: 10px 16px 4px;
+    overflow-x: auto;
+    flex-wrap: wrap;
+  }
+
+  .image-preview-item {
+    position: relative;
+    width: 72px; height: 72px;
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    border: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .image-preview-item img {
+    width: 100%; height: 100%;
+    object-fit: cover;
+  }
+
+  .image-preview-remove {
+    position: absolute;
+    top: 2px; right: 2px;
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    background: rgba(0,0,0,0.6);
+    color: #fff;
+    border: none;
+    font-size: 11px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+  }
+
+  .image-preview-remove:hover { background: var(--red); }
+
+  /* ── Image Display (Messages) ── */
+  .msg-images {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+
+  .msg-image-thumb {
+    max-width: 280px;
+    max-height: 280px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    cursor: pointer;
+    transition: opacity 0.15s;
+    object-fit: contain;
+    background: var(--bg-tertiary);
+  }
+
+  .msg-image-thumb:hover { opacity: 0.85; }
+
+  .generated-image-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+  }
+
+  /* ── Image Lightbox ── */
+  .image-lightbox {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.85);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    cursor: pointer;
+    backdrop-filter: blur(4px);
+  }
+
+  .image-lightbox img {
+    max-width: 90vw;
+    max-height: 90vh;
+    object-fit: contain;
+    border-radius: var(--radius);
+  }
+
   .error-toast {
     position: fixed;
     bottom: 80px;
@@ -1743,7 +1831,10 @@ function App() {
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
   const fileInputRef = useRef(null);
+  const imageInputRef = useRef(null);
   const abortRef = useRef(null);
+  const [chatImages, setChatImages] = useState([]); // [{ name, base64, preview }]
+  const [lightboxSrc, setLightboxSrc] = useState(null);
 
   // ─── モデル一覧取得 ───
   const fetchModels = useCallback(async () => {
@@ -1839,11 +1930,18 @@ function App() {
   // ─── チャット送信 ───
   async function sendMessage() {
     const text = input.trim();
-    if (!text || isLoading || !chatModel) return;
+    const hasImages = chatImages.length > 0;
+    if ((!text && !hasImages) || isLoading || !chatModel) return;
 
-    const userMsg = { role: 'user', content: text };
+    const pendingImages = [...chatImages];
+    const userMsg = {
+      role: 'user',
+      content: text || '(画像を送信)',
+      images: hasImages ? pendingImages.map(img => ({ name: img.name, base64: img.base64, preview: img.preview })) : undefined,
+    };
     setMessages(prev => [...prev, userMsg]);
     setInput('');
+    setChatImages([]);
     setIsLoading(true);
     setError('');
     autoScrollRef.current = true;
@@ -1853,9 +1951,13 @@ function App() {
 
     try {
       const systemPrompt = 'あなたは親切で知識豊富なAIアシスタントです。日本語で回答してください。';
-      const history = [...messages, userMsg].slice(-20).map(m => ({
-        role: m.role, content: m.content,
-      }));
+      const history = [...messages, userMsg].slice(-20).map(m => {
+        const h = { role: m.role, content: m.content };
+        if (m.images && m.images.length > 0) {
+          h.images = m.images.map(img => img.base64);
+        }
+        return h;
+      });
       const ollamaOptions = { num_ctx: numCtx, top_k: appConfig.topK, top_p: appConfig.topP, temperature: appConfig.temperature };
 
       const useAgentic = appConfig.ragMode === 'agentic' && documents.length > 0;
@@ -1888,77 +1990,67 @@ function App() {
         let searchQueries = [];
 
         // アシスタントメッセージを先に追加
-        setMessages(prev => [...prev, { role: 'assistant', content: '', thinking: '', contexts: null, agentStatus: '検索判断中...', searchQueries: [] }]);
+        setMessages(prev => [...prev, { role: 'assistant', content: '', thinking: '', contexts: null, agentStatus: 'ツール判断中...', searchQueries: [] }]);
 
-        // ツール呼び出しループ（最大5回）
-        for (let iter = 0; iter < 5; iter++) {
-          const toolRes = await fetch(`${ollamaUrl}/api/chat`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model: chatModel,
-              messages: apiMessages,
-              tools,
-              stream: false,
-              options: ollamaOptions,
-            }),
-            signal: controller.signal,
-          });
+        // ステップ1: ツール呼び出し判断（非ストリーミング）
+        const toolRes = await fetch(`${ollamaUrl}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: chatModel,
+            messages: apiMessages,
+            tools,
+            stream: false,
+            options: ollamaOptions,
+          }),
+          signal: controller.signal,
+        });
 
-          if (!toolRes.ok) throw new Error(`API Error: ${toolRes.status}`);
-          const toolData = await toolRes.json();
-          const assistantMsg = toolData.message;
+        if (!toolRes.ok) throw new Error(`API Error: ${toolRes.status}`);
+        const toolData = await toolRes.json();
+        const assistantMsg = toolData.message;
 
-          if (!assistantMsg?.tool_calls || assistantMsg.tool_calls.length === 0) {
-            // ツール呼び出しなし → 直接回答（最終ストリーミングへ）
-            break;
-          }
-
-          // ツール呼び出し処理
+        // ステップ2: ツール呼び出しがあれば実行
+        if (assistantMsg?.tool_calls && assistantMsg.tool_calls.length > 0) {
           apiMessages.push(assistantMsg);
 
           for (const tc of assistantMsg.tool_calls) {
-            const query = tc.function?.arguments?.query || text;
-            searchQueries.push(query);
+            const fnName = tc.function?.name;
+            const fnArgs = tc.function?.arguments || {};
 
-            // UI更新
-            setMessages(prev => {
-              const copy = [...prev];
-              copy[copy.length - 1] = {
-                ...copy[copy.length - 1],
-                agentStatus: `「${query}」を検索中...`,
-                searchQueries: searchQueries.map(q => ({ query: q, resultCount: null })),
-              };
-              return copy;
-            });
+            if (fnName === 'search_documents') {
+              const query = fnArgs.query || text;
+              searchQueries.push({ query, resultCount: null });
 
-            const results = await retrieveContext(query);
-            allContexts.push(...results);
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = {
+                  ...copy[copy.length - 1],
+                  agentStatus: `「${query}」を検索中...`,
+                  searchQueries: [...searchQueries],
+                };
+                return copy;
+              });
 
-            // UI更新（結果件数反映）
-            const sqCopy = searchQueries.map((q, qi) => ({
-              query: q,
-              resultCount: qi < searchQueries.length - 1
-                ? (searchQueries[qi]._rc || 0)
-                : results.length,
-            }));
-            searchQueries[searchQueries.length - 1]._rc = results.length;
+              const results = await retrieveContext(query);
+              allContexts.push(...results);
+              searchQueries[searchQueries.length - 1].resultCount = results.length;
 
-            setMessages(prev => {
-              const copy = [...prev];
-              copy[copy.length - 1] = {
-                ...copy[copy.length - 1],
-                agentStatus: null,
-                searchQueries: searchQueries.map(q => ({ query: q, resultCount: q._rc || 0 })),
-              };
-              return copy;
-            });
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = {
+                  ...copy[copy.length - 1],
+                  agentStatus: null,
+                  searchQueries: [...searchQueries],
+                };
+                return copy;
+              });
 
-            const resultText = results.length > 0
-              ? results.map((c, i) => `[資料${i + 1}: ${c.docName}]\n${c.chunk}`).join('\n\n')
-              : '関連する資料が見つかりませんでした。';
-
-            apiMessages.push({ role: 'tool', content: resultText });
+              const resultText = results.length > 0
+                ? results.map((c, i) => `[資料${i + 1}: ${c.docName}]\n${c.chunk}`).join('\n\n')
+                : '関連する資料が見つかりませんでした。';
+              apiMessages.push({ role: 'tool', content: resultText });
+            }
           }
         }
 
@@ -1971,16 +2063,15 @@ function App() {
           return true;
         });
         const contextInfo = uniqueContexts.length > 0 ? uniqueContexts : null;
-        const finalSearchQueries = searchQueries.map(q => ({ query: q, resultCount: q._rc || 0 }));
 
-        // 最終ストリーミング応答
+        // ステップ3: 最終ストリーミング応答（toolsなしで即座にストリーム）
         setMessages(prev => {
           const copy = [...prev];
           copy[copy.length - 1] = {
             role: 'assistant', content: '', thinking: '',
             contexts: contextInfo,
-            agentStatus: null,
-            searchQueries: finalSearchQueries,
+            agentStatus: searchQueries.length > 0 ? '回答生成中...' : null,
+            searchQueries: searchQueries,
           };
           return copy;
         });
@@ -1998,7 +2089,7 @@ function App() {
         });
 
         if (!finalRes.ok) throw new Error(`API Error: ${finalRes.status}`);
-        await streamResponse(finalRes, contextInfo, finalSearchQueries);
+        await streamResponse(finalRes, contextInfo, searchQueries);
 
       } else {
         // ─── 従来モード（always）: 常にRAG検索してプロンプト注入 ───
@@ -2075,6 +2166,7 @@ function App() {
               thinking: displayThinking,
               contexts: contextInfo,
               searchQueries: searchQueries,
+              agentStatus: null,
             };
             return copy;
           });
@@ -2086,11 +2178,47 @@ function App() {
   // ─── ファイルハンドリング ───
   function handleFiles(files) {
     for (const file of files) {
+      if (file.type.startsWith('image/')) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const dataUrl = e.target.result;
+          const base64 = dataUrl.split(',')[1];
+          setChatImages(prev => [...prev, { name: file.name, base64, preview: dataUrl }]);
+        };
+        reader.readAsDataURL(file);
+      } else {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          addDocument(file.name, e.target.result);
+        };
+        reader.readAsText(file);
+      }
+    }
+  }
+
+  function handleImageFiles(files) {
+    for (const file of files) {
+      if (!file.type.startsWith('image/')) continue;
       const reader = new FileReader();
       reader.onload = (e) => {
-        addDocument(file.name, e.target.result);
+        const dataUrl = e.target.result;
+        const base64 = dataUrl.split(',')[1];
+        setChatImages(prev => [...prev, { name: file.name, base64, preview: dataUrl }]);
       };
-      reader.readAsText(file);
+      reader.readAsDataURL(file);
+    }
+  }
+
+  function handlePaste(e) {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type.startsWith('image/')) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (file) handleImageFiles([file]);
+        return;
+      }
     }
   }
 
@@ -2371,7 +2499,7 @@ function App() {
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".txt,.md,.csv,.json,.log,.html,.xml,.py,.js,.ts,.java,.c,.cpp,.rs,.go"
+              accept=".txt,.md,.csv,.json,.log,.html,.xml,.py,.js,.ts,.java,.c,.cpp,.rs,.go,image/*"
               style={{ display: 'none' }}
               onChange={e => { handleFiles(e.target.files); e.target.value = ''; }}
             />
@@ -2416,7 +2544,7 @@ function App() {
           >
             <div className="drop-zone-icon">📂</div>
             ファイルをドラッグ＆ドロップ
-            <div className="drop-zone-sub">txt, md, csv, json, コードファイル 対応</div>
+            <div className="drop-zone-sub">txt, md, csv, json, コードファイル, 画像 対応</div>
           </div>
         </div>
       </div>
@@ -2493,7 +2621,22 @@ function App() {
                   {msg.role === 'assistant' ? (
                     <div className="msg-bubble"><MarkdownContent content={msg.content} /></div>
                   ) : (
-                    <div className="msg-bubble user-bubble">{msg.content}</div>
+                    <React.Fragment>
+                      {msg.images && msg.images.length > 0 && (
+                        <div className="msg-images">
+                          {msg.images.map((img, imgIdx) => (
+                            <img
+                              key={imgIdx}
+                              src={img.preview || `data:image/jpeg;base64,${img.base64}`}
+                              alt={img.name}
+                              className="msg-image-thumb"
+                              onClick={() => setLightboxSrc(img.preview || `data:image/jpeg;base64,${img.base64}`)}
+                            />
+                          ))}
+                        </div>
+                      )}
+                      <div className="msg-bubble user-bubble">{msg.content}</div>
+                    </React.Fragment>
                   )}
                   {msg.role === 'assistant' && msg.content && !(isLoading && i === messages.length - 1) && (
                     <div className="msg-actions">
@@ -2545,13 +2688,24 @@ function App() {
 
         <div className="input-area">
           <div className="input-card">
+            {chatImages.length > 0 && (
+              <div className="image-preview-bar">
+                {chatImages.map((img, idx) => (
+                  <div key={idx} className="image-preview-item">
+                    <img src={img.preview} alt={img.name} />
+                    <button className="image-preview-remove" onClick={() => setChatImages(prev => prev.filter((_, j) => j !== idx))}>×</button>
+                  </div>
+                ))}
+              </div>
+            )}
             <textarea
               ref={inputRef}
               className="input-box"
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
-              placeholder={connected ? 'メッセージを入力...' : 'Ollamaに接続してください...'}
+              onPaste={handlePaste}
+              placeholder={connected ? 'メッセージを入力...（画像も貼り付け可）' : 'Ollamaに接続してください...'}
               rows={1}
               disabled={!connected}
               onInput={e => { e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px'; }}
@@ -2561,18 +2715,29 @@ function App() {
                 <button className="toolbar-btn" title="ドキュメントを追加" onClick={() => fileInputRef.current?.click()}>
                   📎
                 </button>
+                <button className="toolbar-btn" title="画像を追加" onClick={() => imageInputRef.current?.click()}>
+                  🖼️
+                </button>
               </div>
               {isLoading ? (
                 <button className="stop-btn" onClick={stopGeneration} title="生成を停止">
                   <div className="stop-icon" />
                 </button>
               ) : (
-                <button className="send-btn" onClick={sendMessage} disabled={!input.trim() || !connected}>
+                <button className="send-btn" onClick={sendMessage} disabled={(!input.trim() && chatImages.length === 0) || !connected}>
                   ➤
                 </button>
               )}
             </div>
           </div>
+          <input
+            ref={imageInputRef}
+            type="file"
+            multiple
+            accept="image/*"
+            style={{ display: 'none' }}
+            onChange={e => { handleImageFiles(e.target.files); e.target.value = ''; }}
+          />
           <div className="input-hint">Shift + Enter で改行</div>
         </div>
       </div>
@@ -2643,6 +2808,11 @@ function App() {
       </div>
 
       {error && <div className="error-toast">{error}</div>}
+      {lightboxSrc && (
+        <div className="image-lightbox" onClick={() => setLightboxSrc(null)}>
+          <img src={lightboxSrc} alt="拡大表示" />
+        </div>
+      )}
     </div>
   );
 }
