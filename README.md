@@ -12,7 +12,7 @@
 [![Ollama](https://img.shields.io/badge/Ollama-Local%20LLM-000000?logo=ollama)](https://ollama.com/)
 
 <!-- スクリーンショット -->
-<!-- <img src="docs/image.png" alt="LOCAL AI CHAT" width="800" /> -->
+<img src="docs/image.png" alt="LOCAL AI CHAT" width="800" />
 
 </div>
 
