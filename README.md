@@ -67,8 +67,8 @@ ollama pull nomic-embed-text    # Embedding用（RAG必須）
 ### 2. セットアップ
 
 ```bash
-git clone https://github.com/<your-username>/wizapply-ai-chat.git
-cd wizapply-ai-chat
+git clone https://github.com/Wizapply/LocalAIChat.git
+cd LocalAIChat
 npm install
 ```
 
