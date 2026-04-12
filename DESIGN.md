@@ -1,4 +1,4 @@
-# LOCAL AI CHAT — 設計ドキュメント
+# WIZAPPLY AI CHAT — 設計ドキュメント
 
 > このドキュメントはAIアシスタントがプロジェクトを理解し、修正・拡張を行うためのリファレンスです。
 
@@ -17,12 +17,12 @@ Ollama連携のAgentic RAGチャットWebアプリ。ローカルLLMを使い、
 ## 2. ファイル構成
 
 ```
-LocalAIChat/
+wizapply-ai-chat/
 ├── server.js              # バックエンド（Express + WS）  ~460行
 ├── package.json            # express, ws のみ
-├── config.json             # アプリ設定（名前・カラー・推論パラメータ）
+├── config.json             # アプリ設定（名前・カラー・モデル・推論パラメータ）
 ├── public/
-│   ├── index.html          # フロントエンド全体（CSS + React/Babel）  ~3040行
+│   ├── index.html          # フロントエンド全体（CSS + React/Babel）  ~3200行
 │   └── aiicon.jpg          # アイコン画像（favicon・ロゴ・AIアバター）
 ├── chats/                  # チャット履歴JSON（自動作成、.gitignore済）
 ├── settings.json           # ユーザー設定（自動作成、.gitignore済）
@@ -43,10 +43,11 @@ LocalAIChat/
 │                                                               │
 │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐  │
 │  │ サイドバー │ │ チャット  │ │ GPU監視   │ │ 入力エリア        │  │
-│  │ 設定      │ │ メッセージ│ │ パネル    │ │ テキスト+画像     │  │
-│  │ チャット履歴│ │ Thinking │ │ (SSE)    │ │ ペースト/D&D     │  │
-│  │ ドキュメント│ │ RAG参照  │ │          │ │                  │  │
+│  │ 設定      │ │ メッセージ│ │ +推論速度 │ │ テキスト+画像     │  │
+│  │ チャット履歴│ │ Thinking │ │ パネル    │ │ ペースト/D&D     │  │
+│  │ ドキュメント│ │ RAG参照  │ │ (SSE)    │ │                  │  │
 │  │           │ │ 3Dプレビュー│          │ │                  │  │
+│  │           │ │ トークン情報│          │ │                  │  │
 │  └──────────┘ └──────────┘ └──────────┘ └──────────────────┘  │
 └──────────┬────────────────────┬────────────────────┬──────────┘
            │ HTTP               │ SSE                │ WebSocket
@@ -84,12 +85,55 @@ LocalAIChat/
 | ソース | 用途 |
 |:--|:--|
 | 環境変数 | `PORT`, `OLLAMA_HOST`, `OLLAMA_PORT`, `PYTHON_TIMEOUT`, `GPU_INTERVAL`, `CHATS_DIR` |
-| `config.json` | アプリ名、カラー、RAGパラメータ、推論パラメータ（起動時1回読み込み） |
+| `config.json` | アプリ名、カラー、デフォルトモデル、RAGパラメータ、推論パラメータ（起動時1回読み込み） |
 | `settings.json` | ユーザーが選択したモデル、コンテキストサイズ（REST APIで読み書き） |
 
 `config.json` は `DEFAULT_CONFIG` とマージされるため、一部キーのみの記述でも動作する。
 
-### 4.3 Ollamaリバースプロキシ
+### 4.3 config.json 全キー
+
+```json
+{
+  "appName": "WIZAPPLY AI CHAT",
+  "logoMain": "WIZAPPLY",
+  "logoSub": "AI CHAT",
+  "welcomeMessage": "...",
+  "welcomeHints": ["...", "..."],
+  "accentColor": "#34d399",
+  "defaultModel": "",
+  "ragTopK": 10,
+  "ragMode": "agentic",
+  "tokenAvgWindow": 2000,
+  "topK": 40,
+  "topP": 0.9,
+  "temperature": 0.7
+}
+```
+
+| キー | 説明 | デフォルト |
+|:--|:--|:--|
+| `appName` | ページタイトル・ウェルカム画面 | `WIZAPPLY AI CHAT` |
+| `logoMain` / `logoSub` | サイドバーロゴ | `WIZAPPLY` / `AI CHAT` |
+| `welcomeMessage` | ウェルカム説明文 | — |
+| `welcomeHints` | ヒントチップ配列 | — |
+| `accentColor` | テーマカラー（HEX） | `#34d399` |
+| `defaultModel` | 初期モデル（空→一覧の先頭） | `""` |
+| `ragTopK` | RAG検索チャンク数 | `10` |
+| `ragMode` | `agentic` / `always` | `agentic` |
+| `tokenAvgWindow` | 推論速度の平均計算対象トークン数 | `2000` |
+| `topK` | Top-K サンプリング | `40` |
+| `topP` | Top-P サンプリング | `0.9` |
+| `temperature` | Temperature | `0.7` |
+
+### 4.4 モデル選択の優先順位
+
+```
+1. settings.json の chatModel（ユーザーがUIで最後に選択）
+2. config.json の defaultModel（初回起動時）
+3. Ollamaモデル一覧の先頭（上記2つとも空の場合）
+```
+
+### 4.5 Ollamaリバースプロキシ
 
 ```
 app.use('/api', ...)
@@ -97,23 +141,19 @@ app.use('/api', ...)
 
 - `http.request` で `OLLAMA_HOST:OLLAMA_PORT` へ転送
 - ストリーミング対応（`res.pipe`）
-- ログ出力: メソッド、パス、IPアドレス
 
 **注意**: `express.json()` をグローバルに適用するとOllamaプロキシのリクエストボディを消費する。`jsonParser` は `POST /chats/:id` と `POST /settings` のみに適用。
 
-### 4.4 WebSocket: Python実行
+### 4.6 WebSocket: Python実行
 
 ```
 /ws/python
 ```
 
 - `child_process.spawn('python3', ['-u', '-i'])` で対話シェルを起動
-- クライアントからコードを受信 → stdin に書き込み
-- stdout/stderr をクライアントに送信
-- タイムアウト: `PYTHON_TIMEOUT`（デフォルト60秒）
 - クライアントから `__STOP__` を受信すると `SIGKILL` で強制終了
 
-### 4.5 GPU監視（SSE）
+### 4.7 GPU監視（SSE）
 
 ```
 /sse/gpu
@@ -121,8 +161,6 @@ app.use('/api', ...)
 
 - 起動時に `rocm-smi` → `nvidia-smi` の順で自動検出、結果をキャッシュ（`gpuBackend` 変数）
 - `GPU_INTERVAL`（デフォルト1秒）ごとにJSONを送信
-- `rocm-smi`: `--showuse -t -P --showmeminfo vram -c --json` → JSONパース
-- `nvidia-smi`: `--query-gpu=... --format=csv,noheader,nounits` → CSVパース
 
 **GPU データ構造**:
 ```typescript
@@ -142,7 +180,7 @@ app.use('/api', ...)
 }
 ```
 
-### 4.6 REST API一覧
+### 4.8 REST API一覧
 
 | メソッド | パス | Body | 説明 |
 |:--|:--|:--|:--|
@@ -167,15 +205,15 @@ app.use('/api', ...)
 
 ```
 <head>
-  ├── CSS（~1500行） — ダークテーマ、レスポンシブ、プレビューUI
+  ├── CSS（~1600行） — ダークテーマ、レスポンシブ、プレビューUI
   └── CDN読み込み
 </head>
 <body>
   <div id="root" />
   <script type="text/babel">
     ├── ユーティリティ関数（chunkText, cosineSim, escapeHtml, renderLatex）
-    ├── Markdownカスタムレンダラー（コードブロック: コピー/Python実行/プレビューボタン）
-    ├── グローバル関数（copyCode, fallbackCopy, runPython, killPython, runPreview, closePreview, resizePreview）
+    ├── Markdownカスタムレンダラー（コピー/Python実行/プレビューボタン）
+    ├── グローバル関数（copyCode, fallbackCopy, runPython, runPreview, closePreview, resizePreview）
     ├── MarkdownContent コンポーネント
     ├── ThinkingBlock コンポーネント
     └── App コンポーネント（メイン）
@@ -219,13 +257,14 @@ App
 │   │       │   ├── コードブロック（コピー / Python実行 / プレビューボタン）
 │   │       │   └── Three.js / HTMLプレビュー（sandbox iframe）
 │   │       ├── アクション（ダウンロード、ドキュメントに追加）
-│   │       └── 参照資料（グループ化表示）
+│   │       ├── 参照資料（グループ化表示）
+│   │       └── トークン情報（入力/出力/合計 + コンテキスト使用率バー）
 │   ├── 入力エリア
 │   │   ├── 画像プレビューバー
 │   │   ├── テキストエリア（ペースト対応）
 │   │   └── ツールバー（📎, 🖼️, 送信/停止）
 │   └── ローディングオーバーレイ（チャット読み込み時）
-├── 右サイドバー（GPUモニター）
+├── 右サイドバー（GPUモニター + 推論速度）
 ├── 画像ライトボックス
 └── エラートースト
 ```
@@ -250,6 +289,7 @@ App
 | `embeddingJobs` | `EmbeddingJob[]` | Embedding生成中ジョブ |
 | `gpuData` | `GpuInfo[]` | GPU監視データ |
 | `gpuPanelOpen` | `boolean` | GPUパネル開閉 |
+| `tokenSpeed` | `TokenSpeed\|null` | 推論速度の平均値 |
 | `chatId` | `string` | 現在のチャットID |
 | `chatList` | `ChatSummary[]` | チャット一覧 |
 | `chatTitle` | `string` | 現在のチャットタイトル |
@@ -275,54 +315,26 @@ interface Message {
   images?: ChatImage[];          // ユーザーが添付した画像
   searchQueries?: SearchQuery[]; // Agenticの検索クエリ
   agentStatus?: string | null;   // Agentステータス表示
+  tokenInfo?: TokenInfo | null;  // トークン使用量
 }
 
-interface RagResult {
-  chunk: string;
-  docName: string;
-  score: number;
+interface TokenInfo {
+  promptTokens: number;     // 入力トークン数
+  completionTokens: number; // 出力トークン数
 }
 
-interface ChatImage {
-  name: string;
-  base64: string;      // 生base64（data:プレフィックスなし）
-  preview: string;     // data:URL（表示用）
+interface TokenSpeed {
+  tokPerSec: number;    // トークン/秒
+  totalTokens: number;  // 集計対象の合計トークン数
+  samples: number;      // 集計対象の応答回数
 }
 
-interface SearchQuery {
-  query: string;
-  resultCount: number | null;
-}
-
-interface EmbeddingJob {
-  id: string;
-  name: string;
-  current: number;
-  total: number;
-}
-
-interface ChatSummary {
-  id: string;
-  title: string;
-  updatedAt: string;
-  messageCount: number;
-  docCount: number;
-}
-
-interface GpuInfo {
-  id: string;
-  name?: string;
-  usage: number;
-  temp: number;
-  tempHotspot: number;
-  tempMem: number;
-  power: number;
-  sclk: number;
-  mclk: number;
-  vramTotalMB: number;
-  vramUsedMB: number;
-  vramPct: number;
-}
+interface RagResult { chunk: string; docName: string; score: number; }
+interface ChatImage { name: string; base64: string; preview: string; }
+interface SearchQuery { query: string; resultCount: number | null; }
+interface EmbeddingJob { id: string; name: string; current: number; total: number; }
+interface ChatSummary { id: string; title: string; updatedAt: string; messageCount: number; docCount: number; }
+interface GpuInfo { id: string; name?: string; usage: number; temp: number; tempHotspot: number; tempMem: number; power: number; sclk: number; mclk: number; vramTotalMB: number; vramUsedMB: number; vramPct: number; }
 ```
 
 ---
@@ -332,84 +344,39 @@ interface GpuInfo {
 ### 6.1 ドキュメント処理
 
 ```
-ファイルアップロード → chunkText() → getEmbedding() × N → documents stateに追加
+ファイルアップロード → chunkText(500文字, 100重複) → getEmbedding() × N → documents stateに追加
 ```
 
-- **チャンク分割**: `chunkText(text, chunkSize=500, overlap=100)` — 文字数ベース
-- **Embeddingモデル**: `nomic-embed-text:latest` 固定（`/api/embed` 経由）
+- **Embeddingモデル**: `nomic-embed-text:latest` 固定
 - **保存**: Embedding含めてチャット履歴JSONに保存（再読み込み時に再計算不要）
 
-### 6.2 検索
-
-```typescript
-retrieveContext(query) → getEmbedding(query) → cosineSim() × 全チャンク → Top-K
-```
-
-- コサイン類似度でソート → `appConfig.ragTopK` 件取得
-
-### 6.3 Agentic RAG（`ragMode: "agentic"`）
-
-LLMが自律的に検索するかどうかを判断する方式。
+### 6.2 Agentic RAG（`ragMode: "agentic"`）
 
 ```
-1. ユーザーメッセージ送信
-2. LLM呼び出し（stream: false, tools: [search_documents]）
-   → LLMが検索不要と判断 → ステップ4へ
-   → LLMが search_documents(query) を呼び出し → ステップ3
-3. retrieveContext(query) 実行 → 結果を tool message として追加
-4. LLM呼び出し（stream: true, tools なし）→ ストリーミング応答
+1. LLM呼び出し（stream: false, tools: [search_documents]）→ 検索判断
+2. search_documents(query) → retrieveContext() → 結果を tool message に追加
+3. LLM呼び出し（stream: true, tools なし）→ ストリーミング応答
 ```
 
-**UI表示フロー**:
-- 「ツール判断中...」→「"クエリ"を検索中...」→ ストリーミング開始
-
-**制約**:
-- 検索は1ターンで1回の判断（ループなし — 非ストリーミング呼び出しの2回目で応答が止まる問題を回避）
-- LLMが1回のtool_callsで複数検索を返した場合は全て実行
-- ツール呼び出し非対応モデルでは `ragMode: "always"` を使用
-
-### 6.4 従来RAG（`ragMode: "always"`）
+### 6.3 従来RAG（`ragMode: "always"`）
 
 ```
-1. ユーザーメッセージ → retrieveContext() → 常に検索
-2. 結果をsystemプロンプトに注入
-3. LLM呼び出し（stream: true）
+1. retrieveContext(ユーザーメッセージ) → systemプロンプトに注入
+2. LLM呼び出し（stream: true）
 ```
 
 ---
 
 ## 7. 画像入力
 
-### 7.1 入力方法
-
 | 方法 | ハンドラ |
 |:--|:--|
 | 🖼️ ボタン | `imageInputRef` → `handleImageFiles()` |
-| 📎 ボタン（画像ファイル選択時） | `fileInputRef` → `handleFiles()` → 画像判定 |
-| クリップボードペースト | `handlePaste()` → `handleImageFiles()` |
-| ドラッグ＆ドロップ | `handleDrop()` → `handleFiles()` → 画像判定 |
+| 📎 ボタン | `fileInputRef` → `handleFiles()` → 画像判定 |
+| クリップボードペースト | `handlePaste()` |
+| ドラッグ＆ドロップ | `handleDrop()` → `handleFiles()` |
 
-### 7.2 データフロー
-
-```
-File → FileReader.readAsDataURL → base64抽出 → chatImages state
-  → 送信時: userMsg.images に格納 → Ollama API の images フィールドに base64配列
-  → メッセージ表示: preview URLでサムネイル → クリックでライトボックス
-```
-
-### 7.3 Ollama APIへの送信形式
-
-```json
-{
-  "model": "gemma3:12b",
-  "messages": [
-    { "role": "user", "content": "この画像は何？", "images": ["base64..."] }
-  ]
-}
-```
-
-- `images` は生base64文字列の配列（`data:` プレフィックスなし）
-- 会話履歴の過去メッセージの画像も含める
+Ollama APIの `images` フィールドに生base64配列として送信。会話履歴の全画像を含める。
 
 ---
 
@@ -417,165 +384,107 @@ File → FileReader.readAsDataURL → base64抽出 → chatImages state
 
 ### 8.1 対応言語
 
-コードブロックの言語指定が以下にマッチする場合、**▶ プレビュー** ボタンを表示:
-
 ```
 /^(html|threejs|three\.js|3d|webgl|canvas)$/
 ```
 
-### 8.2 実行関数: `runPreview()`
-
-sandboxed iframe（`sandbox="allow-scripts"`）内でコードを実行する。
-
-### 8.3 自動処理パイプライン
+### 8.2 自動処理パイプライン
 
 ```
-LLMのコード出力
-  ↓
-1. LLMが生成した壊れたThree.js scriptタグを正規表現で全除去
-   正規表現: /<script[^>]*src=["'][^"']*(?:three|THREE)[^"']*["'][^>]*><\/script>/gi
-  ↓
-2. 正規CDNを注入
-   - three.js r128 (cdnjs.cloudflare.com)
-   - OrbitControls (cdn.jsdelivr.net)
-   - グローバルシム: window.OrbitControls = THREE.OrbitControls
-  ↓
-3. ESM → UMD 変換（順序重要）
-   a. import * as THREE from '...'  → コメント化
-   b. import THREE from '...'       → コメント化
-   c. import { X } from 'three/examples/...'  → コメント化（シムで定義済み）
-   d. import { X, Y } from 'three'  → const { X, Y } = THREE;
-   e. <script type="module">        → <script>
-  ↓
-4. コード未完全HTML時のラッピング
-   - <html>/<head>/<body> 自動付与
-   - body { margin:0; overflow:hidden; background:#000 } 自動付与
-   - JSのみのコードは <script> で囲む
-  ↓
-5. エラーヘルパー注入
-   - window.onerror でiframe内のエラーを赤オーバーレイ表示（8秒で消去）
-  ↓
-6. iframe.srcdoc に設定
+LLMのコード → 壊れたThree.js scriptタグ全除去(正規表現)
+  → 正規CDN注入(r128 + OrbitControls + window.OrbitControlsシム)
+  → ESM→UMD変換(順序: addons先→three後)
+    import * as THREE → コメント化
+    import {X} from 'three/addons/...' → コメント化(シムで定義済み)
+    import {X,Y} from 'three' → const {X,Y} = THREE
+    <script type="module"> → <script>
+  → 非HTMLならラッピング(html/head/body/style自動付与)
+  → エラーヘルパー注入(onerror→赤オーバーレイ8秒)
+  → iframe.srcdoc(sandbox="allow-scripts")
 ```
 
-### 8.4 UI機能
+### 8.3 Three.js バージョン注意
 
-- **サイズ変更**: S(300px) / M(400px) / L(600px) / XL(800px)
-- **閉じる**: ✕ボタンまたは▶プレビューボタン再クリック
-- **エラー表示**: iframe内の `window.onerror` でオーバーレイ表示
-
-### 8.5 Three.js バージョン注意
-
-r128（UMDビルド）を使用。r142以降の API（`CapsuleGeometry` 等）は使用不可。`THREE.OrbitControls` として登録される（ESMの `import` ではなくグローバル）。
+r128（UMDビルド）。`THREE.OrbitControls` としてグローバル登録。r142以降のAPI不可。
 
 ---
 
-## 9. コードブロック処理
+## 9. トークン情報 & 推論速度
 
-### 9.1 カスタムレンダラー
+### 9.1 トークン情報（メッセージ下部）
 
-`marked.Renderer` の `code` メソッドをオーバーライド。
+Ollamaの最終チャンク（`done: true`）に含まれる `prompt_eval_count` と `eval_count` を取得。
 
-```
-コードブロック検出
-  → highlight.js でハイライト
-  → ヘッダー生成（言語名 + アクションボタン）
-     ├── Python → ▶ 実行 ボタン
-     ├── html/threejs/3d/webgl/canvas → ▶ プレビュー ボタン
-     └── 全て → コピー ボタン
-  → <pre><code id="code-xxxxx"> でラップ
-  → 出力エリア <div id="output-xxxxx"> を付与
-```
+表示: `入力: X  出力: Y  計: Z  | 使用率バー(%) コンテキストサイズ`
 
-### 9.2 コピー機能
+使用率バーの色: 緑(<70%) → オレンジ(70-90%) → 赤(90%+)
 
-```javascript
-window.copyCode(btn, id)
-  → HTTPS: navigator.clipboard.writeText()
-  → HTTP:  fallbackCopy() — textarea + document.execCommand('copy')
-```
+### 9.2 推論速度（GPUパネル）
 
-HTTP環境（`http://` ドメイン）では `navigator.clipboard` が使えないため、`window.isSecureContext` を判定してフォールバック。
+`eval_count` / `eval_duration`（ナノ秒）からトークン/秒を計算。
 
-### 9.3 Python実行
+- `tokenHistoryRef` に各応答の `{ tokens, durationNs }` を蓄積
+- 合計トークン数が `appConfig.tokenAvgWindow`（デフォルト2000）を超えたら古いものから削除
+- 平均 = 合計トークン / 合計時間
 
-```javascript
-window.runPython(codeId, btn)
-  → WebSocket /ws/python に接続
-  → コード送信 → stdout/stderr をリアルタイム表示
-  → stdin入力対応（テキストボックス + 送信ボタン）
-  → 停止ボタン → __STOP__ 送信 → SIGKILL
-```
+GPUパネル上部に `23.4 tok/s` + `直近 1,847 トークン / 5 回` と表示。
 
 ---
 
-## 10. 自動スクロール
+## 10. コードブロック処理
 
-### 10.1 課題
+### 10.1 カスタムレンダラー
 
-ストリーミング中に `scrollIntoView({ behavior: 'smooth' })` を毎チャンク呼ぶと、スムーズアニメーションが追いつかず途中で止まる。また `scrollTop = scrollHeight` がブラウザの `scroll` イベントを発火させ、ユーザーの手動スクロールと誤判定される。
+| 言語 | ボタン |
+|:--|:--|
+| `python`, `py` 等 | ▶ 実行 + コピー |
+| `html`, `threejs`, `3d` 等 | ▶ プレビュー + コピー |
+| その他 | コピー |
 
-### 10.2 解決策
+### 10.2 コピー機能
+
+HTTPS: `navigator.clipboard.writeText()` / HTTP: `fallbackCopy()`（textarea + `execCommand('copy')`）
+
+---
+
+## 11. 自動スクロール
 
 ```
 autoScrollRef    — 自動スクロール有効フラグ
 programScrollRef — プログラムスクロール中フラグ
 
-scroll イベント:
-  programScrollRef が true → 無視（プログラムによるスクロール）
-  bottom付近(80px以内)なら autoScrollRef = true
-  上にスクロールしたら autoScrollRef = false
-
-ストリーミング中:
-  rAF ループで毎フレーム scrollTop = scrollHeight
-  （programScrollRef で保護してscrollイベントと競合しない）
-
-メッセージ送信時:
-  autoScrollRef = true にリセット
+ストリーミング中: rAF ループで scrollTop = scrollHeight（programScrollRefで保護）
+ユーザーが上にスクロール: autoScrollRef = false で追従停止
+メッセージ送信: autoScrollRef = true にリセット
 ```
 
 ---
 
-## 11. チャット履歴
+## 12. チャット履歴
 
-### 11.1 保存タイミング
-
-- メッセージ・ドキュメント変更時（1.5秒デバウンス、生成中は保存しない）
-- `POST /chats/:id` に `{ title, messages, documents }` を送信
-
-### 11.2 保存データ
+### 12.1 保存データ
 
 ```json
 {
-  "id": "m1abc123",
-  "title": "最初のユーザーメッセージ先頭40文字",
-  "createdAt": "2025-...",
-  "updatedAt": "2025-...",
-  "messages": [
-    { "role": "user", "content": "...", "images": [...] },
-    { "role": "assistant", "content": "...", "thinking": "...", "contexts": [...], "searchQueries": [...] }
-  ],
-  "documents": [
-    { "name": "file.cpp", "text": "...", "chunks": ["..."], "embeddings": [[...]] }
-  ]
+  "title": "...",
+  "messages": [{ "role": "...", "content": "...", "images": [...], "tokenInfo": {...} }],
+  "documents": [{ "name": "...", "text": "...", "chunks": [...], "embeddings": [[...]] }]
 }
 ```
 
-### 11.3 グローバル設定（settings.json）
+- 1.5秒デバウンス、生成中は保存しない
+- 画像base64も保存 → `jsonParser` limit `10mb`
 
-- チャットモデルとコンテキストサイズのみ
-- ブラウザから変更時に0.5秒デバウンスで自動保存
-- 初回読み込み時に反映（初回保存スキップ用の `settingsInitRef` あり）
+### 12.2 グローバル設定（settings.json）
+
+- `chatModel` と `numCtx` のみ
+- 0.5秒デバウンス自動保存
 
 ---
 
-## 12. CSS設計
+## 13. CSS設計
 
-### 12.1 テーマ
-
-ダークテーマ固定。CSS変数で定義。`config.json` の `accentColor` から `--accent`, `--accent-dim`, `--accent-glow` を動的に上書き。
-
-### 12.2 レイアウト
+### 13.1 レイアウト
 
 ```
 .app-layout: CSS Grid — grid-template-columns: 340px minmax(0, 1fr)
@@ -587,109 +496,30 @@ scroll イベント:
   └── .right-sidebar: GPUパネル（固定幅320px、右からスライドイン）
 ```
 
-### 12.3 レスポンシブ（768px以下）
+### 13.2 レイアウト修正の注意点
 
-- `.app-layout`: `grid-template-columns: 1fr`
-- サイドバー: オーバーレイスライドイン（ハンバーガーメニュー）
-- GPUパネル: オーバーレイスライドイン
+- `.app-layout` の `minmax(0, 1fr)` が重要（`1fr` のみだとはみ出す）
+- `.msg-content`: `min-width: 0; overflow-x: hidden` 必須
+- `.msg-bubble`: `overflow-x: auto; min-width: 0` 必須
+- `.messages-container`: `min-height: 0` 必須
 
-### 12.4 レイアウト修正の注意点
+### 13.3 テーマカラー動的上書き
 
-- `.app-layout` の `minmax(0, 1fr)` が重要。`1fr` のみだとコンテンツがはみ出す
-- `.msg-content` には `min-width: 0; overflow-x: hidden` が必須
-- `.msg-bubble` には `overflow-x: auto; min-width: 0` が必須
-- `.messages-container` には `min-height: 0` が必須（flex子要素のスクロール）
-- `overflow: hidden` を `.msg-content` に付けると縦方向も切り詰めるため使用不可
+`config.json` の `accentColor` から `--accent`, `--accent-dim`, `--accent-glow` をJS側でCSSカスタムプロパティに設定。
 
 ---
 
-## 13. Markdown / LaTeX レンダリング
+## 14. 拡張時の注意事項
 
-### 13.1 処理順序
-
-```
-content
-  → コードブロック内の$を保護（__DOLLAR_INLINE__ / __DOLLAR_DISPLAY__）
-  → renderLatex() — $...$ / $$...$$ / \(...\) / \[...\] を KaTeX でレンダリング
-  → marked.parse() — Markdownレンダリング（カスタムレンダラー適用）
-  → highlight.js — コードハイライト
-  → コピーボタン追加（各コードブロック）
-  → Pythonコードブロックに「▶ 実行」ボタン追加
-  → html/threejs等に「▶ プレビュー」ボタン追加
-```
-
-### 13.2 markedカスタムレンダラー
-
-- 引数形式: v12+（オブジェクト `{ text, lang }`）と旧バージョン（位置引数 `code, lang`）の両方に対応
-
----
-
-## 14. Thinking表示
-
-### 14.1 対応形式
-
-| 形式 | ソース |
+| 項目 | 注意 |
 |:--|:--|
-| `message.thinking` フィールド | Ollama APIのネイティブthinking |
-| `<think>...</think>` タグ | DeepSeek R1等のコンテンツ内タグ |
-
-### 14.2 パース処理
-
-```javascript
-const thinkMatch = content.match(/^<think>([\s\S]*?)(<\/think>)?([\s\S]*)$/);
-if (thinkMatch) {
-  displayThinking = (apiThinking + tagThinking).trim();
-  displayContent = closed ? afterThink.trim() : '';
-}
-```
-
-- ストリーミング中は `<think>` が閉じるまで `displayContent` は空文字
-- 両形式は結合される
-
----
-
-## 15. 拡張時の注意事項
-
-### 15.1 express.json() の適用範囲
-
-`express.json()` をグローバルに適用するとOllamaプロキシのリクエストボディを消費する。`jsonParser` は個別ルートにのみ適用すること。
-
-### 15.2 ストリーミング応答の処理
-
-`streamResponse()` 関数に共通化済み。新しいモードを追加する場合はこの関数を再利用。
-
-### 15.3 チャット保存のデバウンス
-
-`isLoading` 中は保存しない。ストリーミング中にメッセージが高頻度更新されるため、生成完了後に1.5秒後保存。
-
-### 15.4 Embeddingモデル
-
-`nomic-embed-text:latest` 固定（ソースコード内定数）。変更する場合は `embedModel` 変数を修正。
-
-### 15.5 Agentic RAGのモデル互換性
-
-Ollamaの `tools` パラメータ（Tool Calling）対応が必要。非対応モデルでは `ragMode: "always"` に切り替え。
-
-### 15.6 画像保存
-
-チャット履歴に画像をbase64で保存するため、大量の画像を含むチャットはJSONファイルが大きくなる。`jsonParser` の `limit` は `10mb` に設定済み。
-
-### 15.7 Three.jsプレビューのバージョン
-
-r128（UMDビルド）を使用。LLMがESMの `import` 構文や壊れたCDN URLを出力しても自動変換・修正される。r142以降のAPIは使用不可。
-
-### 15.8 コピー機能のHTTP対応
-
-`navigator.clipboard` はHTTPS必須。HTTP環境では `document.execCommand('copy')` にフォールバック。`window.isSecureContext` で判定。
-
-### 15.9 rocm-smiのキー名
-
-ROCmバージョンによりJSONキー名が異なる。現在のパーサーは以下のキー名に最適化:
-- `GPU use (%)`, `Temperature (Sensor edge) (C)`, `Temperature (Sensor junction) (C)`
-- `sclk clock speed:`, `mclk clock speed:`（括弧内Mhz）
-- `VRAM Total Memory (B)`, `VRAM Total Used Memory (B)`
-- 電力キーは部分一致（`/power/i` かつ `/(W)/`）
-
-### 15.10 自動スクロールの実装
-
-`programScrollRef` フラグでプログラムスクロールとユーザースクロールを分離。ストリーミング中は `requestAnimationFrame` ループで `scrollTop` を直接操作（`scrollIntoView` のスムーズアニメーションは使わない）。
+| express.json() | グローバル適用禁止。個別ルートのみ |
+| ストリーミング | `streamResponse()` に共通化済み。新モードでも再利用 |
+| Embeddingモデル | `nomic-embed-text:latest` 固定（`embedModel` 変数） |
+| Agentic RAG | Tool Calling対応モデル必須。非対応モデルは `ragMode: "always"` |
+| 画像保存 | base64でJSON保存。大量画像は容量増大。limit: 10mb |
+| Three.js | r128 UMD。ESM import / 壊れたURL は自動変換・修正 |
+| コピー機能 | HTTP環境は `execCommand('copy')` フォールバック |
+| rocm-smiキー名 | ROCmバージョンで異なる。電力キーは部分一致 |
+| 自動スクロール | `programScrollRef` でプログラム/ユーザースクロール分離 |
+| marked引数形式 | v12+（オブジェクト）と旧（位置引数）の両方に対応 |

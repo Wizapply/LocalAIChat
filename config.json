@@ -5,8 +5,10 @@
   "welcomeMessage": "ドキュメントをアップロードしてRAGベースの質問応答を行うか、自由にチャットを開始できます。",
   "welcomeHints": ["ドキュメントを要約して", "この資料の要点は？", "〇〇について教えて"],
   "accentColor": "#34d399",
-  "ragTopK": 10,
+  "defaultModel": "",
+  "ragTopK": 30,
   "ragMode": "agentic",
+  "tokenAvgWindow": 3000,
   "topK": 40,
   "topP": 0.9,
   "temperature": 0.9

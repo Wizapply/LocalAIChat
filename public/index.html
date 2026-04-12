@@ -594,6 +594,44 @@
     padding: 24px 8px;
   }
 
+  .inference-speed-card {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+    margin-bottom: 12px;
+  }
+
+  .inference-speed-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .inference-speed-value {
+    font-size: 22px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    color: var(--accent);
+    line-height: 1;
+  }
+
+  .inference-speed-unit {
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-muted);
+    margin-left: 4px;
+  }
+
+  .inference-speed-meta {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: 6px;
+  }
+
   /* ── Chat Area ── */
   .chat-area {
     display: flex;
@@ -1095,6 +1133,47 @@
     letter-spacing: 0.06em;
     color: var(--accent);
     margin-bottom: 4px;
+  }
+
+  /* ── Token Info ── */
+  .token-info {
+    margin-top: 8px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .token-info-items {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .token-info-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .token-info-label { opacity: 0.7; }
+
+  .token-info-value { font-family: var(--font-mono); font-weight: 500; }
+
+  .ctx-bar-wrap {
+    flex: 1;
+    max-width: 160px;
+    height: 6px;
+    background: var(--bg-tertiary);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+
+  .ctx-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s;
   }
 
   /* ── Thinking Block ── */
@@ -2010,8 +2089,10 @@ function App() {
     welcomeMessage: 'ドキュメントをアップロードしてRAGベースの質問応答を行うか、自由にチャットを開始できます。',
     welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
     accentColor: '#34d399',
+    defaultModel: '',
     ragTopK: 10,
     ragMode: 'agentic',
+    tokenAvgWindow: 2000,
     topK: 40,
     topP: 0.9,
     temperature: 0.7,
@@ -2019,7 +2100,7 @@ function App() {
 
   // ─── Ollama接続先（変更する場合はここを編集）───
   const [ollamaUrl] = useState('');
-  const [chatModel, setChatModel] = useState('gemma4:31b');
+  const [chatModel, setChatModel] = useState('');
   const embedModel = 'nomic-embed-text:latest';
   const [availableModels, setAvailableModels] = useState([]);
   const [connected, setConnected] = useState(false);
@@ -2037,6 +2118,8 @@ function App() {
   const [embeddingJobs, setEmbeddingJobs] = useState([]); // { name, current, total }
   const [gpuData, setGpuData] = useState([]);
   const [gpuPanelOpen, setGpuPanelOpen] = useState(false);
+  const [tokenSpeed, setTokenSpeed] = useState(null); // { tokPerSec, totalTokens }
+  const tokenHistoryRef = useRef([]); // [{ tokens, durationNs }]
   const [chatId, setChatId] = useState(() => Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
   const [chatList, setChatList] = useState([]);
   const [chatTitle, setChatTitle] = useState('');
@@ -2351,6 +2434,7 @@ function App() {
     const decoder = new TextDecoder();
     let assistantContent = '';
     let assistantThinking = '';
+    let tokenInfo = null;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -2362,6 +2446,32 @@ function App() {
           const json = JSON.parse(line);
           if (json.message?.thinking) assistantThinking += json.message.thinking;
           if (json.message?.content) assistantContent += json.message.content;
+
+          // 最終チャンク（done: true）にトークン情報が含まれる
+          if (json.done && json.prompt_eval_count != null) {
+            tokenInfo = {
+              promptTokens: json.prompt_eval_count || 0,
+              completionTokens: json.eval_count || 0,
+            };
+            // トークン速度履歴を更新
+            if (json.eval_count > 0 && json.eval_duration > 0) {
+              const hist = tokenHistoryRef.current;
+              hist.push({ tokens: json.eval_count, durationNs: json.eval_duration });
+              // ウィンドウサイズを超えたら古いものから削除
+              const win = appConfig.tokenAvgWindow || 2000;
+              let totalTok = hist.reduce((s, h) => s + h.tokens, 0);
+              while (hist.length > 1 && totalTok > win) {
+                totalTok -= hist[0].tokens;
+                hist.shift();
+              }
+              const totalNs = hist.reduce((s, h) => s + h.durationNs, 0);
+              setTokenSpeed({
+                tokPerSec: totalNs > 0 ? (totalTok / (totalNs / 1e9)) : 0,
+                totalTokens: totalTok,
+                samples: hist.length,
+              });
+            }
+          }
 
           let displayContent = assistantContent;
           let displayThinking = assistantThinking;
@@ -2382,6 +2492,7 @@ function App() {
               contexts: contextInfo,
               searchQueries: searchQueries,
               agentStatus: null,
+              tokenInfo: tokenInfo,
             };
             return copy;
           });
@@ -2570,8 +2681,9 @@ function App() {
     (async () => {
       try {
         const [cfgRes, setRes] = await Promise.all([fetch('/config'), fetch('/settings')]);
+        let cfg = null;
         if (cfgRes.ok) {
-          const cfg = await cfgRes.json();
+          cfg = await cfgRes.json();
           setAppConfig(prev => ({ ...prev, ...cfg }));
           document.title = cfg.appName || 'WIZAPPLY AI CHAT';
           if (cfg.accentColor) {
@@ -2585,7 +2697,10 @@ function App() {
         if (setRes.ok) {
           const s = await setRes.json();
           if (s.chatModel) setChatModel(s.chatModel);
+          else if (cfg?.defaultModel) setChatModel(cfg.defaultModel);
           if (s.numCtx) setNumCtx(s.numCtx);
+        } else if (cfg?.defaultModel) {
+          setChatModel(cfg.defaultModel);
         }
       } catch {}
     })();
@@ -2885,6 +3000,36 @@ function App() {
                       </div>
                     );
                   })()}
+                  {msg.tokenInfo && !(isLoading && i === messages.length - 1) && (() => {
+                    const total = msg.tokenInfo.promptTokens + msg.tokenInfo.completionTokens;
+                    const pct = numCtx > 0 ? Math.round(msg.tokenInfo.promptTokens / numCtx * 100) : 0;
+                    const barColor = pct >= 90 ? 'var(--red)' : pct >= 70 ? 'var(--orange)' : 'var(--green)';
+                    return (
+                      <div className="token-info">
+                        <div className="token-info-items">
+                          <div className="token-info-item">
+                            <span className="token-info-label">入力:</span>
+                            <span className="token-info-value">{msg.tokenInfo.promptTokens.toLocaleString()}</span>
+                          </div>
+                          <div className="token-info-item">
+                            <span className="token-info-label">出力:</span>
+                            <span className="token-info-value">{msg.tokenInfo.completionTokens.toLocaleString()}</span>
+                          </div>
+                          <div className="token-info-item">
+                            <span className="token-info-label">計:</span>
+                            <span className="token-info-value">{total.toLocaleString()}</span>
+                          </div>
+                        </div>
+                        <div className="token-info-item">
+                          <span className="token-info-label">{pct}%</span>
+                          <div className="ctx-bar-wrap">
+                            <div className="ctx-bar-fill" style={{ width: `${Math.min(pct, 100)}%`, background: barColor }} />
+                          </div>
+                          <span className="token-info-label">{(numCtx / 1024).toFixed(0)}K</span>
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
             ))
@@ -2968,8 +3113,20 @@ function App() {
           <button className="clear-btn" onClick={() => setGpuPanelOpen(false)}>✕</button>
         </div>
         <div className="gpu-panel-body">
+          {tokenSpeed && (
+            <div className="inference-speed-card">
+              <div className="inference-speed-label">推論速度（直近平均）</div>
+              <div>
+                <span className="inference-speed-value">{tokenSpeed.tokPerSec.toFixed(1)}</span>
+                <span className="inference-speed-unit">tok/s</span>
+              </div>
+              <div className="inference-speed-meta">
+                直近 {tokenSpeed.totalTokens.toLocaleString()} トークン / {tokenSpeed.samples} 回
+              </div>
+            </div>
+          )}
           {gpuData.length === 0 ? (
-            <div className="gpu-offline">rocm-smi 未検出</div>
+            <div className="gpu-offline">GPU 未検出</div>
           ) : (
             gpuData.map((gpu, gi) => {
               const vramPct = gpu.vramPct || 0;
