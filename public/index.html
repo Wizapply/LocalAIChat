@@ -1096,6 +1096,60 @@
   .thinking-content::-webkit-scrollbar-track { background: transparent; }
   .thinking-content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 
+  /* ── Agent Search Activity ── */
+  .agent-activity {
+    margin-bottom: 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-tertiary);
+    padding: 10px 14px;
+  }
+
+  .agent-activity-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .agent-activity-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    flex-shrink: 0;
+    animation: pulse-dot 1.5s infinite;
+  }
+
+  .agent-activity-dot.done { animation: none; background: var(--text-muted); }
+
+  .agent-search-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-muted);
+    padding: 3px 0;
+  }
+
+  .agent-search-icon {
+    font-size: 12px;
+    flex-shrink: 0;
+  }
+
+  .agent-search-query {
+    color: var(--accent);
+    font-weight: 500;
+  }
+
+  .agent-search-result {
+    color: var(--text-muted);
+    margin-left: auto;
+    font-size: 10px;
+  }
+
   .thinking-indicator {
     display: flex; align-items: center; gap: 6px;
     padding: 14px 18px;
@@ -1654,6 +1708,7 @@ function App() {
     welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
     accentColor: '#34d399',
     ragTopK: 10,
+    ragMode: 'agentic',
     topK: 40,
     topP: 0.9,
     temperature: 0.7,
@@ -1797,89 +1852,234 @@ function App() {
     abortRef.current = controller;
 
     try {
-      // RAG コンテキスト取得
-      const contexts = await retrieveContext(text);
-      let systemPrompt = 'あなたは親切で知識豊富なAIアシスタントです。日本語で回答してください。';
-      if (contexts.length > 0) {
-        const ctxText = contexts.map((c, i) => `[資料${i + 1}: ${c.docName}]\n${c.chunk}`).join('\n\n');
-        systemPrompt += `\n\n以下の参考資料に基づいて回答してください。資料に無い情報は推測であることを明示してください。\n\n${ctxText}`;
-      }
-
-      // Ollama API呼び出し（ストリーミング）
+      const systemPrompt = 'あなたは親切で知識豊富なAIアシスタントです。日本語で回答してください。';
       const history = [...messages, userMsg].slice(-20).map(m => ({
         role: m.role, content: m.content,
       }));
+      const ollamaOptions = { num_ctx: numCtx, top_k: appConfig.topK, top_p: appConfig.topP, temperature: appConfig.temperature };
 
-      const res = await fetch(`${ollamaUrl}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: chatModel,
-          messages: [{ role: 'system', content: systemPrompt }, ...history],
-          stream: true,
-          options: { num_ctx: numCtx, top_k: appConfig.topK, top_p: appConfig.topP, temperature: appConfig.temperature },
-        }),
-        signal: controller.signal,
-      });
+      const useAgentic = appConfig.ragMode === 'agentic' && documents.length > 0;
 
-      if (!res.ok) throw new Error(`API Error: ${res.status}`);
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let assistantContent = '';
-      let assistantThinking = '';
-      const contextInfo = contexts.length > 0 ? contexts : null;
-
-      setMessages(prev => [...prev, { role: 'assistant', content: '', thinking: '', contexts: contextInfo }]);
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n').filter(Boolean);
-        for (const line of lines) {
-          try {
-            const json = JSON.parse(line);
-            // Ollama API の thinking フィールド対応
-            if (json.message?.thinking) {
-              assistantThinking += json.message.thinking;
+      if (useAgentic) {
+        // ─── Agentic RAG: LLMがツールで検索を判断 ───
+        const tools = [{
+          type: 'function',
+          function: {
+            name: 'search_documents',
+            description: 'アップロード済みドキュメントから関連情報を検索する。ユーザーの質問に答えるために必要に応じて使用する。異なるキーワードで複数回検索可能。',
+            parameters: {
+              type: 'object',
+              properties: {
+                query: { type: 'string', description: '検索クエリ（質問の核心を簡潔に）' }
+              },
+              required: ['query']
             }
-            if (json.message?.content) {
-              assistantContent += json.message.content;
-            }
-            // content内の <think> タグ対応 (DeepSeek R1等)
-            let displayContent = assistantContent;
-            let displayThinking = assistantThinking;
-            const thinkMatch = assistantContent.match(/^<think>([\s\S]*?)(<\/think>)?([\s\S]*)$/);
-            if (thinkMatch) {
-              const tagThinking = thinkMatch[1] || '';
-              const closed = !!thinkMatch[2];
-              const afterThink = thinkMatch[3] || '';
-              displayThinking = (assistantThinking + tagThinking).trim();
-              displayContent = closed ? afterThink.trim() : '';
-            }
+          }
+        }];
+
+        const docListText = documents.map(d => d.name).join(', ');
+        const agentSystem = systemPrompt
+          + `\n\n以下のドキュメントが参照可能です: ${docListText}`
+          + '\nユーザーの質問に答えるために、必要に応じて search_documents ツールでドキュメントを検索してください。'
+          + '\n検索結果に基づいて回答し、資料に無い情報は推測であることを明示してください。';
+
+        let apiMessages = [{ role: 'system', content: agentSystem }, ...history];
+        let allContexts = [];
+        let searchQueries = [];
+
+        // アシスタントメッセージを先に追加
+        setMessages(prev => [...prev, { role: 'assistant', content: '', thinking: '', contexts: null, agentStatus: '検索判断中...', searchQueries: [] }]);
+
+        // ツール呼び出しループ（最大5回）
+        for (let iter = 0; iter < 5; iter++) {
+          const toolRes = await fetch(`${ollamaUrl}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: chatModel,
+              messages: apiMessages,
+              tools,
+              stream: false,
+              options: ollamaOptions,
+            }),
+            signal: controller.signal,
+          });
+
+          if (!toolRes.ok) throw new Error(`API Error: ${toolRes.status}`);
+          const toolData = await toolRes.json();
+          const assistantMsg = toolData.message;
+
+          if (!assistantMsg?.tool_calls || assistantMsg.tool_calls.length === 0) {
+            // ツール呼び出しなし → 直接回答（最終ストリーミングへ）
+            break;
+          }
+
+          // ツール呼び出し処理
+          apiMessages.push(assistantMsg);
+
+          for (const tc of assistantMsg.tool_calls) {
+            const query = tc.function?.arguments?.query || text;
+            searchQueries.push(query);
+
+            // UI更新
             setMessages(prev => {
               const copy = [...prev];
               copy[copy.length - 1] = {
-                role: 'assistant',
-                content: displayContent,
-                thinking: displayThinking,
-                contexts: contextInfo,
+                ...copy[copy.length - 1],
+                agentStatus: `「${query}」を検索中...`,
+                searchQueries: searchQueries.map(q => ({ query: q, resultCount: null })),
               };
               return copy;
             });
-          } catch {}
+
+            const results = await retrieveContext(query);
+            allContexts.push(...results);
+
+            // UI更新（結果件数反映）
+            const sqCopy = searchQueries.map((q, qi) => ({
+              query: q,
+              resultCount: qi < searchQueries.length - 1
+                ? (searchQueries[qi]._rc || 0)
+                : results.length,
+            }));
+            searchQueries[searchQueries.length - 1]._rc = results.length;
+
+            setMessages(prev => {
+              const copy = [...prev];
+              copy[copy.length - 1] = {
+                ...copy[copy.length - 1],
+                agentStatus: null,
+                searchQueries: searchQueries.map(q => ({ query: q, resultCount: q._rc || 0 })),
+              };
+              return copy;
+            });
+
+            const resultText = results.length > 0
+              ? results.map((c, i) => `[資料${i + 1}: ${c.docName}]\n${c.chunk}`).join('\n\n')
+              : '関連する資料が見つかりませんでした。';
+
+            apiMessages.push({ role: 'tool', content: resultText });
+          }
         }
+
+        // コンテキスト重複除去
+        const seen = new Set();
+        const uniqueContexts = allContexts.filter(c => {
+          const key = c.docName + '::' + c.chunk.slice(0, 50);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+        const contextInfo = uniqueContexts.length > 0 ? uniqueContexts : null;
+        const finalSearchQueries = searchQueries.map(q => ({ query: q, resultCount: q._rc || 0 }));
+
+        // 最終ストリーミング応答
+        setMessages(prev => {
+          const copy = [...prev];
+          copy[copy.length - 1] = {
+            role: 'assistant', content: '', thinking: '',
+            contexts: contextInfo,
+            agentStatus: null,
+            searchQueries: finalSearchQueries,
+          };
+          return copy;
+        });
+
+        const finalRes = await fetch(`${ollamaUrl}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: chatModel,
+            messages: apiMessages,
+            stream: true,
+            options: ollamaOptions,
+          }),
+          signal: controller.signal,
+        });
+
+        if (!finalRes.ok) throw new Error(`API Error: ${finalRes.status}`);
+        await streamResponse(finalRes, contextInfo, finalSearchQueries);
+
+      } else {
+        // ─── 従来モード（always）: 常にRAG検索してプロンプト注入 ───
+        const contexts = await retrieveContext(text);
+        let fullSystemPrompt = systemPrompt;
+        if (contexts.length > 0) {
+          const ctxText = contexts.map((c, i) => `[資料${i + 1}: ${c.docName}]\n${c.chunk}`).join('\n\n');
+          fullSystemPrompt += `\n\n以下の参考資料に基づいて回答してください。資料に無い情報は推測であることを明示してください。\n\n${ctxText}`;
+        }
+
+        const res = await fetch(`${ollamaUrl}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: chatModel,
+            messages: [{ role: 'system', content: fullSystemPrompt }, ...history],
+            stream: true,
+            options: ollamaOptions,
+          }),
+          signal: controller.signal,
+        });
+
+        if (!res.ok) throw new Error(`API Error: ${res.status}`);
+
+        const contextInfo = contexts.length > 0 ? contexts : null;
+        setMessages(prev => [...prev, { role: 'assistant', content: '', thinking: '', contexts: contextInfo }]);
+        await streamResponse(res, contextInfo, null);
       }
     } catch (e) {
       if (e.name === 'AbortError') {
-        // 停止ボタンで中断 — エラー表示しない
+        // 停止ボタンで中断
       } else {
         setError(e.message);
       }
     } finally {
       abortRef.current = null;
       setIsLoading(false);
+    }
+  }
+
+  // ─── ストリーミング応答の共通処理 ───
+  async function streamResponse(res, contextInfo, searchQueries) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let assistantContent = '';
+    let assistantThinking = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value);
+      const lines = chunk.split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const json = JSON.parse(line);
+          if (json.message?.thinking) assistantThinking += json.message.thinking;
+          if (json.message?.content) assistantContent += json.message.content;
+
+          let displayContent = assistantContent;
+          let displayThinking = assistantThinking;
+          const thinkMatch = assistantContent.match(/^<think>([\s\S]*?)(<\/think>)?([\s\S]*)$/);
+          if (thinkMatch) {
+            const tagThinking = thinkMatch[1] || '';
+            const closed = !!thinkMatch[2];
+            const afterThink = thinkMatch[3] || '';
+            displayThinking = (assistantThinking + tagThinking).trim();
+            displayContent = closed ? afterThink.trim() : '';
+          }
+          setMessages(prev => {
+            const copy = [...prev];
+            copy[copy.length - 1] = {
+              role: 'assistant',
+              content: displayContent,
+              thinking: displayThinking,
+              contexts: contextInfo,
+              searchQueries: searchQueries,
+            };
+            return copy;
+          });
+        } catch {}
+      }
     }
   }
 
@@ -2272,6 +2472,23 @@ function App() {
                       thinking={msg.thinking}
                       isStreaming={isLoading && i === messages.length - 1 && !msg.content}
                     />
+                  )}
+                  {(msg.searchQueries?.length > 0 || msg.agentStatus) && (
+                    <div className="agent-activity">
+                      <div className="agent-activity-header">
+                        <span className={`agent-activity-dot ${msg.agentStatus ? '' : 'done'}`} />
+                        {msg.agentStatus || `${msg.searchQueries.length}回検索完了`}
+                      </div>
+                      {msg.searchQueries?.map((sq, si) => (
+                        <div key={si} className="agent-search-item">
+                          <span className="agent-search-icon">🔍</span>
+                          <span className="agent-search-query">{sq.query}</span>
+                          {sq.resultCount != null && (
+                            <span className="agent-search-result">{sq.resultCount}件</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
                   )}
                   {msg.role === 'assistant' ? (
                     <div className="msg-bubble"><MarkdownContent content={msg.content} /></div>

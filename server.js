@@ -22,6 +22,7 @@ const DEFAULT_CONFIG = {
   welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
   accentColor: '#34d399',
   ragTopK: 10,
+  ragMode: 'agentic',
   topK: 40,
   topP: 0.9,
   temperature: 0.7,
