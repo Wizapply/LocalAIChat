@@ -1,6 +1,5 @@
-<div align="center">
 # LOCAL AI CHAT
-
+<div align="center">
 **社内などのローカル AIチャット**
 
 ローカルLLMを使ったプライベートなAIアシスタント。  
