@@ -2090,6 +2090,7 @@ function App() {
     welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
     accentColor: '#34d399',
     defaultModel: '',
+    webSearch: true,
     ragTopK: 10,
     ragMode: 'agentic',
     tokenAvgWindow: 2000,
@@ -2248,7 +2249,9 @@ function App() {
     abortRef.current = controller;
 
     try {
-      const systemPrompt = 'あなたは親切で知識豊富なAIアシスタントです。日本語で回答してください。';
+      const today = new Date();
+      const dateStr = `${today.getFullYear()}年${today.getMonth() + 1}月${today.getDate()}日`;
+      const systemPrompt = `あなたは親切で知識豊富なAIアシスタントです。日本語で回答してください。今日の日付は${dateStr}です。`;
       const history = [...messages, userMsg].slice(-20).map(m => {
         const h = { role: m.role, content: m.content };
         if (m.images && m.images.length > 0) {
@@ -2258,30 +2261,57 @@ function App() {
       });
       const ollamaOptions = { num_ctx: numCtx, top_k: appConfig.topK, top_p: appConfig.topP, temperature: appConfig.temperature };
 
-      const useAgentic = appConfig.ragMode === 'agentic' && documents.length > 0;
+      const useAgentic = appConfig.ragMode === 'agentic' && (documents.length > 0 || appConfig.webSearch);
 
       if (useAgentic) {
-        // ─── Agentic RAG: LLMがツールで検索を判断 ───
-        const tools = [{
-          type: 'function',
-          function: {
-            name: 'search_documents',
-            description: 'アップロード済みドキュメントから関連情報を検索する。ユーザーの質問に答えるために必要に応じて使用する。異なるキーワードで複数回検索可能。',
-            parameters: {
-              type: 'object',
-              properties: {
-                query: { type: 'string', description: '検索クエリ（質問の核心を簡潔に）' }
-              },
-              required: ['query']
-            }
-          }
-        }];
+        // ─── Agentic RAG + Web検索: LLMがツールで検索を判断 ───
+        const tools = [];
 
-        const docListText = documents.map(d => d.name).join(', ');
-        const agentSystem = systemPrompt
-          + `\n\n以下のドキュメントが参照可能です: ${docListText}`
-          + '\nユーザーの質問に答えるために、必要に応じて search_documents ツールでドキュメントを検索してください。'
-          + '\n検索結果に基づいて回答し、資料に無い情報は推測であることを明示してください。';
+        if (documents.length > 0) {
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'search_documents',
+              description: 'アップロード済みドキュメントから関連情報を検索する。ユーザーの質問に答えるために必要に応じて使用する。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  query: { type: 'string', description: '検索クエリ（質問の核心を簡潔に）' }
+                },
+                required: ['query']
+              }
+            }
+          });
+        }
+
+        if (appConfig.webSearch) {
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'web_search',
+              description: 'インターネットでWebページを検索する。最新情報、知らないこと、事実確認が必要な場合に使用する。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  query: { type: 'string', description: '検索クエリ（簡潔で具体的に）' }
+                },
+                required: ['query']
+              }
+            }
+          });
+        }
+
+        let agentSystem = systemPrompt;
+        if (documents.length > 0) {
+          const docListText = documents.map(d => d.name).join(', ');
+          agentSystem += `\n\n以下のドキュメントが参照可能です: ${docListText}`
+            + '\nユーザーの質問に答えるために、必要に応じて search_documents ツールでドキュメントを検索してください。';
+        }
+        if (appConfig.webSearch) {
+          agentSystem += '\n\n最新の情報や知らないことについては web_search ツールでインターネット検索できます。';
+        }
+        agentSystem += '\n検索結果に基づいて回答してください。検索結果が得られなかった場合は、その旨を簡潔に伝え、自分の知識で回答してください。'
+          + '\n内部的な推論や検索戦略の説明は出力せず、ユーザーへの回答だけを出力してください。';
 
         let apiMessages = [{ role: 'system', content: agentSystem }, ...history];
         let allContexts = [];
@@ -2318,13 +2348,13 @@ function App() {
 
             if (fnName === 'search_documents') {
               const query = fnArgs.query || text;
-              searchQueries.push({ query, resultCount: null });
+              searchQueries.push({ query, resultCount: null, type: 'doc' });
 
               setMessages(prev => {
                 const copy = [...prev];
                 copy[copy.length - 1] = {
                   ...copy[copy.length - 1],
-                  agentStatus: `「${query}」を検索中...`,
+                  agentStatus: `📄「${query}」を検索中...`,
                   searchQueries: [...searchQueries],
                 };
                 return copy;
@@ -2347,6 +2377,45 @@ function App() {
               const resultText = results.length > 0
                 ? results.map((c, i) => `[資料${i + 1}: ${c.docName}]\n${c.chunk}`).join('\n\n')
                 : '関連する資料が見つかりませんでした。';
+              apiMessages.push({ role: 'tool', content: resultText });
+
+            } else if (fnName === 'web_search') {
+              const query = fnArgs.query || text;
+              searchQueries.push({ query, resultCount: null, type: 'web' });
+
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = {
+                  ...copy[copy.length - 1],
+                  agentStatus: `🌐「${query}」をWeb検索中...`,
+                  searchQueries: [...searchQueries],
+                };
+                return copy;
+              });
+
+              let webResults = [];
+              try {
+                const res = await fetch(`/web-search?q=${encodeURIComponent(query)}&n=5`);
+                if (res.ok) {
+                  const data = await res.json();
+                  webResults = data.results || [];
+                }
+              } catch {}
+              searchQueries[searchQueries.length - 1].resultCount = webResults.length;
+
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = {
+                  ...copy[copy.length - 1],
+                  agentStatus: null,
+                  searchQueries: [...searchQueries],
+                };
+                return copy;
+              });
+
+              const resultText = webResults.length > 0
+                ? webResults.map((r, i) => `[Web${i + 1}] ${r.title}\n${r.url}\n${r.snippet}`).join('\n\n')
+                : 'Web検索結果が見つかりませんでした。';
               apiMessages.push({ role: 'tool', content: resultText });
             }
           }
@@ -2939,7 +3008,7 @@ function App() {
                       </div>
                       {msg.searchQueries?.map((sq, si) => (
                         <div key={si} className="agent-search-item">
-                          <span className="agent-search-icon">🔍</span>
+                          <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : '🔍'}</span>
                           <span className="agent-search-query">{sq.query}</span>
                           {sq.resultCount != null && (
                             <span className="agent-search-result">{sq.resultCount}件</span>
