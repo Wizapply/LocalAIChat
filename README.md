@@ -331,4 +331,5 @@ sudo systemctl enable --now wizapply
 
 ## 📝 ライセンス
 
-[MIT](LICENSE)
+[MIT](LICENSE)  
+※一部はAIによって作成されました。
