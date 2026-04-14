@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -22,6 +23,8 @@ const DEFAULT_CONFIG = {
   welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
   accentColor: '#34d399',
   defaultModel: '',
+  ollamaBackends: [],
+  webSearch: true,
   ragTopK: 10,
   ragMode: 'agentic',
   tokenAvgWindow: 2000,
@@ -38,6 +41,39 @@ function loadConfig() {
   return { ...DEFAULT_CONFIG };
 }
 const appConfig = loadConfig();
+
+// ─── Ollamaバックエンド管理 ───
+const backends = (appConfig.ollamaBackends && appConfig.ollamaBackends.length > 0)
+  ? appConfig.ollamaBackends.map(b => ({
+      host: b.host || OLLAMA_HOST,
+      port: b.port || OLLAMA_PORT,
+      gpuIndex: b.gpuIndex ?? -1,
+      activeConns: 0,
+    }))
+  : [{ host: OLLAMA_HOST, port: parseInt(OLLAMA_PORT), gpuIndex: -1, activeConns: 0 }];
+let cachedGpuData = []; // GPU監視データキャッシュ（selectBackendで参照）
+
+function selectBackend() {
+  if (backends.length === 1) return backends[0];
+
+  let best = null;
+  let bestScore = Infinity;
+
+  for (const b of backends) {
+    // スコア = GPU使用率(0-100) + アクティブ接続数 × 30
+    // GPU使用率が取得できない場合は接続数のみで判断
+    let gpuUsage = 0;
+    if (b.gpuIndex >= 0 && cachedGpuData[b.gpuIndex]) {
+      gpuUsage = cachedGpuData[b.gpuIndex].usage || 0;
+    }
+    const score = gpuUsage + b.activeConns * 30;
+    if (score < bestScore) {
+      bestScore = score;
+      best = b;
+    }
+  }
+  return best || backends[0];
+}
 
 // ─── ログ ───
 function timestamp() {
@@ -133,15 +169,111 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+// ─── Web検索 (DuckDuckGo) ───
+function ddgSearch(query, maxResults = 5) {
+  return new Promise((resolve) => {
+    const postData = `q=${encodeURIComponent(query)}&kl=jp-jp`;
+    const req = https.request({
+      hostname: 'html.duckduckgo.com',
+      path: '/html/',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(postData),
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+      },
+      timeout: 15000,
+    }, (res) => {
+      let html = '';
+      res.on('data', (d) => { html += d.toString(); });
+      res.on('end', () => {
+        try {
+          const results = [];
+          const decodeHtml = (s) => s
+            .replace(/<[^>]*>/g, '')
+            .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+            .replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&#39;/g, "'")
+            .replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+
+          // パターン1: class="result results_links..." ブロック
+          const resultRegex = /<a[^>]+class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+          const snippetRegex = /class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|td|div|span)/gi;
+
+          const links = [...html.matchAll(resultRegex)];
+          const snippets = [...html.matchAll(snippetRegex)];
+
+          for (let i = 0; i < links.length && results.length < maxResults; i++) {
+            let url = links[i][1];
+            // DuckDuckGoリダイレクトURLをデコード
+            const uddgMatch = url.match(/[?&]uddg=([^&]+)/);
+            if (uddgMatch) url = decodeURIComponent(uddgMatch[1]);
+            // 広告リンクをスキップ
+            if (url.includes('duckduckgo.com/y.js') || url.includes('ad_provider')) continue;
+            const title = decodeHtml(links[i][2]);
+            const snippet = snippets[i] ? decodeHtml(snippets[i][1]) : '';
+            if (title && url && url.startsWith('http')) {
+              results.push({ title, url, snippet });
+            }
+          }
+
+          // パターン2: パターン1で取れなかった場合、aタグ+href全般で探す
+          if (results.length === 0) {
+            const altRegex = /<a[^>]+href="(\/\/duckduckgo\.com\/l\/\?[^"]*uddg=[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+            const altLinks = [...html.matchAll(altRegex)];
+            for (let i = 0; i < altLinks.length && results.length < maxResults; i++) {
+              let url = 'https:' + altLinks[i][1];
+              const uddgMatch = url.match(/[?&]uddg=([^&]+)/);
+              if (uddgMatch) url = decodeURIComponent(uddgMatch[1]);
+              const title = decodeHtml(altLinks[i][2]);
+              if (title && url && !url.includes('duckduckgo.com')) {
+                results.push({ title, url, snippet: '' });
+              }
+            }
+          }
+
+          if (results.length === 0) {
+            console.log('  [DDG] No results parsed. Response length:', html.length,
+              'Has result__a:', html.includes('result__a'),
+              'Has uddg:', html.includes('uddg='));
+          }
+          resolve(results);
+        } catch (e) {
+          console.log('  [DDG] Parse error:', e.message);
+          resolve([]);
+        }
+      });
+    });
+    req.on('error', (e) => { console.log('  [DDG] Request error:', e.message); resolve([]); });
+    req.on('timeout', () => { console.log('  [DDG] Timeout'); req.destroy(); resolve([]); });
+    req.write(postData);
+    req.end();
+  });
+}
+
+app.get('/web-search', async (req, res) => {
+  const ip = getIP(req);
+  const query = req.query.q;
+  if (!query) return res.status(400).json({ error: 'q parameter required' });
+  log(ip, `WEB SEARCH: ${query}`);
+  const results = await ddgSearch(query, parseInt(req.query.n) || 5);
+  log(ip, `WEB SEARCH: ${results.length} results`);
+  res.json({ results });
+});
+
 // ─── Ollama APIへのリバースプロキシ ───
 app.use('/api', (req, res) => {
   const ip = getIP(req);
   const targetPath = '/api' + req.url;
-  log(ip, `${req.method} ${targetPath}`);
+  const backend = selectBackend();
+  backend.activeConns++;
+  const backendLabel = backends.length > 1 ? ` [${backend.host}:${backend.port}]` : '';
+  log(ip, `${req.method} ${targetPath}${backendLabel}`);
 
   const options = {
-    hostname: OLLAMA_HOST,
-    port: OLLAMA_PORT,
+    hostname: backend.host,
+    port: backend.port,
     path: targetPath,
     method: req.method,
     headers: {
@@ -156,7 +288,7 @@ app.use('/api', (req, res) => {
   }
 
   const proxyReq = http.request(options, (proxyRes) => {
-    log(ip, `${proxyRes.statusCode} ${req.method} ${targetPath}`);
+    log(ip, `${proxyRes.statusCode} ${req.method} ${targetPath}${backendLabel}`);
     const headers = {
       'content-type': proxyRes.headers['content-type'] || 'application/json',
       'cache-control': 'no-cache',
@@ -169,19 +301,22 @@ app.use('/api', (req, res) => {
   });
 
   proxyReq.on('error', (err) => {
-    log(ip, `ERROR ${targetPath} ${err.message}`);
+    log(ip, `ERROR ${targetPath}${backendLabel} ${err.message}`);
     if (!res.headersSent) {
       res.status(502).json({ error: 'Ollama に接続できません: ' + err.message });
     }
   });
 
   proxyReq.on('timeout', () => {
-    log(ip, `TIMEOUT ${targetPath}`);
+    log(ip, `TIMEOUT ${targetPath}${backendLabel}`);
     proxyReq.destroy();
     if (!res.headersSent) {
       res.status(504).json({ error: 'Ollama タイムアウト' });
     }
   });
+
+  // リクエスト完了時にアクティブ接続数を減らす
+  res.on('close', () => { backend.activeConns = Math.max(0, backend.activeConns - 1); });
 
   req.pipe(proxyReq, { end: true });
 });
@@ -320,6 +455,7 @@ app.get('/sse/gpu', (req, res) => {
 
   const send = async () => {
     const gpus = await queryGpu();
+    cachedGpuData = gpus; // バックエンド選択用キャッシュ更新
     if (!res.writableEnded) {
       res.write(`data: ${JSON.stringify(gpus)}\n\n`);
     }
@@ -446,16 +582,30 @@ app.get('*', (req, res) => {
 });
 
 // ─── サーバー起動 ───
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', async () => {
   const name = `${appConfig.appName} Server`;
-  const w = Math.max(name.length + 6, 40);
+  const lines = [];
+  lines.push(`  URL   : http://localhost:${PORT}`);
+  if (backends.length === 1) {
+    lines.push(`  Ollama: http://${backends[0].host}:${backends[0].port}`);
+  } else {
+    lines.push(`  Ollama: ${backends.length} backends (load-balanced)`);
+    backends.forEach((b, i) => {
+      lines.push(`    [${i}] http://${b.host}:${b.port} (GPU ${b.gpuIndex >= 0 ? b.gpuIndex : 'auto'})`);
+    });
+  }
+  const w = Math.max(name.length + 6, ...lines.map(l => l.length + 2), 40);
   const pad = (s) => s + ' '.repeat(w - s.length);
   console.log('');
   console.log(`  ╔${'═'.repeat(w)}╗`);
   console.log(`  ║${pad('   ' + name)}║`);
   console.log(`  ╠${'═'.repeat(w)}╣`);
-  console.log(`  ║${pad(`  URL   : http://localhost:${PORT}`)}║`);
-  console.log(`  ║${pad(`  Ollama: http://${OLLAMA_HOST}:${OLLAMA_PORT}`)}║`);
+  for (const l of lines) console.log(`  ║${pad(l)}║`);
   console.log(`  ╚${'═'.repeat(w)}╝`);
   console.log('');
+  // 起動時にGPUデータを取得してキャッシュ
+  cachedGpuData = await queryGpu();
 });
+
+// ─── バックグラウンドGPU監視（SSEクライアントがいなくてもキャッシュ更新）───
+setInterval(async () => { cachedGpuData = await queryGpu(); }, GPU_INTERVAL * 5);
