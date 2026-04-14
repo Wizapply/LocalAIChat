@@ -1,9 +1,9 @@
 # LOCAL AI CHAT
 <div align="center">
-<h1>ブラウザベースのローカルLLMのWEBチャット</h1>
+<h2>ブラウザベースのローカルLLMのWEBチャット</h2>
 
 ローカルLLMを使ったプライベートなAIアシスタント。  
-ドキュメントRAG・画像入力・Three.jsプレビュー・GPU監視・Python実行をブラウザから。
+ドキュメントRAG・Web検索・画像入力・Three.jsプレビュー・GPU監視・Python実行をブラウザから。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
@@ -66,10 +66,7 @@ AMD（rocm-smi）/ NVIDIA（nvidia-smi）を自動検出し、使用率・温度
 ### 1. Ollamaの準備
 
 ```bash
-# インストール
 curl -fsSL https://ollama.com/install.sh | sh
-
-# モデルのダウンロード
 ollama pull gemma3:12b          # チャット用（例）
 ollama pull nomic-embed-text    # Embedding用（RAG必須）
 ```
@@ -87,9 +84,8 @@ sudo apt install -y nodejs
 brew install node
 ```
 
-**Windows:**
-
-[Node.js公式サイト](https://nodejs.org/) からLTS版をダウンロードしてインストール。
+**Windows:**  
+[Node.js公式サイト](https://nodejs.org/) からLTS版をダウンロード。
 
 確認:
 ```bash
@@ -120,33 +116,17 @@ npm start
 ## 📁 ファイル構成
 
 ```
-wizapply-ai-chat/
+LocalAIChat/
 ├── server.js          # Express + WebSocket サーバー
 ├── package.json
-├── config.json        # アプリ設定（名前・カラー・推論パラメータ）
+├── config.json        # アプリ設定
+├── hashpass.py        # パスワードハッシュ生成ツール
 ├── DESIGN.md          # AI向け設計ドキュメント
 ├── public/
 │   ├── index.html     # フロントエンド（React SPA）
 │   └── aiicon.jpg     # アイコン画像（任意）
 ├── chats/             # チャット履歴（自動作成）
 └── settings.json      # ユーザー設定（自動作成）
-```
-
----
-
-## 🧩 アーキテクチャ
-
-```
-ブラウザ (React SPA)
-  │
-  ├── HTTP ─── :3000 Node.js (Express)
-  │              ├── /api/*        → Ollama リバースプロキシ
-  │              ├── /config       → アプリ設定
-  │              ├── /settings     → ユーザー設定
-  │              ├── /chats/*      → チャット履歴 CRUD
-  │              └── /sse/gpu      → GPU監視 (SSE)
-  │
-  └── WS ──── /ws/python          → Python対話実行
 ```
 
 ---
@@ -158,11 +138,14 @@ wizapply-ai-chat/
   "appName": "WIZAPPLY AI CHAT",
   "logoMain": "WIZAPPLY",
   "logoSub": "AI CHAT",
-  "welcomeMessage": "ドキュメントをアップロードしてRAGベースの質問応答を行うか、自由にチャットを開始できます。",
-  "welcomeHints": ["ドキュメントを要約して", "この資料の要点は？", "〇〇について教えて"],
+  "welcomeMessage": "...",
+  "welcomeHints": ["...", "..."],
   "accentColor": "#34d399",
   "defaultModel": "",
   "ragTopK": 30,
+  "password": "",
+  "webSearch": true,
+  "ollamaBackends": [],
   "ragMode": "agentic",
   "tokenAvgWindow": 3000,
   "topK": 40,
@@ -174,21 +157,102 @@ wizapply-ai-chat/
 | キー | 説明 | デフォルト |
 |:--|:--|:--|
 | `appName` | ページタイトル・ウェルカム画面 | `WIZAPPLY AI CHAT` |
-| `logoMain` | サイドバーロゴ（メイン） | `WIZAPPLY` |
-| `logoSub` | サイドバーロゴ（サブ） | `AI CHAT` |
+| `logoMain` / `logoSub` | サイドバーロゴ | `WIZAPPLY` / `AI CHAT` |
 | `welcomeMessage` | ウェルカム画面の説明文 | — |
 | `welcomeHints` | ヒントチップ（配列） | — |
 | `accentColor` | テーマカラー（HEX） | `#34d399` |
-| `defaultModel` | 初期選択モデル（空ならモデル一覧の先頭） | `""` |
-| `ragTopK` | RAG検索の取得チャンク数 | `30` |
+| `defaultModel` | 初期選択モデル（空→一覧の先頭） | `""` |
+| `password` | MD5ハッシュ（空→制限なし）| `""` |
+| `webSearch` | Web検索（DuckDuckGo）の有効/無効 | `true` |
+| `ollamaBackends` | 複数バックエンド（後述） | `[]` |
+| `ragTopK` | RAG検索の取得チャンク数 | `10` |
 | `ragMode` | `agentic`：LLMが判断 / `always`：常に検索 | `agentic` |
-| `tokenAvgWindow` | 推論速度の平均計算対象トークン数 | `3000` |
+| `tokenAvgWindow` | 推論速度の平均計算対象トークン数 | `2000` |
 | `topK` | Top-K サンプリング | `40` |
 | `topP` | Top-P サンプリング | `0.9` |
-| `temperature` | Temperature | `0.9` |
+| `temperature` | Temperature | `0.7` |
 
-> 変更後はサーバーを再起動してください。  
-> `defaultModel` はUIでモデルを変更すると `settings.json` に保存され、以降はそちらが優先されます。
+> 変更後はサーバーを再起動してください。
+
+---
+
+## 🔒 パスワード設定
+
+パスワードはMD5ハッシュで `config.json` に保存します。
+
+```bash
+# ハッシュ生成（対話モード）
+python3 hashpass.py
+
+# ハッシュ生成（引数指定）
+python3 hashpass.py mypassword
+```
+
+出力例:
+```
+  パスワード: mypassword
+  MD5ハッシュ: 34819d7beeabb9260a5c854bc85b3e44
+
+  config.json に以下を設定してください:
+  "password": "34819d7beeabb9260a5c854bc85b3e44"
+```
+
+パスワードを空 `""` にすると制限なし（ログイン画面なし）。
+
+---
+
+## ⚡ マルチGPU構成
+
+### Ollamaインスタンスの起動（GPUごと）
+
+```bash
+# GPU 0 (ポート 11434)
+CUDA_VISIBLE_DEVICES=0 OLLAMA_HOST=0.0.0.0:11434 ollama serve
+# GPU 1 (ポート 11435)
+CUDA_VISIBLE_DEVICES=1 OLLAMA_HOST=0.0.0.0:11435 ollama serve
+```
+
+AMD（ROCm）の場合は `ROCR_VISIBLE_DEVICES` を使用。
+
+### config.json
+
+```json
+"ollamaBackends": [
+  { "host": "127.0.0.1", "port": 11434, "gpuIndex": 0 },
+  { "host": "127.0.0.1", "port": 11435, "gpuIndex": 1 }
+]
+```
+
+| キー | 説明 |
+|:--|:--|
+| `host` | Ollamaホスト |
+| `port` | Ollamaポート |
+| `gpuIndex` | GPU監視データのインデックス（負荷ベース振り分けに使用） |
+
+振り分けロジック: `スコア = GPU使用率 + アクティブ接続数 × 30` → 最小スコアのバックエンドを選択。
+
+未設定時は環境変数 `OLLAMA_HOST:OLLAMA_PORT` の1台構成で動作。
+
+### systemd自動起動（GPU別）
+
+```bash
+# /etc/systemd/system/ollama-gpu0.service
+[Unit]
+Description=Ollama (GPU 0)
+After=network.target
+[Service]
+Type=simple
+User=<your-username>
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=OLLAMA_HOST=0.0.0.0:11434
+Environment=OLLAMA_MODELS=/usr/share/ollama/.ollama/models
+ExecStart=/usr/local/bin/ollama serve
+Restart=always
+[Install]
+WantedBy=multi-user.target
+```
+
+GPU 1用は `CUDA_VISIBLE_DEVICES=1` / `OLLAMA_HOST=0.0.0.0:11435` に変更。
 
 ---
 
@@ -203,22 +267,19 @@ wizapply-ai-chat/
 | `GPU_INTERVAL` | `1000` | GPU監視の更新間隔（ms） |
 | `CHATS_DIR` | `./chats` | チャット履歴の保存先 |
 
-```bash
-PORT=8080 npm start
-```
-
 ---
 
 ## 📡 API
 
 | メソッド | パス | 説明 |
 |:--|:--|:--|
-| `*` | `/api/*` | Ollamaリバースプロキシ |
-| `GET` | `/config` | アプリ設定の取得 |
+| `*` | `/api/*` | Ollamaリバースプロキシ（負荷分散対応） |
+| `GET` | `/web-search?q=...` | DuckDuckGo Web検索 |
+| `GET` | `/config` | アプリ設定（パスワード除外） |
+| `POST` | `/auth` | パスワード認証 |
 | `GET` | `/sse/gpu` | GPU監視（SSE） |
-| `GET/POST` | `/settings` | ユーザー設定の取得・保存 |
-| `GET` | `/chats` | チャット一覧 |
-| `GET/POST/DELETE` | `/chats/:id` | チャットの取得・保存・削除 |
+| `GET/POST` | `/settings` | ユーザー設定 |
+| `GET/POST/DELETE` | `/chats/:id` | チャット履歴 |
 | `WS` | `/ws/python` | Python対話実行 |
 
 ---
@@ -249,29 +310,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now wizapply
 ```
 
-別PCからアクセスする場合:
-```bash
-sudo ufw allow 3000/tcp
-```
-
-> Ollama側のCORS設定は不要です（Node.jsプロキシ経由）。
-
 ### Windows
 
 1. [Node.js](https://nodejs.org/) をインストール
 2. [Ollama for Windows](https://ollama.com/download/windows) をインストール
 3. `npm install` → `npm start`
-
----
-
-## 🎮 GPU監視
-
-起動時に **rocm-smi**（AMD）→ **nvidia-smi**（NVIDIA）の順で自動検出します。
-
-表示項目: 使用率 / 温度 / 電力 / SCLK / MCLK / VRAM / 推論速度（tok/s）
-
-どちらも未検出の場合、GPU監視は無効になりますがアプリ自体は正常動作します。  
-推論速度はGPU未検出でも表示されます。
 
 ---
 
@@ -282,10 +325,10 @@ sudo ufw allow 3000/tcp
 | フロントエンド | React (CDN/Babel) · marked.js · highlight.js · KaTeX · Three.js (r128) |
 | バックエンド | Node.js · Express · WebSocket (ws) |
 | AI | Ollama · nomic-embed-text · Agentic RAG (Tool Calling) |
+| Web検索 | DuckDuckGo HTML Lite |
 
 ---
 
 ## 📝 ライセンス
 
-[MIT](LICENSE)  
-※ほとんどAIで作成されました。
+[MIT](LICENSE)

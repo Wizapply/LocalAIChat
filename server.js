@@ -4,6 +4,7 @@ const https = require('https');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
+const crypto = require('crypto');
 const os = require('os');
 const { WebSocketServer } = require('ws');
 
@@ -23,6 +24,7 @@ const DEFAULT_CONFIG = {
   welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
   accentColor: '#34d399',
   defaultModel: '',
+  password: '',
   ollamaBackends: [],
   webSearch: true,
   ragTopK: 10,
@@ -471,13 +473,31 @@ app.get('/sse/gpu', (req, res) => {
 });
 
 // ─── アプリ設定配信 ───
+const jsonParser = express.json({ limit: '10mb' });
+
 app.get('/config', (req, res) => {
-  res.json(appConfig);
+  const { password, ...safeConfig } = appConfig;
+  safeConfig.hasPassword = !!password;
+  res.json(safeConfig);
+});
+
+app.post('/auth', jsonParser, (req, res) => {
+  const ip = getIP(req);
+  if (!appConfig.password) {
+    return res.json({ ok: true });
+  }
+  const { password } = req.body || {};
+  const inputHash = crypto.createHash('md5').update(password || '').digest('hex');
+  if (inputHash === appConfig.password) {
+    log(ip, 'AUTH success');
+    return res.json({ ok: true });
+  }
+  log(ip, 'AUTH failed');
+  return res.status(401).json({ ok: false, error: 'パスワードが正しくありません' });
 });
 
 // ─── グローバル設定 ───
 const SETTINGS_FILE = path.join(__dirname, 'settings.json');
-const jsonParser = express.json({ limit: '10mb' });
 
 app.get('/settings', (req, res) => {
   try {

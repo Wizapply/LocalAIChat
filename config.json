@@ -6,6 +6,7 @@
   "welcomeHints": ["ドキュメントを要約して", "この資料の要点は？", "〇〇について教えて"],
   "accentColor": "#34d399",
   "defaultModel": "",
+  "password": "",
   "webSearch": true,
   "ragTopK": 30,
   "ragMode": "agentic",

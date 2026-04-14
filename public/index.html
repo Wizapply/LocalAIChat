@@ -1562,6 +1562,86 @@
     border-radius: var(--radius);
   }
 
+  /* ── Login Screen ── */
+  .login-screen {
+    position: fixed;
+    inset: 0;
+    background: var(--bg-primary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+  }
+
+  .login-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 40px 36px;
+    width: 360px;
+    max-width: 90vw;
+    text-align: center;
+  }
+
+  .login-icon {
+    width: 64px; height: 64px;
+    border-radius: var(--radius);
+    margin: 0 auto 16px;
+    background: url("aiicon.jpg") center/contain no-repeat;
+    background-color: #fff;
+  }
+
+  .login-title {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 6px;
+  }
+
+  .login-sub {
+    font-size: 13px;
+    color: var(--text-muted);
+    margin-bottom: 24px;
+  }
+
+  .login-input {
+    width: 100%;
+    padding: 12px 16px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    outline: none;
+    margin-bottom: 12px;
+  }
+
+  .login-input:focus { border-color: var(--accent); }
+
+  .login-btn {
+    width: 100%;
+    padding: 12px;
+    background: var(--accent);
+    border: none;
+    border-radius: var(--radius-sm);
+    color: #000;
+    font-family: var(--font-sans);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+
+  .login-btn:hover { opacity: 0.85; }
+  .login-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .login-error {
+    font-size: 12px;
+    color: var(--red);
+    margin-top: 12px;
+  }
+
   .error-toast {
     position: fixed;
     bottom: 80px;
@@ -2081,6 +2161,10 @@ function ThinkingBlock({ thinking, isStreaming }) {
 }
 
 function App() {
+  // ─── 認証 ───
+  const [authenticated, setAuthenticated] = useState(false);
+  const [hasPassword, setHasPassword] = useState(null); // null=確認中, true/false
+
   // ─── アプリ設定 (config.json) ───
   const [appConfig, setAppConfig] = useState({
     appName: 'WIZAPPLY AI CHAT',
@@ -2744,15 +2828,13 @@ function App() {
     } catch {}
   }
 
-  // 初回読み込み（コンフィグ + チャット一覧 + グローバル設定）
+  // 初回読み込み（コンフィグ確認 → 認証判定）
   useEffect(() => {
-    loadChatList();
     (async () => {
       try {
-        const [cfgRes, setRes] = await Promise.all([fetch('/config'), fetch('/settings')]);
-        let cfg = null;
+        const cfgRes = await fetch('/config');
         if (cfgRes.ok) {
-          cfg = await cfgRes.json();
+          const cfg = await cfgRes.json();
           setAppConfig(prev => ({ ...prev, ...cfg }));
           document.title = cfg.appName || 'WIZAPPLY AI CHAT';
           if (cfg.accentColor) {
@@ -2762,7 +2844,27 @@ function App() {
             document.documentElement.style.setProperty('--accent-dim', `rgba(${r},${g},${b},0.12)`);
             document.documentElement.style.setProperty('--accent-glow', `rgba(${r},${g},${b},0.25)`);
           }
+          if (cfg.hasPassword) {
+            setHasPassword(true);
+          } else {
+            setHasPassword(false);
+            setAuthenticated(true);
+          }
         }
+      } catch {}
+    })();
+  }, []);
+
+  // 認証後にデータ読み込み
+  const settingsLoadedRef = useRef(false);
+  useEffect(() => {
+    if (!authenticated) return;
+    loadChatList();
+    (async () => {
+      try {
+        const [cfgRes, setRes] = await Promise.all([fetch('/config'), fetch('/settings')]);
+        let cfg = null;
+        if (cfgRes.ok) cfg = await cfgRes.json();
         if (setRes.ok) {
           const s = await setRes.json();
           if (s.chatModel) setChatModel(s.chatModel);
@@ -2772,13 +2874,14 @@ function App() {
           setChatModel(cfg.defaultModel);
         }
       } catch {}
+      // 設定読み込み完了後にフラグを立てる（自動保存を有効にする）
+      setTimeout(() => { settingsLoadedRef.current = true; }, 1000);
     })();
-  }, []);
+  }, [authenticated]);
 
-  // グローバル設定の自動保存（変更時）
-  const settingsInitRef = useRef(false);
+  // グローバル設定の自動保存（変更時、設定読み込み完了後のみ）
   useEffect(() => {
-    if (!settingsInitRef.current) { settingsInitRef.current = true; return; }
+    if (!settingsLoadedRef.current) return;
     const t = setTimeout(async () => {
       try {
         await fetch('/settings', {
@@ -2811,6 +2914,73 @@ function App() {
   }, [error]);
 
   const totalChunks = documents.reduce((s, d) => s + d.chunks.length, 0);
+
+  // ─── ログイン処理 ───
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginError, setLoginError] = useState('');
+  const [loginLoading, setLoginLoading] = useState(false);
+
+  async function handleLogin(e) {
+    if (e) e.preventDefault();
+    setLoginLoading(true);
+    setLoginError('');
+    try {
+      const res = await fetch('/auth', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: loginPassword }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setAuthenticated(true);
+      } else {
+        setLoginError(data.error || 'パスワードが正しくありません');
+      }
+    } catch {
+      setLoginError('接続に失敗しました');
+    } finally {
+      setLoginLoading(false);
+    }
+  }
+
+  // ─── ログイン画面 ───
+  if (hasPassword === null) {
+    // 読み込み中
+    return (
+      <div className="login-screen">
+        <div className="login-card">
+          <div className="login-icon" />
+          <div className="login-sub">読み込み中...</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (hasPassword && !authenticated) {
+    return (
+      <div className="login-screen">
+        <div className="login-card">
+          <div className="login-icon" />
+          <div className="login-title">{appConfig.appName}</div>
+          <div className="login-sub">続行するにはパスワードを入力してください</div>
+          <form onSubmit={handleLogin}>
+            <input
+              className="login-input"
+              type="password"
+              placeholder="パスワード"
+              value={loginPassword}
+              onChange={e => setLoginPassword(e.target.value)}
+              autoFocus
+            />
+            <button className="login-btn" type="submit" disabled={loginLoading}>
+              {loginLoading ? '認証中...' : 'ログイン'}
+            </button>
+          </form>
+          {loginError && <div className="login-error">{loginError}</div>}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="app-layout">
