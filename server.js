@@ -25,6 +25,7 @@ const DEFAULT_CONFIG = {
   accentColor: '#34d399',
   defaultModel: '',
   password: '',
+  gpuAgentToken: '',
   ollamaBackends: [],
   webSearch: true,
   ragTopK: 10,
@@ -46,14 +47,16 @@ const appConfig = loadConfig();
 
 // ─── Ollamaバックエンド管理 ───
 const backends = (appConfig.ollamaBackends && appConfig.ollamaBackends.length > 0)
-  ? appConfig.ollamaBackends.map(b => ({
+  ? appConfig.ollamaBackends.map((b, i) => ({
       host: b.host || OLLAMA_HOST,
       port: b.port || OLLAMA_PORT,
-      gpuIndex: b.gpuIndex ?? -1,
+      gpuAgentPort: b.gpuAgentPort || 11400,
+      gpuAgentToken: b.gpuAgentToken || appConfig.gpuAgentToken || '',
+      label: b.label || `PC-${i}`,
       activeConns: 0,
+      gpus: [],
     }))
-  : [{ host: OLLAMA_HOST, port: parseInt(OLLAMA_PORT), gpuIndex: -1, activeConns: 0 }];
-let cachedGpuData = []; // GPU監視データキャッシュ（selectBackendで参照）
+  : [{ host: OLLAMA_HOST, port: parseInt(OLLAMA_PORT), gpuAgentPort: 0, gpuAgentToken: '', label: 'localhost', activeConns: 0, gpus: [] }];
 
 function selectBackend() {
   if (backends.length === 1) return backends[0];
@@ -62,11 +65,10 @@ function selectBackend() {
   let bestScore = Infinity;
 
   for (const b of backends) {
-    // スコア = GPU使用率(0-100) + アクティブ接続数 × 30
-    // GPU使用率が取得できない場合は接続数のみで判断
+    // GPU平均使用率を算出
     let gpuUsage = 0;
-    if (b.gpuIndex >= 0 && cachedGpuData[b.gpuIndex]) {
-      gpuUsage = cachedGpuData[b.gpuIndex].usage || 0;
+    if (b.gpus.length > 0) {
+      gpuUsage = b.gpus.reduce((s, g) => s + (g.usage || 0), 0) / b.gpus.length;
     }
     const score = gpuUsage + b.activeConns * 30;
     if (score < bestScore) {
@@ -75,6 +77,63 @@ function selectBackend() {
     }
   }
   return best || backends[0];
+}
+
+// リモートGPUエージェントからデータ取得
+function fetchRemoteGpu(host, port, token) {
+  return new Promise((resolve) => {
+    const headers = {};
+    if (token) headers['x-agent-token'] = token;
+    const req = http.request({ hostname: host, port, path: '/', method: 'GET', timeout: 5000, headers }, (res) => {
+      let data = '';
+      res.on('data', (d) => { data += d.toString(); });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch { resolve([]); }
+      });
+    });
+    req.on('error', () => resolve([]));
+    req.on('timeout', () => { req.destroy(); resolve([]); });
+    req.end();
+  });
+}
+
+// ローカルマシンのIPアドレス一覧を取得
+function getLocalIps() {
+  const ips = new Set(['127.0.0.1', 'localhost', '::1', OLLAMA_HOST]);
+  const ifaces = os.networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    for (const iface of ifaces[name] || []) {
+      if (iface.address) ips.add(iface.address);
+    }
+  }
+  return ips;
+}
+const LOCAL_IPS = getLocalIps();
+
+// 全バックエンドのGPUデータを更新
+async function updateAllGpuData() {
+  await Promise.all(backends.map(async (b) => {
+    const isLocal = LOCAL_IPS.has(b.host);
+    if (isLocal) {
+      // ローカルは直接実行（gpu-agent不要）
+      b.gpus = await queryGpu();
+    } else if (b.gpuAgentPort) {
+      // リモートはgpu-agent経由
+      const remoteGpus = await fetchRemoteGpu(b.host, b.gpuAgentPort, b.gpuAgentToken);
+      // 取得失敗時は前回のキャッシュを維持（一時的な接続エラーでUIをちらつかせない）
+      if (remoteGpus.length > 0) b.gpus = remoteGpus;
+    }
+  }));
+}
+
+// SSE用のデータ構築
+function buildGpuSseData() {
+  return backends.map(b => ({
+    label: b.label,
+    host: b.host,
+    port: b.port,
+    gpus: b.gpus,
+  }));
 }
 
 // ─── ログ ───
@@ -104,6 +163,17 @@ const wss = new WebSocketServer({ server, path: '/ws/python' });
 
 wss.on('connection', (ws, req) => {
   const ip = getIP(req);
+  // 認証チェック（パスワード設定時）
+  if (appConfig.password) {
+    const cookieToken = (req.headers.cookie || '').split(';')
+      .map(c => c.trim())
+      .find(c => c.startsWith('wz_session='))?.split('=')[1];
+    if (!isValidSession(cookieToken)) {
+      log(ip, 'WS AUTH failed');
+      ws.close(1008, 'Unauthorized');
+      return;
+    }
+  }
   let proc = null;
   let tmpFile = null;
 
@@ -254,7 +324,7 @@ function ddgSearch(query, maxResults = 5) {
   });
 }
 
-app.get('/web-search', async (req, res) => {
+app.get('/web-search', requireAuth, async (req, res) => {
   const ip = getIP(req);
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: 'q parameter required' });
@@ -265,11 +335,18 @@ app.get('/web-search', async (req, res) => {
 });
 
 // ─── Ollama APIへのリバースプロキシ ───
-app.use('/api', (req, res) => {
+app.use('/api', requireAuth, (req, res) => {
   const ip = getIP(req);
   const targetPath = '/api' + req.url;
   const backend = selectBackend();
   backend.activeConns++;
+  let connDecremented = false;
+  const decrementConn = () => {
+    if (!connDecremented) {
+      connDecremented = true;
+      backend.activeConns = Math.max(0, backend.activeConns - 1);
+    }
+  };
   const backendLabel = backends.length > 1 ? ` [${backend.host}:${backend.port}]` : '';
   log(ip, `${req.method} ${targetPath}${backendLabel}`);
 
@@ -304,6 +381,7 @@ app.use('/api', (req, res) => {
 
   proxyReq.on('error', (err) => {
     log(ip, `ERROR ${targetPath}${backendLabel} ${err.message}`);
+    decrementConn();
     if (!res.headersSent) {
       res.status(502).json({ error: 'Ollama に接続できません: ' + err.message });
     }
@@ -311,14 +389,15 @@ app.use('/api', (req, res) => {
 
   proxyReq.on('timeout', () => {
     log(ip, `TIMEOUT ${targetPath}${backendLabel}`);
+    decrementConn();
     proxyReq.destroy();
     if (!res.headersSent) {
       res.status(504).json({ error: 'Ollama タイムアウト' });
     }
   });
 
-  // リクエスト完了時にアクティブ接続数を減らす
-  res.on('close', () => { backend.activeConns = Math.max(0, backend.activeConns - 1); });
+  // クライアント切断・正常完了時にカウンタ減算
+  res.on('close', decrementConn);
 
   req.pipe(proxyReq, { end: true });
 });
@@ -446,7 +525,7 @@ async function queryGpu() {
   return [];
 }
 
-app.get('/sse/gpu', (req, res) => {
+app.get('/sse/gpu', requireAuth, (req, res) => {
   const ip = getIP(req);
   log(ip, 'SSE GPU connected');
   res.writeHead(200, {
@@ -455,11 +534,10 @@ app.get('/sse/gpu', (req, res) => {
     'Connection': 'keep-alive',
   });
 
-  const send = async () => {
-    const gpus = await queryGpu();
-    cachedGpuData = gpus; // バックエンド選択用キャッシュ更新
+  // 即座にキャッシュを送信（updateAllGpuDataはバックグラウンドタイマーが行う）
+  const send = () => {
     if (!res.writableEnded) {
-      res.write(`data: ${JSON.stringify(gpus)}\n\n`);
+      res.write(`data: ${JSON.stringify(buildGpuSseData())}\n\n`);
     }
   };
 
@@ -475,8 +553,86 @@ app.get('/sse/gpu', (req, res) => {
 // ─── アプリ設定配信 ───
 const jsonParser = express.json({ limit: '10mb' });
 
+// ─── セッショントークン管理 ───
+const SESSION_TTL = 24 * 60 * 60 * 1000; // 24時間
+const sessions = new Map(); // token → { ip, expiresAt }
+
+function newSession(ip) {
+  const token = crypto.randomBytes(32).toString('hex');
+  sessions.set(token, { ip, expiresAt: Date.now() + SESSION_TTL });
+  return token;
+}
+
+function isValidSession(token) {
+  if (!token) return false;
+  const s = sessions.get(token);
+  if (!s) return false;
+  if (s.expiresAt < Date.now()) {
+    sessions.delete(token);
+    return false;
+  }
+  return true;
+}
+
+// 期限切れセッションを定期清掃
+setInterval(() => {
+  const now = Date.now();
+  for (const [tok, s] of sessions.entries()) {
+    if (s.expiresAt < now) sessions.delete(tok);
+  }
+}, 60 * 60 * 1000);
+
+// ─── ログイン試行レートリミット ───
+const loginAttempts = new Map(); // ip → { count, resetAt }
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOGIN_WINDOW = 15 * 60 * 1000; // 15分
+
+function checkLoginRate(ip) {
+  const now = Date.now();
+  const rec = loginAttempts.get(ip);
+  if (!rec || rec.resetAt < now) {
+    loginAttempts.set(ip, { count: 0, resetAt: now + LOGIN_WINDOW });
+    return true;
+  }
+  return rec.count < MAX_LOGIN_ATTEMPTS;
+}
+
+function recordLoginFail(ip) {
+  const rec = loginAttempts.get(ip);
+  if (rec) rec.count++;
+}
+
+function resetLoginRate(ip) {
+  loginAttempts.delete(ip);
+}
+
+// ─── パスワード照合（MD5 / SHA-256両対応）───
+// MD5: 32文字hex / SHA-256: 64文字hex
+function verifyPassword(input, stored) {
+  if (!stored) return false;
+  const isSha256 = stored.length === 64;
+  const algo = isSha256 ? 'sha256' : 'md5';
+  const hash = crypto.createHash(algo).update(input || '').digest('hex');
+  // タイミング攻撃対策で定時間比較
+  if (hash.length !== stored.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(stored));
+}
+
+// ─── 認証ミドルウェア ───
+function requireAuth(req, res, next) {
+  if (!appConfig.password) return next(); // パスワード未設定なら認証不要
+  // CookieまたはAuthorizationヘッダーからトークン取得
+  const cookieToken = (req.headers.cookie || '').split(';')
+    .map(c => c.trim())
+    .find(c => c.startsWith('wz_session='))?.split('=')[1];
+  const headerToken = req.headers['x-auth-token'];
+  const token = cookieToken || headerToken;
+  if (isValidSession(token)) return next();
+  res.status(401).json({ error: '認証が必要です' });
+}
+
 app.get('/config', (req, res) => {
-  const { password, ...safeConfig } = appConfig;
+  const { password, ollamaBackends, ...safeConfig } = appConfig;
   safeConfig.hasPassword = !!password;
   res.json(safeConfig);
 });
@@ -484,14 +640,21 @@ app.get('/config', (req, res) => {
 app.post('/auth', jsonParser, (req, res) => {
   const ip = getIP(req);
   if (!appConfig.password) {
-    return res.json({ ok: true });
+    return res.json({ ok: true, token: null });
+  }
+  if (!checkLoginRate(ip)) {
+    log(ip, 'AUTH rate limited');
+    return res.status(429).json({ ok: false, error: 'ログイン試行回数が多すぎます。しばらくしてから再度お試しください。' });
   }
   const { password } = req.body || {};
-  const inputHash = crypto.createHash('md5').update(password || '').digest('hex');
-  if (inputHash === appConfig.password) {
+  if (verifyPassword(password, appConfig.password)) {
+    const token = newSession(ip);
+    resetLoginRate(ip);
     log(ip, 'AUTH success');
-    return res.json({ ok: true });
+    res.setHeader('Set-Cookie', `wz_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(SESSION_TTL / 1000)}`);
+    return res.json({ ok: true, token });
   }
+  recordLoginFail(ip);
   log(ip, 'AUTH failed');
   return res.status(401).json({ ok: false, error: 'パスワードが正しくありません' });
 });
@@ -499,7 +662,7 @@ app.post('/auth', jsonParser, (req, res) => {
 // ─── グローバル設定 ───
 const SETTINGS_FILE = path.join(__dirname, 'settings.json');
 
-app.get('/settings', (req, res) => {
+app.get('/settings', requireAuth, (req, res) => {
   try {
     if (!fs.existsSync(SETTINGS_FILE)) return res.json({});
     const data = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
@@ -509,7 +672,7 @@ app.get('/settings', (req, res) => {
   }
 });
 
-app.post('/settings', jsonParser, (req, res) => {
+app.post('/settings', requireAuth, jsonParser, (req, res) => {
   const ip = getIP(req);
   try {
     fs.writeFileSync(SETTINGS_FILE, JSON.stringify(req.body, null, 2), 'utf-8');
@@ -525,7 +688,16 @@ const CHATS_DIR = process.env.CHATS_DIR || path.join(__dirname, 'chats');
 if (!fs.existsSync(CHATS_DIR)) fs.mkdirSync(CHATS_DIR, { recursive: true });
 
 // 一覧取得
-app.get('/chats', (req, res) => {
+// チャットIDのサニタイズ（パストラバーサル防止）
+function sanitizeChatId(id) {
+  if (!id || typeof id !== 'string') return null;
+  // 英数字・ハイフン・アンダースコアのみ許可
+  if (!/^[a-zA-Z0-9_-]+$/.test(id)) return null;
+  if (id.length > 64) return null;
+  return id;
+}
+
+app.get('/chats', requireAuth, (req, res) => {
   try {
     const files = fs.readdirSync(CHATS_DIR).filter(f => f.endsWith('.json'));
     const list = files.map(f => {
@@ -548,8 +720,10 @@ app.get('/chats', (req, res) => {
 });
 
 // 1件取得
-app.get('/chats/:id', (req, res) => {
-  const file = path.join(CHATS_DIR, `${req.params.id}.json`);
+app.get('/chats/:id', requireAuth, (req, res) => {
+  const id = sanitizeChatId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid chat id' });
+  const file = path.join(CHATS_DIR, `${id}.json`);
   if (!fs.existsSync(file)) return res.status(404).json({ error: 'Not found' });
   try {
     const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
@@ -560,9 +734,10 @@ app.get('/chats/:id', (req, res) => {
 });
 
 // 保存（新規 or 上書き）
-app.post('/chats/:id', jsonParser, (req, res) => {
+app.post('/chats/:id', requireAuth, jsonParser, (req, res) => {
   const ip = getIP(req);
-  const id = req.params.id;
+  const id = sanitizeChatId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid chat id' });
   const file = path.join(CHATS_DIR, `${id}.json`);
   try {
     const payload = {
@@ -580,13 +755,15 @@ app.post('/chats/:id', jsonParser, (req, res) => {
 });
 
 // 削除
-app.delete('/chats/:id', (req, res) => {
+app.delete('/chats/:id', requireAuth, (req, res) => {
   const ip = getIP(req);
-  const file = path.join(CHATS_DIR, `${req.params.id}.json`);
+  const id = sanitizeChatId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid chat id' });
+  const file = path.join(CHATS_DIR, `${id}.json`);
   if (!fs.existsSync(file)) return res.status(404).json({ error: 'Not found' });
   try {
     fs.unlinkSync(file);
-    log(ip, `CHAT DELETE ${req.params.id}`);
+    log(ip, `CHAT DELETE ${id}`);
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -611,7 +788,7 @@ server.listen(PORT, '0.0.0.0', async () => {
   } else {
     lines.push(`  Ollama: ${backends.length} backends (load-balanced)`);
     backends.forEach((b, i) => {
-      lines.push(`    [${i}] http://${b.host}:${b.port} (GPU ${b.gpuIndex >= 0 ? b.gpuIndex : 'auto'})`);
+      lines.push(`    [${i}] ${b.label} http://${b.host}:${b.port} (agent :${b.gpuAgentPort || '-'})`);
     });
   }
   const w = Math.max(name.length + 6, ...lines.map(l => l.length + 2), 40);
@@ -623,9 +800,15 @@ server.listen(PORT, '0.0.0.0', async () => {
   for (const l of lines) console.log(`  ║${pad(l)}║`);
   console.log(`  ╚${'═'.repeat(w)}╝`);
   console.log('');
-  // 起動時にGPUデータを取得してキャッシュ
-  cachedGpuData = await queryGpu();
+  // 起動時にGPUデータを取得
+  await updateAllGpuData();
 });
 
-// ─── バックグラウンドGPU監視（SSEクライアントがいなくてもキャッシュ更新）───
-setInterval(async () => { cachedGpuData = await queryGpu(); }, GPU_INTERVAL * 5);
+// ─── バックグラウンドGPU監視（全クライアントで共有キャッシュ） ───
+let gpuUpdating = false;
+async function safeUpdateGpu() {
+  if (gpuUpdating) return;
+  gpuUpdating = true;
+  try { await updateAllGpuData(); } finally { gpuUpdating = false; }
+}
+setInterval(safeUpdateGpu, GPU_INTERVAL);

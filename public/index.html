@@ -536,6 +536,35 @@
 
   .gpu-card:last-child { margin-bottom: 0; }
 
+  .gpu-host-group {
+    margin-bottom: 14px;
+  }
+
+  .gpu-host-group:last-child { margin-bottom: 0; }
+
+  .gpu-host-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent);
+    padding: 6px 0 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .gpu-host-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .gpu-host-dot.online { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .gpu-host-dot.offline { background: var(--text-muted); }
+
   .gpu-card-label {
     font-size: 12px;
     font-weight: 600;
@@ -2235,17 +2264,20 @@ function App() {
     }
   }, [ollamaUrl]);
 
-  useEffect(() => { fetchModels(); }, [fetchModels]);
+  useEffect(() => {
+    if (authenticated) fetchModels();
+  }, [authenticated, fetchModels]);
 
   // ─── GPU 監視 (SSE) ───
   useEffect(() => {
+    if (!authenticated) return;
     const evtSource = new EventSource('/sse/gpu');
     evtSource.onmessage = (e) => {
       try { setGpuData(JSON.parse(e.data)); } catch {}
     };
     evtSource.onerror = () => { setGpuData([]); };
     return () => evtSource.close();
-  }, []);
+  }, [authenticated]);
 
   // ─── Embedding取得 ───
   async function getEmbedding(text) {
@@ -3137,7 +3169,7 @@ function App() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
             <button className="clear-btn" onClick={newChat}>新規チャット</button>
             <button className={`clear-btn ${gpuPanelOpen ? 'gpu-btn-active' : ''}`} onClick={() => setGpuPanelOpen(!gpuPanelOpen)}>
-              {gpuData.length > 0 && <span className="gpu-header-dot" />}
+              {gpuData.some(g => g.gpus?.length > 0) && <span className="gpu-header-dot" />}
               GPU
             </button>
           </div>
@@ -3346,7 +3378,7 @@ function App() {
       <div className={`right-sidebar ${gpuPanelOpen ? 'open' : ''}`}>
         <div className="right-sidebar-header">
           <div className="gpu-panel-title" style={{ margin: 0 }}>
-            {gpuData.length > 0 && <span className="gpu-live-dot" />}
+            {gpuData.some(g => g.gpus?.length > 0) && <span className="gpu-live-dot" />}
             GPU モニター
           </div>
           <button className="clear-btn" onClick={() => setGpuPanelOpen(false)}>✕</button>
@@ -3364,57 +3396,66 @@ function App() {
               </div>
             </div>
           )}
-          {gpuData.length === 0 ? (
-            <div className="gpu-offline">GPU 未検出</div>
-          ) : (
-            gpuData.map((gpu, gi) => {
-              const vramPct = gpu.vramPct || 0;
-              const tempClass = gpu.temp >= 90 ? 'hot' : gpu.temp >= 70 ? 'warn' : 'normal';
-              const hotspotClass = gpu.tempHotspot >= 100 ? 'hot' : gpu.tempHotspot >= 80 ? 'warn' : 'normal';
-              const usageClass = gpu.usage >= 90 ? 'hot' : gpu.usage >= 60 ? 'warn' : 'normal';
-              const vramClass = vramPct >= 90 ? 'hot' : vramPct >= 70 ? 'warn' : 'normal';
-              const vramColor = vramPct >= 90 ? 'var(--red)' : vramPct >= 70 ? 'var(--orange)' : 'var(--green)';
-              return (
-                <div key={gi} className="gpu-card">
-                  {gpuData.length > 1 && <div className="gpu-card-label">{gpu.name || `GPU ${gi}`} ({gpu.id})</div>}
-                  <div className="gpu-stats-grid">
-                    <div className="gpu-stat">
-                      <div className="gpu-stat-label">使用率</div>
-                      <div className={`gpu-stat-value ${usageClass}`}>{gpu.usage}%</div>
-                    </div>
-                    <div className="gpu-stat">
-                      <div className="gpu-stat-label">温度 (Edge)</div>
-                      <div className={`gpu-stat-value ${tempClass}`}>{gpu.temp}°C</div>
-                    </div>
-                    <div className="gpu-stat">
-                      <div className="gpu-stat-label">電力</div>
-                      <div className="gpu-stat-value normal">{gpu.power}W</div>
-                    </div>
-                    {gpu.tempHotspot > 0 && (
-                      <div className="gpu-stat">
-                        <div className="gpu-stat-label">温度 (Hotspot)</div>
-                        <div className={`gpu-stat-value ${hotspotClass}`}>{gpu.tempHotspot}°C</div>
+          {(() => {
+            const allGpus = gpuData.reduce((s, g) => s + (g.gpus?.length || 0), 0);
+            if (allGpus === 0) return <div className="gpu-offline">GPU 未検出</div>;
+            return gpuData.map((group, bi) => (
+              <div key={bi} className="gpu-host-group">
+                {gpuData.length > 1 && (
+                  <div className="gpu-host-label">
+                    <span className={`gpu-host-dot ${group.gpus?.length > 0 ? 'online' : 'offline'}`} />
+                    {group.label} ({group.host})
+                  </div>
+                )}
+                {(group.gpus || []).map((gpu, gi) => {
+                  const vramPct = gpu.vramPct || 0;
+                  const tempClass = gpu.temp >= 90 ? 'hot' : gpu.temp >= 70 ? 'warn' : 'normal';
+                  const hotspotClass = gpu.tempHotspot >= 100 ? 'hot' : gpu.tempHotspot >= 80 ? 'warn' : 'normal';
+                  const usageClass = gpu.usage >= 90 ? 'hot' : gpu.usage >= 60 ? 'warn' : 'normal';
+                  const vramColor = vramPct >= 90 ? 'var(--red)' : vramPct >= 70 ? 'var(--orange)' : 'var(--green)';
+                  return (
+                    <div key={gi} className="gpu-card">
+                      <div className="gpu-card-label">{gpu.name || `GPU ${gi}`} ({gpu.id})</div>
+                      <div className="gpu-stats-grid">
+                        <div className="gpu-stat">
+                          <div className="gpu-stat-label">使用率</div>
+                          <div className={`gpu-stat-value ${usageClass}`}>{gpu.usage}%</div>
+                        </div>
+                        <div className="gpu-stat">
+                          <div className="gpu-stat-label">温度 (Edge)</div>
+                          <div className={`gpu-stat-value ${tempClass}`}>{gpu.temp}°C</div>
+                        </div>
+                        <div className="gpu-stat">
+                          <div className="gpu-stat-label">電力</div>
+                          <div className="gpu-stat-value normal">{gpu.power}W</div>
+                        </div>
+                        {gpu.tempHotspot > 0 && (
+                          <div className="gpu-stat">
+                            <div className="gpu-stat-label">温度 (Hotspot)</div>
+                            <div className={`gpu-stat-value ${hotspotClass}`}>{gpu.tempHotspot}°C</div>
+                          </div>
+                        )}
+                        <div className="gpu-stat">
+                          <div className="gpu-stat-label">SCLK</div>
+                          <div className="gpu-stat-value normal">{gpu.sclk || 'N/A'}{gpu.sclk ? 'MHz' : ''}</div>
+                        </div>
+                        <div className="gpu-stat">
+                          <div className="gpu-stat-label">MCLK</div>
+                          <div className="gpu-stat-value normal">{gpu.mclk || 'N/A'}{gpu.mclk ? 'MHz' : ''}</div>
+                        </div>
                       </div>
-                    )}
-                    <div className="gpu-stat">
-                      <div className="gpu-stat-label">SCLK</div>
-                      <div className="gpu-stat-value normal">{gpu.sclk || 'N/A'}{gpu.sclk ? 'MHz' : ''}</div>
+                      <div className="gpu-stat" style={{ marginTop: 8 }}>
+                        <div className="gpu-stat-label">VRAM {gpu.vramUsedMB || 0}MB / {gpu.vramTotalMB || 0}MB ({vramPct}%)</div>
+                        <div className="gpu-vram-bar">
+                          <div className="gpu-vram-fill" style={{ width: `${vramPct}%`, background: vramColor }} />
+                        </div>
+                      </div>
                     </div>
-                    <div className="gpu-stat">
-                      <div className="gpu-stat-label">MCLK</div>
-                      <div className="gpu-stat-value normal">{gpu.mclk || 'N/A'}{gpu.mclk ? 'MHz' : ''}</div>
-                    </div>
-                  </div>
-                  <div className="gpu-stat" style={{ marginTop: 8 }}>
-                    <div className="gpu-stat-label">VRAM {gpu.vramUsedMB || 0}MB / {gpu.vramTotalMB || 0}MB ({vramPct}%)</div>
-                    <div className="gpu-vram-bar">
-                      <div className="gpu-vram-fill" style={{ width: `${vramPct}%`, background: vramColor }} />
-                    </div>
-                  </div>
-                </div>
-              );
-            })
-          )}
+                  );
+                })}
+              </div>
+            ));
+          })()}
         </div>
       </div>
 
