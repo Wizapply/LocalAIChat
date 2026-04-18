@@ -1,13 +1,13 @@
 {
-  "name": "wizapply-ai-chat",
+  "name": "opengeek-llm-chat",
   "version": "1.0.0",
-  "description": "WIZAPPLY AI CHAT - Ollama RAG Chat Server",
+  "description": "OpenGeekLLMChat - A geek-oriented browser-based chat app for local LLMs (Ollama)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
-  "keywords": ["ollama", "rag", "chat", "llm", "ai", "gpu-monitor"],
+  "keywords": ["ollama", "rag", "chat", "llm", "ai", "gpu-monitor", "agentic", "local-llm", "self-hosted"],
   "license": "MIT",
   "repository": {
     "type": "git",

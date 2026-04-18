@@ -1,21 +1,35 @@
 {
-  "appName": "WIZAPPLY AI CHAT",
-  "logoMain": "WIZAPPLY",
-  "logoSub": "AI CHAT",
-  "welcomeMessage": "ドキュメントをアップロードしてRAGベースの質問応答を行うか、自由にチャットを開始できます。",
-  "welcomeHints": ["ドキュメントを要約して", "この資料の要点は？", "〇〇について教えて"],
+  "appName": "OpenGeekLLMChat",
+  "logoMain": "OpenGeek",
+  "logoSub": "LLM Chat",
+  "welcomeMessage": "ローカルLLM(Ollama)を使ったプライベートなAIアシスタントです。ドキュメントをアップロードしてRAG質問応答を行うか、自由にチャットを開始できます。",
+  "welcomeHints": ["このコードを解説して", "今日のニュースを教えて", "Pythonで〇〇するスクリプトを書いて"],
   "accentColor": "#34d399",
   "defaultModel": "",
-  "password": "",
+  "password": "e10adc3949ba59abbe56e057f20f883e",
   "gpuAgentToken": "mysecret123",
   "ollamaBackends": [
-    { "host": "192.168.10.201", "port": 11434, "label": "PC-0" }
+    {
+      "host": "127.0.0.1",
+      "port": 11434,
+      "label": "PC-0"
+    }
   ],
   "webSearch": true,
-  "ragTopK": 10,
+  "fileAccess": true,
+  "ragTopK": 30,
   "ragMode": "agentic",
-  "tokenAvgWindow": 2000,
+  "agentContext": {
+    "smallCtx": 2048,
+    "mediumCtx": 8192,
+    "smallPredict": 512,
+    "largePredict": 8192,
+    "smallThreshold": 2000,
+    "mediumThreshold": 8000,
+    "largeGenKeywords": null
+  },
+  "tokenAvgWindow": 3000,
   "topK": 40,
   "topP": 0.9,
-  "temperature": 0.7
+  "temperature": 0.9
 }

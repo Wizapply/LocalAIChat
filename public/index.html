@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>AI CHAT</title>
+<title>OpenGeekLLMChat</title>
 <link rel="icon" type="image/jpeg" href="aiicon.jpg" />
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
 <style>
@@ -497,6 +497,117 @@
   .gpu-panel-body::-webkit-scrollbar-track { background: transparent; }
   .gpu-panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 
+  /* ── Right Sidebar Tabs ── */
+  .right-panel-tabs {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 12px;
+  }
+
+  .right-panel-tab {
+    flex: 1;
+    padding: 8px 12px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-muted);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+
+  .right-panel-tab:hover { color: var(--text-primary); }
+  .right-panel-tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  .files-panel-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .files-upload-btn {
+    padding: 10px;
+    background: var(--accent-dim);
+    border: 1px dashed var(--accent);
+    border-radius: var(--radius-sm);
+    color: var(--accent);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    text-align: center;
+    transition: opacity 0.15s;
+  }
+
+  .files-upload-btn:hover { opacity: 0.8; }
+
+  .server-file-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    cursor: pointer;
+    transition: border-color 0.15s;
+  }
+
+  .server-file-item:hover { border-color: var(--accent); }
+
+  .server-file-info {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .server-file-name {
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .server-file-meta {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  .server-file-delete {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: color 0.15s, background 0.15s;
+  }
+
+  .server-file-delete:hover { color: var(--red); background: var(--red-dim); }
+
+  .files-empty {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
+    padding: 24px 8px;
+  }
+
   /* ── GPU Panel Content ── */
   .gpu-panel-title {
     font-size: 12px;
@@ -683,6 +794,8 @@
 
   .chat-header-left {
     display: flex; align-items: center; gap: 12px;
+    flex: 1;
+    min-width: 0;
   }
 
   .status-dot {
@@ -695,6 +808,42 @@
   .status-dot.connected { background: var(--green); box-shadow: 0 0 8px var(--green); }
 
   .chat-header-title { font-size: 14px; font-weight: 500; }
+
+  .chat-header-divider {
+    width: 1px;
+    height: 16px;
+    background: var(--border);
+    margin: 0 4px;
+  }
+
+  .chat-title-editable {
+    flex: 1;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text-primary);
+    cursor: text;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    border: 1px solid transparent;
+    background: transparent;
+    transition: background 0.15s, border-color 0.15s;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--font-sans);
+  }
+
+  .chat-title-editable:hover {
+    background: var(--bg-tertiary);
+    border-color: var(--border);
+  }
+
+  .chat-title-editable:focus {
+    background: var(--bg-tertiary);
+    border-color: var(--accent);
+    outline: none;
+  }
 
   .clear-btn {
     background: none; border: 1px solid var(--border);
@@ -1753,6 +1902,14 @@
 <script type="text/babel">
 const { useState, useRef, useEffect, useCallback } = React;
 
+// ─── Utility: バイト数フォーマット ───
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)}GB`;
+}
+
 // ─── Utility: テキストをチャンクに分割 ───
 function chunkText(text, chunkSize = 500, overlap = 100) {
   const chunks = [];
@@ -2196,9 +2353,9 @@ function App() {
 
   // ─── アプリ設定 (config.json) ───
   const [appConfig, setAppConfig] = useState({
-    appName: 'WIZAPPLY AI CHAT',
-    logoMain: 'WIZAPPLY',
-    logoSub: 'AI CHAT',
+    appName: 'OpenGeekLLMChat',
+    logoMain: 'OpenGeek',
+    logoSub: 'LLM Chat',
     welcomeMessage: 'ドキュメントをアップロードしてRAGベースの質問応答を行うか、自由にチャットを開始できます。',
     welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
     accentColor: '#34d399',
@@ -2206,6 +2363,14 @@ function App() {
     webSearch: true,
     ragTopK: 10,
     ragMode: 'agentic',
+    agentContext: {
+      smallCtx: 2048,
+      mediumCtx: 8192,
+      smallPredict: 512,
+      largePredict: 8192,
+      smallThreshold: 2000,
+      mediumThreshold: 8000,
+    },
     tokenAvgWindow: 2000,
     topK: 40,
     topP: 0.9,
@@ -2232,10 +2397,12 @@ function App() {
   const [embeddingJobs, setEmbeddingJobs] = useState([]); // { name, current, total }
   const [gpuData, setGpuData] = useState([]);
   const [gpuPanelOpen, setGpuPanelOpen] = useState(false);
+  const [rightPanelTab, setRightPanelTab] = useState('gpu'); // 'gpu' | 'files'
   const [tokenSpeed, setTokenSpeed] = useState(null); // { tokPerSec, totalTokens }
   const tokenHistoryRef = useRef([]); // [{ tokens, durationNs }]
   const [chatId, setChatId] = useState(() => Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
   const [chatList, setChatList] = useState([]);
+  const [fileList, setFileList] = useState([]);
   const [chatTitle, setChatTitle] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
   const saveTimerRef = useRef(null);
@@ -2244,6 +2411,7 @@ function App() {
   const inputRef = useRef(null);
   const fileInputRef = useRef(null);
   const imageInputRef = useRef(null);
+  const serverFileInputRef = useRef(null);
   const abortRef = useRef(null);
   const [chatImages, setChatImages] = useState([]); // [{ name, base64, preview }]
   const [lightboxSrc, setLightboxSrc] = useState(null);
@@ -2417,6 +2585,46 @@ function App() {
           });
         }
 
+        if (appConfig.fileAccess !== false) {
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'list_files',
+              description: 'サーバーのuploadsフォルダに保存されているファイル一覧を取得する。',
+              parameters: { type: 'object', properties: {} }
+            }
+          });
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'read_file',
+              description: 'uploadsフォルダ内のファイルを読み込む。引数 path は必ず "path" という名前で、uploadsフォルダからの相対パス（例: "data.json", "scripts/hello.py"）を指定する。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  path: { type: 'string', description: 'uploadsフォルダからの相対パス' }
+                },
+                required: ['path']
+              }
+            }
+          });
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'write_file',
+              description: 'uploadsフォルダ内のファイルに書き込む（新規作成または上書き）。引数は必ず "path"（相対パス）と "content"（ファイル内容の文字列）の2つ。10MBまで。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  path: { type: 'string', description: 'uploadsフォルダからの相対パス（例: "hello.py"）' },
+                  content: { type: 'string', description: 'ファイルに書き込む内容（文字列）' }
+                },
+                required: ['path', 'content']
+              }
+            }
+          });
+        }
+
         let agentSystem = systemPrompt;
         if (documents.length > 0) {
           const docListText = documents.map(d => d.name).join(', ');
@@ -2426,8 +2634,19 @@ function App() {
         if (appConfig.webSearch) {
           agentSystem += '\n\n最新の情報や知らないことについては web_search ツールでインターネット検索できます。';
         }
-        agentSystem += '\n検索結果に基づいて回答してください。検索結果が得られなかった場合は、その旨を簡潔に伝え、自分の知識で回答してください。'
-          + '\n内部的な推論や検索戦略の説明は出力せず、ユーザーへの回答だけを出力してください。';
+        if (appConfig.fileAccess !== false) {
+          agentSystem += '\n\nサーバーのuploadsフォルダに対してファイルの読み書きが可能です。'
+            + '\n- list_files: ファイル一覧を取得'
+            + '\n- read_file(path): ファイル読み込み'
+            + '\n- write_file(path, content): ファイル書き込み'
+            + '\n重要: pathには"uploads/"プレフィックスを付けずにファイル名のみを指定してください（例: "hello.py"、"data/config.json"）。'
+            + '\nユーザーがファイル操作やコード保存を依頼した場合は、余計な説明なしに即座にツールを呼び出してください。';
+        }
+        agentSystem += '\n\n重要な指示:'
+          + '\n- 内部的な推論・検索戦略・計画・メタ的な説明は一切出力しないでください。'
+          + '\n- "I need to...", "The user wants...", "I should..." のような独り言を書かないでください。'
+          + '\n- ツールを呼び出すと決めたら、即座にツールを呼び出してください。テキスト応答と併用しないでください。'
+          + '\n- 検索結果が得られなかった場合は、その旨を簡潔に伝え、自分の知識で回答してください。';
 
         let apiMessages = [{ role: 'system', content: agentSystem }, ...history];
         let allContexts = [];
@@ -2436,7 +2655,32 @@ function App() {
         // アシスタントメッセージを先に追加
         setMessages(prev => [...prev, { role: 'assistant', content: '', thinking: '', contexts: null, agentStatus: 'ツール判断中...', searchQueries: [] }]);
 
-        // ステップ1: ツール呼び出し判断（非ストリーミング）
+        // ─── 入力内容からツール判断時のnum_ctx/num_predictを動的決定 ───
+        const agentCtx = appConfig.agentContext || {};
+        const fileWriteKeywords = agentCtx.largeGenKeywords || [
+          // 日本語
+          '書き込', '書いて', '書き出', '保存', '作成して', '生成して', 'ファイル作', 'ファイルに',
+          'スクリプト', 'プログラム', 'コード', '.py', '.js', '.ts', '.html', '.css',
+          '.xml', '.json', '.yaml', '.yml', '.md', '.txt', '.csv', '.sh', '.cpp', '.c ', '.h ',
+          // 英語
+          'write ', 'save ', 'create file', 'generate ', 'write_file', 'write to',
+        ];
+        const smallCtx = agentCtx.smallCtx ?? 2048;
+        const mediumCtx = agentCtx.mediumCtx ?? 8192;
+        const smallPredict = agentCtx.smallPredict ?? 512;
+        const largePredict = agentCtx.largePredict ?? 8192;
+        const smallThreshold = agentCtx.smallThreshold ?? 2000;
+        const mediumThreshold = agentCtx.mediumThreshold ?? 8000;
+
+        const lowerText = text.toLowerCase();
+        const needsLargeGen = fileWriteKeywords.some(k => lowerText.includes(k.toLowerCase()));
+        const totalChars = apiMessages.reduce((s, m) => s + (typeof m.content === 'string' ? m.content.length : 0), 0);
+        const ctxByHistory = totalChars > mediumThreshold ? numCtx : totalChars > smallThreshold ? Math.min(numCtx, mediumCtx) : smallCtx;
+        const judgeNumCtx = needsLargeGen ? numCtx : ctxByHistory;
+        const judgeNumPredict = needsLargeGen ? largePredict : smallPredict;
+        console.log(`[ツール判断] num_ctx=${judgeNumCtx}, num_predict=${judgeNumPredict} (needsLargeGen=${needsLargeGen}, totalChars=${totalChars})`);
+
+        // ステップ1: ツール呼び出し判断（非ストリーミング、動的コンテキスト）
         const toolRes = await fetch(`${ollamaUrl}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -2445,7 +2689,7 @@ function App() {
             messages: apiMessages,
             tools,
             stream: false,
-            options: ollamaOptions,
+            options: { ...ollamaOptions, num_ctx: judgeNumCtx, num_predict: judgeNumPredict },
           }),
           signal: controller.signal,
         });
@@ -2533,6 +2777,95 @@ function App() {
                 ? webResults.map((r, i) => `[Web${i + 1}] ${r.title}\n${r.url}\n${r.snippet}`).join('\n\n')
                 : 'Web検索結果が見つかりませんでした。';
               apiMessages.push({ role: 'tool', content: resultText });
+
+            } else if (fnName === 'list_files') {
+              searchQueries.push({ query: 'list_files', resultCount: null, type: 'file' });
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: '📁 ファイル一覧取得中...', searchQueries: [...searchQueries] };
+                return copy;
+              });
+              let files = [];
+              try {
+                const res = await fetch('/files');
+                if (res.ok) files = (await res.json()).files || [];
+              } catch {}
+              searchQueries[searchQueries.length - 1].resultCount = files.length;
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: null, searchQueries: [...searchQueries] };
+                return copy;
+              });
+              const resultText = files.length > 0
+                ? files.map(f => `${f.path} (${f.size}バイト, ${f.modified})`).join('\n')
+                : 'uploadsフォルダは空です。';
+              apiMessages.push({ role: 'tool', content: resultText });
+
+            } else if (fnName === 'read_file') {
+              const fpath = fnArgs.path || fnArgs.filename || fnArgs.file || fnArgs.filepath || '';
+              searchQueries.push({ query: `read: ${fpath}`, resultCount: null, type: 'file' });
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: `📖 「${fpath}」を読み込み中...`, searchQueries: [...searchQueries] };
+                return copy;
+              });
+              let content = null, error = null;
+              try {
+                const res = await fetch(`/files/${encodeURI(fpath)}`);
+                if (res.ok) {
+                  const data = await res.json();
+                  content = data.content;
+                } else {
+                  const data = await res.json().catch(() => ({}));
+                  error = data.error || `HTTP ${res.status}`;
+                }
+              } catch (e) { error = e.message; }
+              searchQueries[searchQueries.length - 1].resultCount = content != null ? 1 : 0;
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: null, searchQueries: [...searchQueries] };
+                return copy;
+              });
+              const resultText = content != null
+                ? `ファイル「${fpath}」の内容:\n\`\`\`\n${content}\n\`\`\``
+                : `ファイル「${fpath}」の読み込みに失敗: ${error}`;
+              apiMessages.push({ role: 'tool', content: resultText });
+
+            } else if (fnName === 'write_file') {
+              const fpath = fnArgs.path || fnArgs.filename || fnArgs.file || fnArgs.filepath || '';
+              let fcontent = fnArgs.content ?? fnArgs.data ?? fnArgs.text ?? fnArgs.body ?? '';
+              // オブジェクトで渡された場合はJSON文字列化
+              if (typeof fcontent === 'object') fcontent = JSON.stringify(fcontent, null, 2);
+              if (typeof fcontent !== 'string') fcontent = String(fcontent);
+              searchQueries.push({ query: `write: ${fpath}`, resultCount: null, type: 'file' });
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: `✍️ 「${fpath}」に書き込み中...`, searchQueries: [...searchQueries] };
+                return copy;
+              });
+              let ok = false, error = null, size = 0;
+              try {
+                const res = await fetch(`/files/${encodeURI(fpath)}`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ content: fcontent }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (res.ok) { ok = true; size = data.size || 0; }
+                else error = data.error || `HTTP ${res.status}`;
+              } catch (e) { error = e.message; }
+              searchQueries[searchQueries.length - 1].resultCount = ok ? 1 : 0;
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: null, searchQueries: [...searchQueries] };
+                return copy;
+              });
+              const resultText = ok
+                ? `ファイル「${fpath}」に${size}バイト書き込みました。`
+                : `書き込みに失敗: ${error}`;
+              apiMessages.push({ role: 'tool', content: resultText });
+              // ファイル一覧を再読み込み
+              loadFileList();
             }
           }
         }
@@ -2813,6 +3146,60 @@ function App() {
     } catch {}
   }
 
+  // ─── サーバーファイル管理 ───
+  async function loadFileList() {
+    try {
+      const res = await fetch('/files');
+      if (res.ok) setFileList((await res.json()).files || []);
+    } catch {}
+  }
+
+  async function deleteServerFile(path) {
+    if (!confirm(`ファイル「${path}」を削除しますか？`)) return;
+    try {
+      await fetch(`/files/${encodeURI(path)}`, { method: 'DELETE' });
+      loadFileList();
+    } catch {}
+  }
+
+  async function downloadServerFile(path) {
+    try {
+      const res = await fetch(`/files/${encodeURI(path)}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const blob = new Blob([data.content], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = path.split('/').pop();
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {}
+  }
+
+  async function uploadServerFile(file) {
+    if (file.size > 10 * 1024 * 1024) {
+      setError('ファイルサイズが10MBを超えています');
+      return;
+    }
+    try {
+      const text = await file.text();
+      const res = await fetch(`/files/${encodeURI(file.name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: text }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setError(data.error || 'アップロードに失敗しました');
+        return;
+      }
+      loadFileList();
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
   async function saveChat(id, msgs, title) {
     if ((!msgs || msgs.length === 0) && documents.length === 0) return;
     const autoTitle = title || msgs.find(m => m.role === 'user')?.content?.slice(0, 40) || '無題';
@@ -2868,7 +3255,7 @@ function App() {
         if (cfgRes.ok) {
           const cfg = await cfgRes.json();
           setAppConfig(prev => ({ ...prev, ...cfg }));
-          document.title = cfg.appName || 'WIZAPPLY AI CHAT';
+          document.title = cfg.appName || 'OpenGeekLLMChat';
           if (cfg.accentColor) {
             const hex = cfg.accentColor;
             const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
@@ -2892,6 +3279,7 @@ function App() {
   useEffect(() => {
     if (!authenticated) return;
     loadChatList();
+    loadFileList();
     (async () => {
       try {
         const [cfgRes, setRes] = await Promise.all([fetch('/config'), fetch('/settings')]);
@@ -3077,6 +3465,14 @@ function App() {
           </div>
         </div>
 
+        {/* Server Files input (hidden, used by right sidebar button) */}
+        <input
+          type="file"
+          ref={serverFileInputRef}
+          style={{ display: 'none' }}
+          onChange={e => { if (e.target.files[0]) uploadServerFile(e.target.files[0]); e.target.value = ''; }}
+        />
+
         {/* ── Documents ── */}
         <div className="docs-panel">
           <div className="docs-header">
@@ -3165,10 +3561,33 @@ function App() {
             <span className="chat-header-title">
               {connected ? chatModel || 'モデル未選択' : 'Ollama未接続'}
             </span>
+            {messages.length > 0 && (
+              <>
+                <div className="chat-header-divider" />
+                <input
+                  className="chat-title-editable"
+                  type="text"
+                  value={chatTitle}
+                  onChange={e => setChatTitle(e.target.value)}
+                  onBlur={() => {
+                    if (chatId && messages.length > 0) saveChat(chatId, messages, chatTitle || '無題');
+                  }}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') e.target.blur();
+                    if (e.key === 'Escape') e.target.blur();
+                  }}
+                  placeholder="タイトル未設定"
+                  title="クリックで編集"
+                />
+              </>
+            )}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
             <button className="clear-btn" onClick={newChat}>新規チャット</button>
-            <button className={`clear-btn ${gpuPanelOpen ? 'gpu-btn-active' : ''}`} onClick={() => setGpuPanelOpen(!gpuPanelOpen)}>
+            <button className={`clear-btn ${gpuPanelOpen && rightPanelTab === 'files' ? 'gpu-btn-active' : ''}`} onClick={() => { setRightPanelTab('files'); setGpuPanelOpen(rightPanelTab !== 'files' || !gpuPanelOpen); loadFileList(); }}>
+              📁 ファイル{fileList.length > 0 && ` (${fileList.length})`}
+            </button>
+            <button className={`clear-btn ${gpuPanelOpen && rightPanelTab === 'gpu' ? 'gpu-btn-active' : ''}`} onClick={() => { setRightPanelTab('gpu'); setGpuPanelOpen(rightPanelTab !== 'gpu' || !gpuPanelOpen); }}>
               {gpuData.some(g => g.gpus?.length > 0) && <span className="gpu-header-dot" />}
               GPU
             </button>
@@ -3210,7 +3629,7 @@ function App() {
                       </div>
                       {msg.searchQueries?.map((sq, si) => (
                         <div key={si} className="agent-search-item">
-                          <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : '🔍'}</span>
+                          <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : sq.type === 'file' ? '📁' : '🔍'}</span>
                           <span className="agent-search-query">{sq.query}</span>
                           {sq.resultCount != null && (
                             <span className="agent-search-result">{sq.resultCount}件</span>
@@ -3373,89 +3792,131 @@ function App() {
         </div>
       </div>
 
-      {/* ── Right Sidebar: GPU Monitor ── */}
+      {/* ── Right Sidebar: GPU Monitor / Server Files ── */}
       <div className={`right-sidebar-overlay ${gpuPanelOpen ? 'open' : ''}`} onClick={() => setGpuPanelOpen(false)} />
       <div className={`right-sidebar ${gpuPanelOpen ? 'open' : ''}`}>
         <div className="right-sidebar-header">
           <div className="gpu-panel-title" style={{ margin: 0 }}>
-            {gpuData.some(g => g.gpus?.length > 0) && <span className="gpu-live-dot" />}
-            GPU モニター
+            {rightPanelTab === 'gpu'
+              ? <>{gpuData.some(g => g.gpus?.length > 0) && <span className="gpu-live-dot" />} GPU モニター</>
+              : <>📁 サーバーファイル</>}
           </div>
           <button className="clear-btn" onClick={() => setGpuPanelOpen(false)}>✕</button>
         </div>
         <div className="gpu-panel-body">
-          {tokenSpeed && (
-            <div className="inference-speed-card">
-              <div className="inference-speed-label">推論速度（直近平均）</div>
-              <div>
-                <span className="inference-speed-value">{tokenSpeed.tokPerSec.toFixed(1)}</span>
-                <span className="inference-speed-unit">tok/s</span>
-              </div>
-              <div className="inference-speed-meta">
-                直近 {tokenSpeed.totalTokens.toLocaleString()} トークン / {tokenSpeed.samples} 回
-              </div>
-            </div>
-          )}
-          {(() => {
-            const allGpus = gpuData.reduce((s, g) => s + (g.gpus?.length || 0), 0);
-            if (allGpus === 0) return <div className="gpu-offline">GPU 未検出</div>;
-            return gpuData.map((group, bi) => (
-              <div key={bi} className="gpu-host-group">
-                {gpuData.length > 1 && (
-                  <div className="gpu-host-label">
-                    <span className={`gpu-host-dot ${group.gpus?.length > 0 ? 'online' : 'offline'}`} />
-                    {group.label} ({group.host})
+          <div className="right-panel-tabs">
+            <button className={`right-panel-tab ${rightPanelTab === 'gpu' ? 'active' : ''}`} onClick={() => setRightPanelTab('gpu')}>
+              {gpuData.some(g => g.gpus?.length > 0) && <span className="gpu-header-dot" />}
+              GPU
+            </button>
+            <button className={`right-panel-tab ${rightPanelTab === 'files' ? 'active' : ''}`} onClick={() => { setRightPanelTab('files'); loadFileList(); }}>
+              📁 ファイル{fileList.length > 0 && ` (${fileList.length})`}
+            </button>
+          </div>
+
+          {rightPanelTab === 'gpu' && (
+            <>
+              {tokenSpeed && (
+                <div className="inference-speed-card">
+                  <div className="inference-speed-label">推論速度（直近平均）</div>
+                  <div>
+                    <span className="inference-speed-value">{tokenSpeed.tokPerSec.toFixed(1)}</span>
+                    <span className="inference-speed-unit">tok/s</span>
                   </div>
-                )}
-                {(group.gpus || []).map((gpu, gi) => {
-                  const vramPct = gpu.vramPct || 0;
-                  const tempClass = gpu.temp >= 90 ? 'hot' : gpu.temp >= 70 ? 'warn' : 'normal';
-                  const hotspotClass = gpu.tempHotspot >= 100 ? 'hot' : gpu.tempHotspot >= 80 ? 'warn' : 'normal';
-                  const usageClass = gpu.usage >= 90 ? 'hot' : gpu.usage >= 60 ? 'warn' : 'normal';
-                  const vramColor = vramPct >= 90 ? 'var(--red)' : vramPct >= 70 ? 'var(--orange)' : 'var(--green)';
-                  return (
-                    <div key={gi} className="gpu-card">
-                      <div className="gpu-card-label">{gpu.name || `GPU ${gi}`} ({gpu.id})</div>
-                      <div className="gpu-stats-grid">
-                        <div className="gpu-stat">
-                          <div className="gpu-stat-label">使用率</div>
-                          <div className={`gpu-stat-value ${usageClass}`}>{gpu.usage}%</div>
-                        </div>
-                        <div className="gpu-stat">
-                          <div className="gpu-stat-label">温度 (Edge)</div>
-                          <div className={`gpu-stat-value ${tempClass}`}>{gpu.temp}°C</div>
-                        </div>
-                        <div className="gpu-stat">
-                          <div className="gpu-stat-label">電力</div>
-                          <div className="gpu-stat-value normal">{gpu.power}W</div>
-                        </div>
-                        {gpu.tempHotspot > 0 && (
-                          <div className="gpu-stat">
-                            <div className="gpu-stat-label">温度 (Hotspot)</div>
-                            <div className={`gpu-stat-value ${hotspotClass}`}>{gpu.tempHotspot}°C</div>
-                          </div>
-                        )}
-                        <div className="gpu-stat">
-                          <div className="gpu-stat-label">SCLK</div>
-                          <div className="gpu-stat-value normal">{gpu.sclk || 'N/A'}{gpu.sclk ? 'MHz' : ''}</div>
-                        </div>
-                        <div className="gpu-stat">
-                          <div className="gpu-stat-label">MCLK</div>
-                          <div className="gpu-stat-value normal">{gpu.mclk || 'N/A'}{gpu.mclk ? 'MHz' : ''}</div>
-                        </div>
+                  <div className="inference-speed-meta">
+                    直近 {tokenSpeed.totalTokens.toLocaleString()} トークン / {tokenSpeed.samples} 回
+                  </div>
+                </div>
+              )}
+              {(() => {
+                const allGpus = gpuData.reduce((s, g) => s + (g.gpus?.length || 0), 0);
+                if (allGpus === 0) return <div className="gpu-offline">GPU 未検出</div>;
+                return gpuData.map((group, bi) => (
+                  <div key={bi} className="gpu-host-group">
+                    {gpuData.length > 1 && (
+                      <div className="gpu-host-label">
+                        <span className={`gpu-host-dot ${group.gpus?.length > 0 ? 'online' : 'offline'}`} />
+                        {group.label} ({group.host})
                       </div>
-                      <div className="gpu-stat" style={{ marginTop: 8 }}>
-                        <div className="gpu-stat-label">VRAM {gpu.vramUsedMB || 0}MB / {gpu.vramTotalMB || 0}MB ({vramPct}%)</div>
-                        <div className="gpu-vram-bar">
-                          <div className="gpu-vram-fill" style={{ width: `${vramPct}%`, background: vramColor }} />
+                    )}
+                    {(group.gpus || []).map((gpu, gi) => {
+                      const vramPct = gpu.vramPct || 0;
+                      const tempClass = gpu.temp >= 90 ? 'hot' : gpu.temp >= 70 ? 'warn' : 'normal';
+                      const hotspotClass = gpu.tempHotspot >= 100 ? 'hot' : gpu.tempHotspot >= 80 ? 'warn' : 'normal';
+                      const usageClass = gpu.usage >= 90 ? 'hot' : gpu.usage >= 60 ? 'warn' : 'normal';
+                      const vramColor = vramPct >= 90 ? 'var(--red)' : vramPct >= 70 ? 'var(--orange)' : 'var(--green)';
+                      return (
+                        <div key={gi} className="gpu-card">
+                          <div className="gpu-card-label">{gpu.name || `GPU ${gi}`} ({gpu.id})</div>
+                          <div className="gpu-stats-grid">
+                            <div className="gpu-stat">
+                              <div className="gpu-stat-label">使用率</div>
+                              <div className={`gpu-stat-value ${usageClass}`}>{gpu.usage}%</div>
+                            </div>
+                            <div className="gpu-stat">
+                              <div className="gpu-stat-label">温度 (Edge)</div>
+                              <div className={`gpu-stat-value ${tempClass}`}>{gpu.temp}°C</div>
+                            </div>
+                            <div className="gpu-stat">
+                              <div className="gpu-stat-label">電力</div>
+                              <div className="gpu-stat-value normal">{gpu.power}W</div>
+                            </div>
+                            {gpu.tempHotspot > 0 && (
+                              <div className="gpu-stat">
+                                <div className="gpu-stat-label">温度 (Hotspot)</div>
+                                <div className={`gpu-stat-value ${hotspotClass}`}>{gpu.tempHotspot}°C</div>
+                              </div>
+                            )}
+                            <div className="gpu-stat">
+                              <div className="gpu-stat-label">SCLK</div>
+                              <div className="gpu-stat-value normal">{gpu.sclk || 'N/A'}{gpu.sclk ? 'MHz' : ''}</div>
+                            </div>
+                            <div className="gpu-stat">
+                              <div className="gpu-stat-label">MCLK</div>
+                              <div className="gpu-stat-value normal">{gpu.mclk || 'N/A'}{gpu.mclk ? 'MHz' : ''}</div>
+                            </div>
+                          </div>
+                          <div className="gpu-stat" style={{ marginTop: 8 }}>
+                            <div className="gpu-stat-label">VRAM {gpu.vramUsedMB || 0}MB / {gpu.vramTotalMB || 0}MB ({vramPct}%)</div>
+                            <div className="gpu-vram-bar">
+                              <div className="gpu-vram-fill" style={{ width: `${vramPct}%`, background: vramColor }} />
+                            </div>
+                          </div>
                         </div>
+                      );
+                    })}
+                  </div>
+                ));
+              })()}
+            </>
+          )}
+
+          {rightPanelTab === 'files' && (
+            <div className="files-panel-body">
+              <button className="files-upload-btn" onClick={() => serverFileInputRef.current?.click()}>
+                + ファイルをアップロード
+              </button>
+              {fileList.length === 0 ? (
+                <div className="files-empty">ファイルがありません</div>
+              ) : (
+                fileList.map(f => (
+                  <div key={f.path} className="server-file-item" onClick={() => downloadServerFile(f.path)} title="クリックでダウンロード">
+                    <div className="server-file-info">
+                      <div className="server-file-name">{f.path}</div>
+                      <div className="server-file-meta">
+                        {formatBytes(f.size)} · {f.modified ? new Date(f.modified).toLocaleDateString('ja-JP') + ' ' + new Date(f.modified).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' }) : ''}
                       </div>
                     </div>
-                  );
-                })}
-              </div>
-            ));
-          })()}
+                    <button
+                      className="server-file-delete"
+                      onClick={e => { e.stopPropagation(); deleteServerFile(f.path); }}
+                      title="削除"
+                    >×</button>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
         </div>
       </div>
 

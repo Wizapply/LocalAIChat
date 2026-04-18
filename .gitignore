@@ -4,3 +4,6 @@ settings.json
 *.log
 .DS_Store
 Thumbs.db
+# uploadsは追跡するが、中身のファイルは除外
+public/uploads/*
+!public/uploads/.gitkeep

@@ -1,3 +1,14 @@
+#!/usr/bin/env python3
+"""
+WIZAPPLY AI CHAT — パスワードハッシュ生成ツール
+
+使い方:
+  python3 hashpass.py
+  python3 hashpass.py mypassword
+
+生成されたMD5ハッシュを config.json の "password" に設定してください。
+"""
+
 import hashlib
 import sys
 import getpass

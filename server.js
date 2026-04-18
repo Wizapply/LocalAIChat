@@ -17,9 +17,9 @@ const PYTHON_TIMEOUT = parseInt(process.env.PYTHON_TIMEOUT) || 60000;
 // ─── アプリ設定 (config.json) ───
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 const DEFAULT_CONFIG = {
-  appName: 'WIZAPPLY AI CHAT',
-  logoMain: 'WIZAPPLY',
-  logoSub: 'AI CHAT',
+  appName: 'OpenGeekLLMChat',
+  logoMain: 'OpenGeek',
+  logoSub: 'LLM Chat',
   welcomeMessage: 'ドキュメントをアップロードしてRAGベースの質問応答を行うか、自由にチャットを開始できます。',
   welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
   accentColor: '#34d399',
@@ -30,6 +30,15 @@ const DEFAULT_CONFIG = {
   webSearch: true,
   ragTopK: 10,
   ragMode: 'agentic',
+  agentContext: {
+    smallCtx: 2048,
+    mediumCtx: 8192,
+    smallPredict: 512,
+    largePredict: 8192,
+    smallThreshold: 2000,
+    mediumThreshold: 8000,
+    largeGenKeywords: null,
+  },
   tokenAvgWindow: 2000,
   topK: 40,
   topP: 0.9,
@@ -657,6 +666,115 @@ app.post('/auth', jsonParser, (req, res) => {
   recordLoginFail(ip);
   log(ip, 'AUTH failed');
   return res.status(401).json({ ok: false, error: 'パスワードが正しくありません' });
+});
+
+// ─── ユーザーファイルストレージ (public/uploads) ───
+const UPLOADS_DIR = path.join(__dirname, 'public', 'uploads');
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+
+// uploadsディレクトリ作成
+try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch {}
+
+// パス安全性チェック（ディレクトリトラバーサル対策）
+function safeUploadPath(relativePath) {
+  if (!relativePath || typeof relativePath !== 'string') return null;
+  // 先頭の/を除去
+  let clean = relativePath.replace(/^[\/\\]+/, '');
+  // "uploads/" プレフィックスが付いていたら除去（LLMが付けてくることがある）
+  clean = clean.replace(/^(public\/)?uploads[\/\\]/, '');
+  // nullバイト拒否
+  if (clean.includes('\0')) return null;
+  // 絶対パスに解決
+  const abs = path.resolve(UPLOADS_DIR, clean);
+  // UPLOADS_DIR配下であることを確認
+  if (!abs.startsWith(UPLOADS_DIR + path.sep) && abs !== UPLOADS_DIR) return null;
+  return abs;
+}
+
+// ファイル一覧
+app.get('/files', requireAuth, (req, res) => {
+  try {
+    const walk = (dir, base = '') => {
+      const items = [];
+      for (const name of fs.readdirSync(dir)) {
+        const full = path.join(dir, name);
+        const rel = base ? `${base}/${name}` : name;
+        try {
+          const stat = fs.statSync(full);
+          if (stat.isDirectory()) {
+            items.push(...walk(full, rel));
+          } else if (stat.isFile()) {
+            items.push({
+              path: rel,
+              size: stat.size,
+              modified: stat.mtime.toISOString(),
+            });
+          }
+        } catch {}
+      }
+      return items;
+    };
+    const files = walk(UPLOADS_DIR);
+    files.sort((a, b) => b.modified.localeCompare(a.modified));
+    res.json({ files });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ファイル読み込み
+app.get('/files/*', requireAuth, (req, res) => {
+  const ip = getIP(req);
+  const relativePath = req.params[0];
+  const abs = safeUploadPath(relativePath);
+  if (!abs) return res.status(400).json({ error: 'Invalid path' });
+  if (!fs.existsSync(abs)) return res.status(404).json({ error: 'Not found' });
+  try {
+    const stat = fs.statSync(abs);
+    if (!stat.isFile()) return res.status(400).json({ error: 'Not a file' });
+    if (stat.size > MAX_FILE_SIZE) return res.status(413).json({ error: 'File too large' });
+    const content = fs.readFileSync(abs, 'utf-8');
+    log(ip, `FILE READ ${relativePath} (${stat.size} bytes)`);
+    res.json({ path: relativePath, size: stat.size, content, modified: stat.mtime.toISOString() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ファイル書き込み（新規 or 上書き）
+app.post('/files/*', requireAuth, jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const relativePath = req.params[0];
+  const abs = safeUploadPath(relativePath);
+  if (!abs) return res.status(400).json({ error: 'Invalid path' });
+  const { content } = req.body || {};
+  if (typeof content !== 'string') return res.status(400).json({ error: 'content required (string)' });
+  const size = Buffer.byteLength(content, 'utf-8');
+  if (size > MAX_FILE_SIZE) return res.status(413).json({ error: `File too large (${size} bytes, max ${MAX_FILE_SIZE})` });
+  try {
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, content, 'utf-8');
+    log(ip, `FILE WRITE ${relativePath} (${size} bytes)`);
+    res.json({ ok: true, path: relativePath, size });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ファイル削除
+app.delete('/files/*', requireAuth, (req, res) => {
+  const ip = getIP(req);
+  const relativePath = req.params[0];
+  const abs = safeUploadPath(relativePath);
+  if (!abs) return res.status(400).json({ error: 'Invalid path' });
+  if (!fs.existsSync(abs)) return res.status(404).json({ error: 'Not found' });
+  try {
+    fs.unlinkSync(abs);
+    log(ip, `FILE DELETE ${relativePath}`);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─── グローバル設定 ───
