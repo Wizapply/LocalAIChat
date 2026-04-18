@@ -7,6 +7,7 @@
   "accentColor": "#34d399",
   "defaultModel": "",
   "password": "e10adc3949ba59abbe56e057f20f883e",
+  "pythonPath": "python3",
   "gpuAgentToken": "mysecret123",
   "ollamaBackends": [
     {

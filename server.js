@@ -25,6 +25,7 @@ const DEFAULT_CONFIG = {
   accentColor: '#34d399',
   defaultModel: '',
   password: '',
+  pythonPath: 'python3',
   gpuAgentToken: '',
   ollamaBackends: [],
   webSearch: true,
@@ -191,11 +192,12 @@ wss.on('connection', (ws, req) => {
     try { msg = JSON.parse(raw); } catch { return; }
 
     if (msg.type === 'run' && msg.code) {
-      tmpFile = path.join(os.tmpdir(), `wizapply_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.py`);
+      tmpFile = path.join(os.tmpdir(), `opengeek_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.py`);
       fs.writeFileSync(tmpFile, msg.code, 'utf-8');
-      log(ip, `PYTHON RUN (${msg.code.length} chars)`);
+      const pythonCmd = appConfig.pythonPath || 'python3';
+      log(ip, `PYTHON RUN (${msg.code.length} chars) using ${pythonCmd}`);
 
-      proc = spawn('python3', ['-u', tmpFile], {
+      proc = spawn(pythonCmd, ['-u', tmpFile], {
         env: { ...process.env, PYTHONUNBUFFERED: '1' },
         cwd: os.tmpdir(),
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -909,6 +911,7 @@ server.listen(PORT, '0.0.0.0', async () => {
       lines.push(`    [${i}] ${b.label} http://${b.host}:${b.port} (agent :${b.gpuAgentPort || '-'})`);
     });
   }
+  lines.push(`  Python: ${appConfig.pythonPath || 'python3'}`);
   const w = Math.max(name.length + 6, ...lines.map(l => l.length + 2), 40);
   const pad = (s) => s + ' '.repeat(w - s.length);
   console.log('');
