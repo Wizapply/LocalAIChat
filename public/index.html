@@ -1264,6 +1264,17 @@
     background: var(--accent-dim);
   }
 
+  .msg-action-btn.continue-btn {
+    background: var(--accent-dim);
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .msg-action-btn.continue-btn:hover {
+    background: var(--accent);
+    color: var(--bg-primary);
+  }
+
   .msg-bubble strong { font-weight: 600; }
   .msg-bubble em { font-style: italic; }
 
@@ -1606,6 +1617,17 @@
   }
 
   .toolbar-btn:hover { background: var(--bg-hover); color: var(--text-secondary); }
+
+  .toolbar-btn.mic-recording {
+    background: var(--red-dim);
+    color: var(--red);
+    animation: mic-pulse 1.5s ease-in-out infinite;
+  }
+
+  @keyframes mic-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); }
+    50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+  }
 
   .send-btn {
     width: 40px; height: 40px;
@@ -2053,6 +2075,17 @@ window.runPython = function(codeId, btn) {
       body.innerHTML += '<span style="color:var(--red)">' + escapeHtml(msg.data) + '</span>';
       body.scrollTop = body.scrollHeight;
     }
+    if (msg.type === 'image') {
+      // Python matplotlib で生成された画像を表示
+      const url = '/files/' + encodeURIComponent(msg.filename) + '?t=' + Date.now();
+      const imgHtml = '<div style="margin:8px 0;padding:8px;background:var(--bg-primary);border-radius:6px;">'
+        + '<img src="' + url + '" style="max-width:100%;height:auto;display:block;cursor:zoom-in;" '
+        + 'onclick="window.open(this.src, \'_blank\')" alt="' + escapeHtml(msg.filename) + '">'
+        + '<div style="font-size:11px;color:var(--text-muted);margin-top:4px;">📊 ' + escapeHtml(msg.filename) + '</div>'
+        + '</div>';
+      body.innerHTML += imgHtml;
+      body.scrollTop = body.scrollHeight;
+    }
     if (msg.type === 'exit') {
       const isError = msg.exitCode !== 0;
       // ヘッダーを完了に更新
@@ -2360,6 +2393,7 @@ function App() {
     welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
     accentColor: '#34d399',
     defaultModel: '',
+    embedModel: 'mxbai-embed-large:latest',
     webSearch: true,
     ragTopK: 10,
     ragMode: 'agentic',
@@ -2375,12 +2409,13 @@ function App() {
     topK: 40,
     topP: 0.9,
     temperature: 0.7,
+    transcribe: { enabled: false },
   });
 
   // ─── Ollama接続先（変更する場合はここを編集）───
   const [ollamaUrl] = useState('');
   const [chatModel, setChatModel] = useState('');
-  const embedModel = 'nomic-embed-text:latest';
+  const embedModel = appConfig.embedModel || 'mxbai-embed-large:latest';
   const [availableModels, setAvailableModels] = useState([]);
   const [connected, setConnected] = useState(false);
 
@@ -2412,7 +2447,10 @@ function App() {
   const fileInputRef = useRef(null);
   const imageInputRef = useRef(null);
   const serverFileInputRef = useRef(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [speakingIndex, setSpeakingIndex] = useState(-1);
   const abortRef = useRef(null);
+  const sendMessageRef = useRef(null);
   const [chatImages, setChatImages] = useState([]); // [{ name, base64, preview }]
   const [lightboxSrc, setLightboxSrc] = useState(null);
 
@@ -2422,7 +2460,13 @@ function App() {
       const res = await fetch(`${ollamaUrl}/api/tags`);
       if (!res.ok) throw new Error();
       const data = await res.json();
-      const names = (data.models || []).map(m => m.name);
+      const allNames = (data.models || []).map(m => m.name);
+      // Embedding系モデルをチャット選択肢から除外
+      const embedPatterns = /embed|embedding|nomic-embed|mxbai-embed|bge-|e5-|gte-/i;
+      const currentEmbedModel = (appConfig.embedModel || '').toLowerCase();
+      const names = allNames.filter(n =>
+        n.toLowerCase() !== currentEmbedModel && !embedPatterns.test(n)
+      );
       setAvailableModels(names);
       setConnected(true);
       if (!chatModel && names.length > 0) setChatModel(names[0]);
@@ -2430,7 +2474,7 @@ function App() {
       setConnected(false);
       setAvailableModels([]);
     }
-  }, [ollamaUrl]);
+  }, [ollamaUrl, appConfig.embedModel]);
 
   useEffect(() => {
     if (authenticated) fetchModels();
@@ -2516,6 +2560,9 @@ function App() {
     const hasImages = chatImages.length > 0;
     if ((!text && !hasImages) || isLoading || !chatModel) return;
 
+    // 録音中なら停止（送信テキストが確定したので）
+    if (isRecording) stopRecording();
+
     const pendingImages = [...chatImages];
     const userMsg = {
       role: 'user',
@@ -2528,6 +2575,7 @@ function App() {
     setIsLoading(true);
     setError('');
     autoScrollRef.current = true;
+    lastProgScrollRef.current = 0;  // 差分チェックをリセット
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -2535,7 +2583,13 @@ function App() {
     try {
       const today = new Date();
       const dateStr = `${today.getFullYear()}年${today.getMonth() + 1}月${today.getDate()}日`;
-      const systemPrompt = `あなたは親切で知識豊富なAIアシスタントです。日本語で回答してください。今日の日付は${dateStr}です。`;
+      const systemPrompt = `あなたは親切で知識豊富なAIアシスタントです。日本語で簡潔に回答してください。今日の日付は${dateStr}です。
+
+重要な指示:
+- 思考は手短に済ませ、ユーザーへの回答を必ず出力してください。
+- ツールから取得した情報は信頼し、そのまま使ってください（妥当性を過度に疑わないこと）。
+- 日付に関する自己矛盾を感じても、与えられた${dateStr}を真として処理してください。過去の学習データとの整合性を気にする必要はありません。
+- 天気・ニュース・株価など現在情報は、ツールの結果をそのまま引用してください。`;
       const history = [...messages, userMsg].slice(-20).map(m => {
         const h = { role: m.role, content: m.content };
         if (m.images && m.images.length > 0) {
@@ -2642,6 +2696,10 @@ function App() {
             + '\n重要: pathには"uploads/"プレフィックスを付けずにファイル名のみを指定してください（例: "hello.py"、"data/config.json"）。'
             + '\nユーザーがファイル操作やコード保存を依頼した場合は、余計な説明なしに即座にツールを呼び出してください。';
         }
+        agentSystem += '\n\nPythonコード実行について:'
+          + '\n- 応答に ```python ... ``` のコードブロックを含めると、ユーザー側で実行ボタンが表示されます。'
+          + '\n- グラフ・図の作成依頼には matplotlib を使ったPythonコードを提示してください（matplotlib.use(\'Agg\')の指定は不要、plt.show()で自動的にチャットに画像表示されます）。'
+          + '\n- データ処理・計算・可視化の依頼では、迷わずPythonコードブロックを返してください。それだけで完結します。ツール呼び出しは不要です。';
         agentSystem += '\n\n重要な指示:'
           + '\n- 内部的な推論・検索戦略・計画・メタ的な説明は一切出力しないでください。'
           + '\n- "I need to...", "The user wants...", "I should..." のような独り言を書かないでください。'
@@ -2659,8 +2717,9 @@ function App() {
         const agentCtx = appConfig.agentContext || {};
         const fileWriteKeywords = agentCtx.largeGenKeywords || [
           // 日本語
-          '書き込', '書いて', '書き出', '保存', '作成して', '生成して', 'ファイル作', 'ファイルに',
-          'スクリプト', 'プログラム', 'コード', '.py', '.js', '.ts', '.html', '.css',
+          '書き込', '書き出', '保存', '作成して', 'ファイル作', 'サーバーファイルに',
+          // 拡張子
+          '.py', '.js', '.ts', '.html', '.css',
           '.xml', '.json', '.yaml', '.yml', '.md', '.txt', '.csv', '.sh', '.cpp', '.c ', '.h ',
           // 英語
           'write ', 'save ', 'create file', 'generate ', 'write_file', 'write to',
@@ -2669,37 +2728,70 @@ function App() {
         const mediumCtx = agentCtx.mediumCtx ?? 8192;
         const smallPredict = agentCtx.smallPredict ?? 512;
         const largePredict = agentCtx.largePredict ?? 8192;
-        const smallThreshold = agentCtx.smallThreshold ?? 2000;
-        const mediumThreshold = agentCtx.mediumThreshold ?? 8000;
+        const judgeHistoryCount = agentCtx.judgeHistoryCount ?? 3; // ツール判断時の履歴件数
 
         const lowerText = text.toLowerCase();
         const needsLargeGen = fileWriteKeywords.some(k => lowerText.includes(k.toLowerCase()));
-        const totalChars = apiMessages.reduce((s, m) => s + (typeof m.content === 'string' ? m.content.length : 0), 0);
-        const ctxByHistory = totalChars > mediumThreshold ? numCtx : totalChars > smallThreshold ? Math.min(numCtx, mediumCtx) : smallCtx;
-        const judgeNumCtx = needsLargeGen ? numCtx : ctxByHistory;
+
+        // ツール判断用の簡潔なシステムプロンプト（メタ的な指示を排除）
+        const judgeSystem = '以下の中から必要なツールを呼び出してください。通常の質問に答えられる場合はツールを使わずそのまま応答してください。'
+          + (documents.length > 0 ? '\n- search_documents: アップロード済みドキュメントから検索' : '')
+          + (appConfig.webSearch ? '\n- web_search: インターネット検索（最新情報が必要な場合）' : '')
+          + (appConfig.fileAccess !== false ? '\n- list_files/read_file/write_file: uploadsフォルダへのファイル操作（path は "uploads/" プレフィックスなし）' : '')
+          + '\nグラフ・計算・データ処理はツール不要。```python ... ``` コードブロックを応答に含めれば自動実行されます（matplotlibで画像表示可能）。'
+          + '\n内部推論は書かず、ツールを呼ぶか直接短く応答するかのみ。';
+
+        // 判断用のapiMessages（短縮版）— 直近の履歴だけ使う
+        const judgeHistory = history.slice(-judgeHistoryCount);
+        // 初回ツール判断用プロンプト
+        let judgeMessages = [{ role: 'system', content: judgeSystem }, ...judgeHistory];
+
+        const judgeNumCtx = needsLargeGen ? numCtx : smallCtx;
         const judgeNumPredict = needsLargeGen ? largePredict : smallPredict;
-        console.log(`[ツール判断] num_ctx=${judgeNumCtx}, num_predict=${judgeNumPredict} (needsLargeGen=${needsLargeGen}, totalChars=${totalChars})`);
+        console.log(`[ツール判断] num_ctx=${judgeNumCtx}, num_predict=${judgeNumPredict}, history=${judgeHistory.length}件 (needsLargeGen=${needsLargeGen})`);
 
-        // ステップ1: ツール呼び出し判断（非ストリーミング、動的コンテキスト）
-        const toolRes = await fetch(`${ollamaUrl}/api/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: chatModel,
-            messages: apiMessages,
-            tools,
-            stream: false,
-            options: { ...ollamaOptions, num_ctx: judgeNumCtx, num_predict: judgeNumPredict },
-          }),
-          signal: controller.signal,
-        });
+        // ─── ツール実行ループ（最大3ターンまで繰り返し） ───
+        const MAX_TOOL_TURNS = 3;
+        let toolTurn = 0;
+        let lastAssistantMsg = null;
 
-        if (!toolRes.ok) throw new Error(`API Error: ${toolRes.status}`);
-        const toolData = await toolRes.json();
-        const assistantMsg = toolData.message;
+        while (toolTurn < MAX_TOOL_TURNS) {
+          toolTurn++;
+          // 2周目以降は、最新のapiMessagesを使う（ツール結果を含んだ会話）
+          const turnMessages = toolTurn === 1 ? judgeMessages : [{ role: 'system', content: judgeSystem }, ...apiMessages.slice(1)];
 
-        // ステップ2: ツール呼び出しがあれば実行
-        if (assistantMsg?.tool_calls && assistantMsg.tool_calls.length > 0) {
+          // 2周目以降のステータス更新
+          if (toolTurn > 1) {
+            setMessages(prev => {
+              const copy = [...prev];
+              copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: `🔄 追加ツール判断中 (${toolTurn}/${MAX_TOOL_TURNS})...`, searchQueries: [...searchQueries] };
+              return copy;
+            });
+          }
+
+          // ツール呼び出し判断（非ストリーミング）
+          const toolRes = await fetch(`${ollamaUrl}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: chatModel,
+              messages: turnMessages,
+              tools,
+              stream: false,
+              options: { ...ollamaOptions, num_ctx: judgeNumCtx, num_predict: judgeNumPredict },
+            }),
+            signal: controller.signal,
+          });
+
+          if (!toolRes.ok) throw new Error(`API Error: ${toolRes.status}`);
+          const toolData = await toolRes.json();
+          const assistantMsg = toolData.message;
+          lastAssistantMsg = assistantMsg;
+
+          // ツール呼び出しがなければループ終了
+          if (!assistantMsg?.tool_calls || assistantMsg.tool_calls.length === 0) break;
+
+          console.log(`[ツール実行 ${toolTurn}周目] ${assistantMsg.tool_calls.length}件のツール呼び出し`);
           apiMessages.push(assistantMsg);
 
           for (const tc of assistantMsg.tool_calls) {
@@ -2774,7 +2866,11 @@ function App() {
               });
 
               const resultText = webResults.length > 0
-                ? webResults.map((r, i) => `[Web${i + 1}] ${r.title}\n${r.url}\n${r.snippet}`).join('\n\n')
+                ? webResults.map((r, i) => {
+                    let entry = `[Web${i + 1}] ${r.title}\n${r.url}\n${r.snippet}`;
+                    if (r.body) entry += `\n--- 本文抜粋 ---\n${r.body}`;
+                    return entry;
+                  }).join('\n\n===\n\n')
                 : 'Web検索結果が見つかりませんでした。';
               apiMessages.push({ role: 'tool', content: resultText });
 
@@ -2868,6 +2964,11 @@ function App() {
               loadFileList();
             }
           }
+          // ループ先頭に戻って次のツール判断を試みる
+        } // end while tool turn
+
+        if (toolTurn >= MAX_TOOL_TURNS && lastAssistantMsg?.tool_calls?.length > 0) {
+          console.log(`[ツール実行] 最大${MAX_TOOL_TURNS}ターンに到達。最終応答へ移行。`);
         }
 
         // コンテキスト重複除去
@@ -3092,31 +3193,74 @@ function App() {
   // ─── 自動スクロール ───
   const containerRef = useRef(null);
   const autoScrollRef = useRef(true);    // 自動スクロール有効フラグ
-  const programScrollRef = useRef(false); // プログラムによるスクロール中フラグ
+  const lastProgScrollRef = useRef(0);   // 直近のプログラムスクロール位置
 
-  // ユーザーが上にスクロールしたら自動追従を停止
+  // documentレベルでwheelを捕捉（最も確実）
   useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    const onScroll = () => {
-      if (programScrollRef.current) return; // プログラムスクロールは無視
-      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-      autoScrollRef.current = atBottom;
+    const onWheel = (e) => {
+      const el = containerRef.current;
+      if (!el) return;
+      if (!el.contains(e.target)) return; // チャット領域外は無視
+
+      if (e.deltaY < 0) {
+        autoScrollRef.current = false;
+      } else if (e.deltaY > 0) {
+        const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        if (atBottom) autoScrollRef.current = true;
+      }
     };
-    el.addEventListener('scroll', onScroll, { passive: true });
-    return () => el.removeEventListener('scroll', onScroll);
+
+    const onKeyDown = (e) => {
+      const el = containerRef.current;
+      if (!el) return;
+      if (['ArrowUp', 'PageUp', 'Home'].includes(e.key)) {
+        autoScrollRef.current = false;
+      } else if (e.key === 'End') {
+        autoScrollRef.current = true;
+      }
+    };
+
+    let touchStartY = 0;
+    const onTouchStart = (e) => {
+      touchStartY = e.touches[0]?.clientY || 0;
+    };
+    const onTouchMove = (e) => {
+      const el = containerRef.current;
+      if (!el || !el.contains(e.target)) return;
+      const cur = e.touches[0]?.clientY || 0;
+      if (cur > touchStartY + 5) {
+        autoScrollRef.current = false;
+      }
+    };
+
+    document.addEventListener('wheel', onWheel, { passive: true });
+    document.addEventListener('keydown', onKeyDown);
+    document.addEventListener('touchstart', onTouchStart, { passive: true });
+    document.addEventListener('touchmove', onTouchMove, { passive: true });
+    return () => {
+      document.removeEventListener('wheel', onWheel);
+      document.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('touchstart', onTouchStart);
+      document.removeEventListener('touchmove', onTouchMove);
+    };
   }, []);
 
-  // ストリーミング中は rAF で追従（smooth を使わず直接操作）
+  // ストリーミング中は rAF で追従（ユーザースクロール検出付き）
   useEffect(() => {
     if (!isLoading) return;
     let raf;
     const tick = () => {
       const el = containerRef.current;
-      if (el && autoScrollRef.current) {
-        programScrollRef.current = true;
-        el.scrollTop = el.scrollHeight;
-        programScrollRef.current = false;
+      if (el) {
+        // ユーザーが上方向にスクロールした場合のみ停止
+        // （下方向の変化は新コンテンツ追加によるものなので無視）
+        if (lastProgScrollRef.current > 0 && el.scrollTop < lastProgScrollRef.current - 30) {
+          autoScrollRef.current = false;
+        }
+        if (autoScrollRef.current) {
+          el.scrollTop = el.scrollHeight;
+          lastProgScrollRef.current = el.scrollTop;
+        }
       }
       raf = requestAnimationFrame(tick);
     };
@@ -3131,9 +3275,8 @@ function App() {
     requestAnimationFrame(() => {
       const el = containerRef.current;
       if (el) {
-        programScrollRef.current = true;
         el.scrollTop = el.scrollHeight;
-        programScrollRef.current = false;
+        lastProgScrollRef.current = el.scrollTop;
       }
     });
   }, [messages]);
@@ -3200,6 +3343,289 @@ function App() {
     }
   }
 
+  // ─── マイク音声認識 (Web Speech API) ───
+  const speechRecognitionRef = useRef(null);
+
+  function startRecording() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      setError('このブラウザは音声認識に対応していません（Chrome/Edge推奨）');
+      return;
+    }
+    try {
+      const recognition = new SR();
+      recognition.lang = 'ja-JP';
+      recognition.continuous = true;         // 止めるまで認識継続
+      recognition.interimResults = true;     // 確定前の中間結果も取得
+      recognition.maxAlternatives = 1;
+      recognition._stopped = false;          // 停止フラグ
+      recognition._silenceTimer = null;      // 無音検出タイマー
+
+      // 認識開始時点の入力欄内容を保持（追記モード）
+      let baseText = '';
+      setInput(prev => { baseText = prev; return prev; });
+      let finalText = '';
+
+      // 無音タイマーをリセット（3秒無音で自動送信）
+      const resetSilenceTimer = () => {
+        if (recognition._silenceTimer) clearTimeout(recognition._silenceTimer);
+        recognition._silenceTimer = setTimeout(() => {
+          // 無音3秒 → 入力内容で判断
+          const combined = (finalText || '').trim();
+          const hasContent = (baseText + ' ' + combined).trim().length > 0;
+          recognition._stopped = true;
+          try { recognition.abort(); } catch {}
+          try { recognition.stop(); } catch {}
+          setIsRecording(false);
+          if (hasContent) {
+            // 自動送信（次のtickでinputが確定してから）
+            setTimeout(() => sendMessageRef.current?.(), 50);
+          }
+        }, 3000);
+      };
+
+      recognition.onresult = (event) => {
+        if (recognition._stopped) return;
+        let interim = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const transcript = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            finalText += transcript;
+          } else {
+            interim += transcript;
+          }
+        }
+        const combined = (finalText + interim).trim();
+        setInput(baseText ? `${baseText} ${combined}` : combined);
+
+        // 発話があった → 無音タイマーをリセット
+        if (combined) resetSilenceTimer();
+      };
+
+      recognition.onerror = (event) => {
+        if (event.error === 'no-speech') return;
+        if (event.error === 'aborted') return;
+        if (event.error === 'not-allowed') {
+          setError('マイクの使用が許可されていません');
+        } else if (event.error === 'network') {
+          setError('音声認識サーバーに接続できません（Google依存）');
+        } else {
+          setError('音声認識エラー: ' + event.error);
+        }
+        if (recognition._silenceTimer) clearTimeout(recognition._silenceTimer);
+        setIsRecording(false);
+      };
+
+      recognition.onend = () => {
+        if (recognition._silenceTimer) clearTimeout(recognition._silenceTimer);
+        setIsRecording(false);
+        speechRecognitionRef.current = null;
+      };
+
+      recognition.start();
+      speechRecognitionRef.current = recognition;
+      setIsRecording(true);
+      // 開始直後にタイマー発動（無発話時は3秒後に停止）
+      resetSilenceTimer();
+    } catch (e) {
+      setError('音声認識の開始に失敗: ' + e.message);
+    }
+  }
+
+  function stopRecording() {
+    if (speechRecognitionRef.current) {
+      speechRecognitionRef.current._stopped = true;
+      if (speechRecognitionRef.current._silenceTimer) clearTimeout(speechRecognitionRef.current._silenceTimer);
+      try { speechRecognitionRef.current.abort(); } catch {}
+      try { speechRecognitionRef.current.stop(); } catch {}
+    }
+    setIsRecording(false);
+  }
+
+  function toggleRecording() {
+    if (isRecording) stopRecording();
+    else startRecording();
+  }
+
+  // ─── 音声合成 (Web Speech API) ───
+  function stripMarkdownForSpeech(text) {
+    if (!text) return '';
+    return text
+      // コードブロックを「コード省略」に置換
+      .replace(/```[\s\S]*?```/g, '（コード省略）')
+      .replace(/`[^`]+`/g, '')
+      // 画像・リンクは alt/文字部分だけ
+      .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      // 見出し記号・箇条書き記号・強調記号を除去
+      .replace(/^#{1,6}\s+/gm, '')
+      .replace(/^\s*[-*+]\s+/gm, '')
+      .replace(/^\s*\d+\.\s+/gm, '')
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/\*([^*]+)\*/g, '$1')
+      .replace(/~~([^~]+)~~/g, '$1')
+      // HTMLタグ除去
+      .replace(/<[^>]+>/g, '')
+      // 連続空白を1つに
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function toggleSpeak(content, idx) {
+    if (!window.speechSynthesis) return;
+    // 現在読み上げ中なら停止
+    if (speakingIndex === idx) {
+      window.speechSynthesis.cancel();
+      setSpeakingIndex(-1);
+      return;
+    }
+    // 他のメッセージを読み上げ中なら一旦止める
+    window.speechSynthesis.cancel();
+
+    const text = stripMarkdownForSpeech(content);
+    if (!text) return;
+
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = 'ja-JP';
+    utter.rate = 1.1;   // やや速め
+    utter.pitch = 1.0;
+    utter.volume = 1.0;
+
+    // 日本語ボイスがあれば優先選択
+    const voices = window.speechSynthesis.getVoices();
+    const jaVoice = voices.find(v => v.lang === 'ja-JP') || voices.find(v => v.lang.startsWith('ja'));
+    if (jaVoice) utter.voice = jaVoice;
+
+    utter.onend = () => setSpeakingIndex(-1);
+    utter.onerror = () => setSpeakingIndex(-1);
+
+    setSpeakingIndex(idx);
+    window.speechSynthesis.speak(utter);
+  }
+
+  // sendMessageを常に最新状態で音声認識から呼び出せるようにref保持
+  useEffect(() => { sendMessageRef.current = sendMessage; });
+
+  // 新規チャット/ページ離脱時に音声停止
+  useEffect(() => {
+    return () => {
+      if (window.speechSynthesis) window.speechSynthesis.cancel();
+    };
+  }, []);
+
+  // ─── 思考停止からの続き生成 ───
+  async function continueGeneration(idx) {
+    const target = messages[idx];
+    if (!target || target.role !== 'assistant') return;
+
+    setIsLoading(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      const now = new Date();
+      const dateStr = now.toLocaleDateString('ja-JP', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' });
+      const systemPrompt = `あなたは親切で知識豊富なAIアシスタントです。日本語で簡潔に回答してください。今日の日付は${dateStr}です。
+
+重要な指示:
+- 思考は手短に済ませ、ユーザーへの回答を必ず出力してください。
+- ツールから取得した情報は信頼し、そのまま使ってください。
+- 日付に関する自己矛盾を感じても、与えられた${dateStr}を真として処理してください。`;
+
+      // idxまでの会話履歴 + thinking情報を引き継ぎ、続きを促す
+      const history = messages.slice(0, idx).map(m => ({
+        role: m.role,
+        content: m.content,
+        ...(m.images && m.images.length > 0 ? { images: m.images.map(img => img.base64) } : {}),
+      }));
+
+      // 途中までの思考+応答を「部分応答」として追加し、続きを書くよう促す
+      const partial = [target.thinking ? `<think>${target.thinking}</think>` : '', target.content || ''].filter(Boolean).join('\n').trim();
+      const nudgeMessages = [
+        { role: 'system', content: systemPrompt },
+        ...history,
+      ];
+      if (partial) {
+        nudgeMessages.push({ role: 'assistant', content: partial });
+        nudgeMessages.push({ role: 'user', content: '思考が途中で止まっています。続きから応答を完成させてください。必要な思考は手短に済ませ、ユーザーへの回答を必ず出力してください。' });
+      } else {
+        nudgeMessages.push({ role: 'user', content: '先ほどの質問への回答をお願いします。簡潔に答えてください。' });
+      }
+
+      const numCtx = appConfig.agentContext?.mediumCtx || 8192;
+      const ollamaOptions = {
+        num_ctx: numCtx,
+        num_predict: appConfig.agentContext?.largePredict || 8192,
+        top_k: appConfig.topK,
+        top_p: appConfig.topP,
+        temperature: appConfig.temperature,
+      };
+
+      const res = await fetch(`${ollamaUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: chatModel,
+          messages: nudgeMessages,
+          stream: true,
+          options: ollamaOptions,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) throw new Error(`API Error: ${res.status}`);
+
+      // 既存メッセージに追記するため、いったん読み込みしながら直接更新
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let addedContent = '';
+      let addedThinking = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n').filter(Boolean);
+        for (const line of lines) {
+          try {
+            const json = JSON.parse(line);
+            if (json.message?.thinking) addedThinking += json.message.thinking;
+            if (json.message?.content) addedContent += json.message.content;
+
+            // <think>タグ形式も処理
+            let displayAddedContent = addedContent;
+            let displayAddedThinking = addedThinking;
+            const thinkMatch = addedContent.match(/^<think>([\s\S]*?)(<\/think>)?([\s\S]*)$/);
+            if (thinkMatch) {
+              const tagThinking = thinkMatch[1] || '';
+              const closed = !!thinkMatch[2];
+              const afterThink = thinkMatch[3] || '';
+              displayAddedThinking = (addedThinking + tagThinking).trim();
+              displayAddedContent = closed ? afterThink.trim() : '';
+            }
+
+            // 既存メッセージに追記
+            setMessages(prev => {
+              const copy = [...prev];
+              const orig = copy[idx];
+              copy[idx] = {
+                ...orig,
+                content: (target.content || '') + displayAddedContent,
+                thinking: (target.thinking || '') + (displayAddedThinking ? '\n\n[続き]\n' + displayAddedThinking : ''),
+              };
+              return copy;
+            });
+          } catch {}
+        }
+      }
+    } catch (e) {
+      if (e.name !== 'AbortError') setError(e.message);
+    } finally {
+      abortRef.current = null;
+      setIsLoading(false);
+    }
+  }
+
   async function saveChat(id, msgs, title) {
     if ((!msgs || msgs.length === 0) && documents.length === 0) return;
     const autoTitle = title || msgs.find(m => m.role === 'user')?.content?.slice(0, 40) || '無題';
@@ -3218,6 +3644,8 @@ function App() {
   }
 
   async function loadChat(id) {
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    setSpeakingIndex(-1);
     setChatLoading(true);
     try {
       const res = await fetch(`/chats/${id}`);
@@ -3233,6 +3661,8 @@ function App() {
   }
 
   function newChat() {
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    setSpeakingIndex(-1);
     setChatId(Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
     setChatTitle('');
     setMessages([]);
@@ -3265,6 +3695,8 @@ function App() {
           }
           if (cfg.hasPassword) {
             setHasPassword(true);
+            // 既存のセッションCookieが有効なら自動ログイン
+            if (cfg.authenticated) setAuthenticated(true);
           } else {
             setHasPassword(false);
             setAuthenticated(true);
@@ -3658,14 +4090,29 @@ function App() {
                       <div className="msg-bubble user-bubble">{msg.content}</div>
                     </React.Fragment>
                   )}
-                  {msg.role === 'assistant' && msg.content && !(isLoading && i === messages.length - 1) && (
+                  {msg.role === 'assistant' && !(isLoading && i === messages.length - 1) && (msg.content || msg.thinking) && (
                     <div className="msg-actions">
-                      <button className="msg-action-btn" onClick={() => downloadMarkdown(msg.content, i)}>
-                        📥 ダウンロード
-                      </button>
-                      <button className="msg-action-btn" onClick={() => addResponseToDocuments(msg.content, i)}>
-                        📄 ドキュメントに追加
-                      </button>
+                      {msg.content && (
+                        <>
+                          <button className="msg-action-btn" onClick={() => downloadMarkdown(msg.content, i)}>
+                            📥 ダウンロード
+                          </button>
+                          <button className="msg-action-btn" onClick={() => addResponseToDocuments(msg.content, i)}>
+                            📄 ドキュメントに追加
+                          </button>
+                          {(typeof window !== 'undefined' && window.speechSynthesis) && (
+                            <button className="msg-action-btn" onClick={() => toggleSpeak(msg.content, i)}>
+                              {speakingIndex === i ? '⏹️ 停止' : '🔊 読み上げ'}
+                            </button>
+                          )}
+                        </>
+                      )}
+                      {/* 思考のみで本応答が空 or 応答が途中で切れた場合に「続ける」ボタン */}
+                      {i === messages.length - 1 && (!msg.content || msg.thinking) && (
+                        <button className="msg-action-btn continue-btn" onClick={() => continueGeneration(i)}>
+                          🔄 続きを生成
+                        </button>
+                      )}
                     </div>
                   )}
                   {msg.contexts && (() => {
@@ -3692,7 +4139,7 @@ function App() {
                   })()}
                   {msg.tokenInfo && !(isLoading && i === messages.length - 1) && (() => {
                     const total = msg.tokenInfo.promptTokens + msg.tokenInfo.completionTokens;
-                    const pct = numCtx > 0 ? Math.round(msg.tokenInfo.promptTokens / numCtx * 100) : 0;
+                    const pct = numCtx > 0 ? Math.round(total / numCtx * 100) : 0;
                     const barColor = pct >= 90 ? 'var(--red)' : pct >= 70 ? 'var(--orange)' : 'var(--green)';
                     return (
                       <div className="token-info">
@@ -3768,6 +4215,15 @@ function App() {
                 <button className="toolbar-btn" title="画像を追加" onClick={() => imageInputRef.current?.click()}>
                   🖼️
                 </button>
+                {(typeof window !== 'undefined' && (window.SpeechRecognition || window.webkitSpeechRecognition)) && (
+                  <button
+                    className={`toolbar-btn ${isRecording ? 'mic-recording' : ''}`}
+                    title={isRecording ? '録音停止' : 'マイク録音（Web Speech API・日本語）'}
+                    onClick={toggleRecording}
+                  >
+                    {isRecording ? '🔴' : '🎤'}
+                  </button>
+                )}
               </div>
               {isLoading ? (
                 <button className="stop-btn" onClick={stopGeneration} title="生成を停止">

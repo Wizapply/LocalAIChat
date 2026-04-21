@@ -1,0 +1,35 @@
+[Unit]
+Description=OpenGeekLLMChat Server
+After=network.target ollama.service
+Wants=network.target
+
+[Service]
+Type=simple
+# ⚠️ 以下を環境に合わせて変更してください
+User=wizapply-ai
+Group=wizapply-ai
+WorkingDirectory=/home/wizapply-ai/wizapply-server
+ExecStart=/usr/bin/node /home/wizapply-ai/wizapply-server/server.js
+
+# 再起動設定
+Restart=always
+RestartSec=10
+
+# 環境変数（必要に応じて）
+Environment=NODE_ENV=production
+Environment=PORT=3000
+# Environment=OLLAMA_HOST=127.0.0.1
+# Environment=OLLAMA_PORT=11434
+
+# ログ出力
+StandardOutput=journal
+StandardError=journal
+
+# セキュリティ
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/wizapply-ai/wizapply-server
+
+[Install]
+WantedBy=multi-user.target

@@ -1,519 +1,611 @@
-# WIZAPPLY AI CHAT — 設計ドキュメント
+# OpenGeekLLMChat - 設計ドキュメント
 
-> AIアシスタントがプロジェクトを理解し、修正・拡張を行うためのリファレンスです。
-
----
-
-## 1. プロジェクト概要
-
-Ollama連携のAgentic RAGチャットWebアプリ。マルチGPU・複数PC負荷分散対応。  
-単一HTMLファイル（React/Babel CDN）+ Node.jsサーバー + リモートGPU監視エージェント構成。
+このドキュメントは、コード修正時にLLMが参照する設計書です。
+アーキテクチャ、データフロー、主要な技術判断の理由が記載されています。
 
 ---
 
-## 2. ファイル構成
+## 📐 全体アーキテクチャ
 
 ```
-wizapply-ai-chat/
-├── server.js              # バックエンド（Express + WS）  ~800行
-├── package.json            # express, ws のみ
-├── config.json             # アプリ設定（名前・カラー・パスワード・バックエンド・推論パラメータ）
-├── hashpass.py             # パスワードハッシュ生成ツール（MD5/SHA-256対応）
-├── gpu-agent.js            # 各PCに配置するGPU監視エージェント  ~140行
-├── public/
-│   ├── index.html          # フロントエンド全体（CSS + React/Babel）  ~3475行
-│   └── aiicon.jpg          # アイコン画像（favicon・ロゴ・AIアバター）
-├── chats/                  # チャット履歴JSON（自動作成、.gitignore済）
-├── settings.json           # ユーザー設定（自動作成、.gitignore済）
-├── README.md               # 公開用ドキュメント
-├── DESIGN.md               # このファイル
-├── LICENSE                 # MIT
-└── .gitignore
-```
-
----
-
-## 3. アーキテクチャ
-
-```
-ブラウザ (React SPA)
-  │
-  ├── HTTP ─── PC-0 :3000 Node.js (Express)
-  │              ├── /web-search    → DuckDuckGo検索
-  │              ├── /auth          → 認証（セッションCookie発行）
-  │              ├── /api/*         → Ollamaリバースプロキシ（負荷分散）
-  │              ├── /config        → アプリ設定
-  │              ├── /settings      → ユーザー設定
-  │              ├── /chats/*       → チャット履歴 CRUD
-  │              └── /sse/gpu       → 全PC統合GPU監視 (SSE)
-  │
-  └── WS ──── /ws/python           → Python対話実行
+┌─────────────────────────────────────────────────────────┐
+│                    Browser (Client)                     │
+│  public/index.html (React SPA / 単一ファイル / ~4300行) │
+│  - 認証画面                                             │
+│  - チャットUI                                           │
+│  - Python実行ターミナル                                 │
+│  - GPU監視サイドバー                                    │
+│  - Web Speech API (STT/TTS)                             │
+└──────────────────────┬──────────────────────────────────┘
+                       │ HTTPS / WebSocket
                        │
-                       ▼
-        ┌──────────────┼──────────────┬──────────────┐
-        ▼              ▼              ▼              ▼
-       PC-0           PC-1           PC-2    ...   PC-N
-       :11434         :11434         :11434         :11434
-       Ollama         Ollama         Ollama         Ollama
-       :11400         :11400         :11400         :11400
-       gpu-agent      gpu-agent      gpu-agent      gpu-agent
+┌──────────────────────▼──────────────────────────────────┐
+│                  server.js (Node.js)                    │
+│  - Express (HTTP/HTTPS切り替え自動)                     │
+│  - WebSocket (ws) - Python実行                          │
+│  - セッション管理                                       │
+│  - Ollamaリバースプロキシ (負荷分散)                   │
+│  - DuckDuckGo検索 (+本文取得)                           │
+│  - ファイル操作API                                      │
+│  - GPU監視 SSE ハブ                                     │
+└─────┬──────────┬──────────┬──────────┬─────────────────┘
+      │          │          │          │
+      ▼          ▼          ▼          ▼
+  ┌───────┐ ┌───────┐ ┌───────┐ ┌───────────┐
+  │Ollama │ │Python │ │DDG    │ │gpu-agent  │
+  │ #0    │ │subproc│ │HTTP   │ │(別PC)     │
+  └───────┘ └───────┘ └───────┘ └───────────┘
+  ┌───────┐
+  │Ollama │ ← 複数バックエンドで負荷分散
+  │ #1    │
+  └───────┘
 ```
 
 ---
 
-## 4. バックエンド（server.js）
+## 📁 ファイル構成と役割
 
-### 4.1 依存
-
-```json
-{ "express": "^4.21.0", "ws": "^8.17.0" }
-```
-
-標準モジュール: `http`, `https`, `path`, `child_process`, `fs`, `crypto`, `os`
-
-### 4.2 config.json 全キー
-
-```json
-{
-  "appName": "...", "logoMain": "...", "logoSub": "...",
-  "welcomeMessage": "...", "welcomeHints": ["...", "..."],
-  "accentColor": "#34d399",
-  "defaultModel": "",
-  "password": "",         // MD5(32桁)/SHA-256(64桁)ハッシュ
-  "gpuAgentToken": "",    // 全バックエンド共通のGPUエージェントトークン
-  "ollamaBackends": [],   // [{ host, port, gpuAgentPort, gpuAgentToken, label }]
-  "webSearch": true,
-  "ragTopK": 10, "ragMode": "agentic",
-  "tokenAvgWindow": 2000,
-  "topK": 40, "topP": 0.9, "temperature": 0.7
-}
-```
-
-### 4.3 認証システム
-
-**4.3.1 セッショントークン**
-- `crypto.randomBytes(32)` で256bitトークン生成
-- HttpOnly + SameSite=Strict のCookieとして発行
-- 24時間TTL、サーバー側 `Map<token, {ip, expiresAt}>` で管理
-- 期限切れセッションは1時間ごとに清掃
-
-**4.3.2 パスワード照合 (`verifyPassword`)**
-- MD5(32桁) / SHA-256(64桁) を文字長で自動判別
-- `crypto.timingSafeEqual` で定時間比較
-- 入力長と保存ハッシュ長が異なる場合は即false
-
-**4.3.3 レートリミット**
-- IP別に15分間で最大5回失敗まで許可 → 429
-- ログイン成功時に該当IPのカウンタリセット
-- `loginAttempts: Map<ip, {count, resetAt}>`
-
-**4.3.4 認証ミドルウェア (`requireAuth`)**
-- パスワード未設定なら素通り
-- Cookie `wz_session=...` または `X-Auth-Token` ヘッダーから取得
-- `isValidSession()` で検証
-- WebSocket `/ws/python` でも `req.headers.cookie` から認証
-
-**4.3.5 認証フロー**
-```
-mount → GET /config → hasPassword?
-  ├── false → setAuthenticated(true) → メインUI + データ読込
-  └── true → ログイン画面表示
-              → POST /auth → Set-Cookie + token
-              → setAuthenticated(true)
-              → fetchModels() / GPU SSE接続 / チャット読込開始
-```
-
-### 4.4 モデル選択の優先順位
-
-```
-1. settings.json の chatModel
-2. config.json の defaultModel
-3. Ollamaモデル一覧の先頭
-```
-
-### 4.5 ロードバランシング
-
-**4.5.1 バックエンド構造**
-```javascript
-{
-  host: '192.168.10.0',
-  port: 11434,
-  gpuAgentPort: 11400,
-  gpuAgentToken: 'mysecret123',  // 個別 or 共通の gpuAgentToken
-  label: 'PC-0',
-  activeConns: 0,
-  gpus: []  // gpu-agent から取得した最新GPU情報
-}
-```
-
-**4.5.2 selectBackend()**
-```
-スコア = GPU平均使用率(0-100) + アクティブ接続数 × 30
-→ 最小スコアを選択
-```
-
-**4.5.3 アクティブ接続管理**
-- `connDecremented` フラグで二重デクリメント防止
-- error / timeout / `res.on('close')` 全てで `decrementConn()` 呼び出し
-
-**4.5.4 後方互換**
-- `ollamaBackends` 未設定 → 環境変数 `OLLAMA_HOST:OLLAMA_PORT` の1台構成
-- 1台構成時は起動バナーで `Ollama: http://...` 形式
-- 複数構成時は `Ollama: N backends (load-balanced)` + 一覧表示
-
-### 4.6 リモートGPU監視
-
-**4.6.1 GPUエージェント (`gpu-agent.js`)**
-- 各PCで起動する独立したHTTPサーバー（依存パッケージなし）
-- ポート 11400（デフォルト）
-- `GET /` → GPU情報JSON配列を返す
-- `GPU_AGENT_TOKEN` 環境変数または引数でトークン認証
-- `X-Agent-Token` ヘッダーまたは `?token=` クエリで照合
-
-**4.6.2 統合GPU取得 (`updateAllGpuData`)**
-```javascript
-// ローカル（host=127.0.0.1/localhost/OLLAMA_HOST）→ 直接 queryGpu()
-// リモート → fetchRemoteGpu(host, port, token)
-// 全バックエンド並列取得（Promise.all）
-```
-
-**4.6.3 共有タイマー方式**
-- バックグラウンド `setInterval` 1本でキャッシュ更新（GPU_INTERVAL ms ごと）
-- `gpuUpdating` フラグで重複実行防止
-- SSE送信時は更新せずキャッシュ (`buildGpuSseData()`) のみ送信
-- → SSEクライアントが複数いてもリモートGPU取得は1本に集約
-
-**4.6.4 SSEデータ構造**
-```typescript
-[
-  { label: "PC-0", host: "192.168.10.0", port: 11434, gpus: [...] },
-  { label: "PC-1", host: "192.168.10.1", port: 11434, gpus: [...] }
-]
-```
-
-### 4.7 Web検索（DuckDuckGo）
-
-```
-GET /web-search?q=クエリ&n=5  (要認証)
-```
-
-- `https://html.duckduckgo.com/html/` にPOST + `kl=jp-jp`（日本語リージョン）
-- 2段階パーサー: `class="result__a"` → フォールバック `uddg=` リダイレクトURL
-- 失敗時: `[DDG]` プレフィックスのデバッグログをコンソール出力
-- `/api/*` プロキシと競合しないよう `/api` の外に配置
-
-### 4.8 Ollamaリバースプロキシ
-
-```
-/api/* → requireAuth → selectBackend() → http.request転送
-```
-
-**注意**: `express.json()` グローバル適用禁止（プロキシのbody消費）。`jsonParser` は個別ルートのみ。
-
-### 4.9 WebSocket: Python実行
-
-```
-/ws/python → 認証チェック → spawn('python3', ['-u', ...])
-```
-
-タイムアウト: `PYTHON_TIMEOUT`（デフォルト60秒）。`__STOP__` で `SIGKILL`。
-
-### 4.10 チャット履歴
-
-**パストラバーサル対策 (`sanitizeChatId`)**
-```javascript
-if (!/^[a-zA-Z0-9_-]+$/.test(id)) return null;
-if (id.length > 64) return null;
-```
-
-全 `/chats/:id` エンドポイントで適用。不正IDは400。
-
-### 4.11 REST API一覧
-
-| メソッド | パス | 認証 | 説明 |
-|:--|:--|:--:|:--|
-| `*` | `/api/*` | ✓ | Ollamaリバースプロキシ（負荷分散） |
-| `GET` | `/web-search?q=&n=` | ✓ | DuckDuckGo検索 |
-| `POST` | `/auth` | — | 認証（セッションCookie発行） |
-| `GET` | `/config` | — | config（password/ollamaBackends除外、hasPassword付与） |
-| `GET/POST` | `/settings` | ✓ | ユーザー設定 |
-| `GET` | `/chats` | ✓ | チャット一覧 |
-| `GET/POST/DELETE` | `/chats/:id` | ✓ | チャット CRUD |
-| `GET` | `/sse/gpu` | ✓ | 統合GPU監視 SSE |
-| `WS` | `/ws/python` | ✓ | Python対話実行 |
-
----
-
-## 5. フロントエンド（public/index.html）
-
-### 5.1 構成
-
-```
-<head>CSS（~1700行） + CDN読み込み</head>
-<body>
-  <div id="root" />
-  <script type="text/babel">
-    ├── ユーティリティ
-    ├── Markdownカスタムレンダラー（コピー/Python実行/プレビュー）
-    ├── グローバル関数（copyCode, fallbackCopy, runPython, runPreview, ...）
-    ├── MarkdownContent / ThinkingBlock コンポーネント
-    └── App コンポーネント（ログイン画面 + メインUI + GPUモニター）
-  </script>
-</body>
-```
-
-### 5.2 CDN依存
-
-| ライブラリ | バージョン | 用途 |
+| ファイル | 役割 | 依存 |
 |:--|:--|:--|
-| React / ReactDOM | 18.2.0 | UI |
-| Babel Standalone | 7.23.9 | JSXトランスパイル |
-| marked | 12.0.1 | Markdown |
-| highlight.js | 11.9.0 | コードハイライト |
-| KaTeX | 0.16.9 | LaTeX数式 |
-| Three.js | r128 | 3Dプレビュー（iframeに動的注入） |
-| IBM Plex Sans JP / JetBrains Mono | — | フォント |
+| `server.js` | メインサーバー（Express+WS） | `express`, `ws` |
+| `gpu-agent.js` | リモートGPU情報配信 | なし（標準ライブラリのみ） |
+| `public/index.html` | React SPA単一ファイル | CDN経由（react, marked, highlight.js, katex, three.js） |
+| `config.json` | 全設定 | - |
+| `hashpass.py` | パスワードハッシュ生成 | Python標準 |
+| `generate-cert.sh` | 自己署名SSL生成 | openssl |
+| `transcribe-server.py` | Gemma4音声認識（参考実装） | transformers, torch |
+| `opengeek-llm-chat.service` | systemdテンプレート | - |
 
-### 5.3 useEffect実行順序
+---
 
-```
-1. mount: GET /config → setAppConfig + setHasPassword
-2. hasPassword === true && !authenticated → ログイン画面
-3. POST /auth → setAuthenticated(true)
-4. authenticated useEffect:
-   - fetchModels() → GET /api/tags → setConnected(true)
-   - GPU SSE接続開始
-   - loadChatList()
-   - GET /settings → setChatModel / setNumCtx
-   - 1秒後に settingsLoadedRef.current = true（自動保存有効化）
-```
-
-**重要**: `fetchModels` と GPU SSE は `[authenticated]` 依存のuseEffectで実行（認証前は401で失敗するため）。
-
-### 5.4 コンポーネント構造
+## 🔐 認証フロー
 
 ```
-App
-├── ログイン画面（hasPassword && !authenticated のとき表示）
-├── 左サイドバー
-│   ├── ロゴ、設定（モデル選択、コンテキストサイズ）
-│   ├── チャット履歴パネル
-│   ├── ドキュメントパネル
-│   └── hidden file inputs
-├── チャットエリア
-│   ├── ヘッダー（接続状態、モデル名、新規チャット、GPUボタン）
-│   ├── メッセージコンテナ
-│   │   ├── ウェルカム画面（0件時）
-│   │   └── メッセージ一覧
-│   │       ├── ThinkingBlock
-│   │       ├── Agent Activity（🔍/🌐 検索クエリ）
-│   │       ├── ユーザー/アシスタントメッセージ
-│   │       │   ├── コードブロック（コピー/Python実行/プレビュー）
-│   │       │   └── Three.js/HTMLプレビュー（sandbox iframe）
-│   │       ├── アクション、参照資料
-│   │       └── トークン情報（入力/出力 + 使用率バー）
-│   ├── 入力エリア（画像プレビュー、テキスト、📎🖼️送信/停止）
-│   └── ローディングオーバーレイ
-├── 右サイドバー（推論速度 + PC別GPU群）
-├── 画像ライトボックス
-└── エラートースト
+[初回アクセス]
+Browser              Server
+   │                   │
+   │── GET /config ───>│
+   │<── { hasPassword:true, authenticated:false }
+   │ ログイン画面表示  │
+   │                   │
+   │── POST /auth ────>│ (パスワード送信)
+   │                   │ crypto.timingSafeEqual で照合
+   │                   │ 失敗時: loginAttempts でレートリミット
+   │<── Set-Cookie ────│ wz_session=<32byteHex> HttpOnly SameSite=Strict [Secure]
+   │ チャット画面       │ sessions Map に格納 (TTL 24h)
+
+[再アクセス (Cookie有効)]
+   │── GET /config (Cookie付き) ──>│
+   │                               │ isValidSession() 検証
+   │<── { authenticated:true } ────│
+   │ ログイン画面スキップ          │
 ```
 
-### 5.5 State一覧
+### セキュリティ要素
+- **セッションメモリ保持**: Map (サーバー再起動でリセット)
+- **Cookie属性**: `HttpOnly; SameSite=Strict; Max-Age=86400` + HTTPS時 `Secure`
+- **HTTPS自動判定**: `HTTPS_ENABLED || X-Forwarded-Proto === 'https'`
+- **レートリミット**: 15分5回失敗で429
+- **全認証必須ルートに `requireAuth` ミドルウェア適用**
 
-| State | 型 | 説明 |
-|:--|:--|:--|
-| `authenticated` | `boolean` | 認証済みフラグ |
-| `hasPassword` | `boolean\|null` | パスワード設定有無（null=確認中） |
-| `appConfig` | `object` | config.json設定 |
-| `chatModel` / `availableModels` / `connected` | — | Ollama接続管理 |
-| `documents` / `numCtx` | — | RAG/コンテキスト |
-| `messages` / `input` / `isLoading` | — | チャット |
-| `gpuData` | `GpuGroup[]` | PC別GPU群 |
-| `tokenSpeed` | `TokenSpeed\|null` | 推論速度平均 |
-| `chatId` / `chatList` / `chatTitle` | — | チャット管理 |
-| `chatImages` / `lightboxSrc` | — | 画像 |
-
-### 5.6 データ型
-
-```typescript
-interface Message {
-  role: 'user' | 'assistant';
-  content: string;
-  thinking?: string;
-  contexts?: RagResult[];
-  images?: ChatImage[];
-  searchQueries?: { query: string; resultCount: number; type: 'doc'|'web' }[];
-  agentStatus?: string | null;
-  tokenInfo?: { promptTokens: number; completionTokens: number } | null;
-}
-
-interface GpuGroup {
-  label: string;    // "PC-0"
-  host: string;
-  port: number;
-  gpus: GpuInfo[];
-}
-
-interface GpuInfo {
-  id: string; name?: string;
-  usage: number; temp: number; tempHotspot: number; tempMem: number;
-  power: number; sclk: number; mclk: number;
-  vramTotalMB: number; vramUsedMB: number; vramPct: number;
-}
-
-interface TokenSpeed { tokPerSec: number; totalTokens: number; samples: number; }
-```
-
-### 5.7 設定保存の二重防止
-
-`settingsLoadedRef` フラグで以下を防止:
-- 初期化時: モデル一覧読込でsetChatModelが発火 → 空値で保存される問題
-- 認証直後: settings読込前にsetChatModelが発火 → 上書き問題
-
-```
-authenticated → settings読込 → 1秒後に settingsLoadedRef = true
-→ 以降の chatModel/numCtx 変更で保存される
+### `isValidSession(token)`
+```javascript
+const s = sessions.get(token);
+if (!s || s.expiresAt < Date.now()) { sessions.delete(token); return false; }
+return true;
 ```
 
 ---
 
-## 6. リモートGPU監視エージェント（gpu-agent.js）
+## 🤖 Agentic RAG / マルチターンツール実行
 
-### 6.1 概要
+### 概要
 
-各PCで起動する単一ファイルNode.jsスクリプト。依存パッケージなし。
+LLMが応答生成前に「ツール判断フェーズ」と「最終応答フェーズ」の2段階で動作:
 
-### 6.2 機能
+```
+[1] ツール判断フェーズ (非ストリーミング)
+    - 軽量プロンプト (smallCtx: 2048, smallPredict: 512)
+    - tools パラメータでOllamaに関数一覧を渡す
+    - LLMが tool_calls を返すか、直接応答するか判断
 
-- HTTP `GET /` でGPU情報JSON配列を返す
-- `rocm-smi` → `nvidia-smi` の順で自動検出
-- トークン認証（オプション）
-- CORS有効（`Access-Control-Allow-Origin: *`）
+[2] ツール実行フェーズ (最大3ターン)
+    - tool_calls があれば実行
+    - 結果を messages に追加
+    - 再度ツール判断へ (tool_calls がなくなるまで繰り返し)
 
-### 6.3 起動例
+[3] 最終応答フェーズ (ストリーミング)
+    - toolsなしで /api/chat 呼び出し
+    - ストリームで content + thinking を受信
+```
 
+### マルチターン実装のポイント
+
+```javascript
+const MAX_TOOL_TURNS = 3;
+while (toolTurn < MAX_TOOL_TURNS) {
+  toolTurn++;
+  const turnMessages = toolTurn === 1
+    ? judgeMessages
+    : [judgeSystem, ...apiMessages.slice(1)];
+
+  const res = await chat({ messages: turnMessages, tools, stream: false });
+  if (!res.message.tool_calls?.length) break;  // ツール呼び出しなくなったら終了
+  apiMessages.push(res.message);
+  // 各 tool_call を実行して apiMessages に結果追加
+}
+// 最終応答はtoolsなしでストリーミング
+```
+
+### ツールセット
+
+| 関数名 | 引数 | 説明 |
+|:--|:--|:--|
+| `search_documents` | `query` | アップロードドキュメントのベクター検索 |
+| `web_search` | `query` | DuckDuckGo検索+上位3件の本文取得 |
+| `list_files` | なし | `public/uploads/` 一覧 |
+| `read_file` | `path` | ファイル読み込み |
+| `write_file` | `path`, `content` | ファイル書き込み |
+
+### 引数の揺れ対応
+
+LLMが `path`/`filename`/`file`/`filepath` など揺らぎで呼ぶため、フロント側で吸収:
+
+```javascript
+const fpath = fnArgs.path || fnArgs.filename || fnArgs.file || fnArgs.filepath || '';
+```
+
+### 動的コンテキスト調整
+
+ユーザー入力に「ファイル書き出し系キーワード」があるかで `num_ctx` / `num_predict` を切り替え:
+
+- **短文モード**: smallCtx=2048, smallPredict=512（通常質問用）
+- **長文モード**: mediumCtx=8192, largePredict=8192（ファイル生成時）
+
+キーワードは `appConfig.agentContext.largeGenKeywords` で上書き可。
+
+---
+
+## 💾 RAG (Retrieval Augmented Generation)
+
+### Embedding
+
+- モデル: `config.embedModel`（デフォルト `mxbai-embed-large:latest`）
+- 次元: モデル依存（mxbai=1024, nomic=768）
+- サーバー送信せず、フロントで Ollama に直接 POST
+
+### チャンク化
+
+```javascript
+function chunkText(text, size = 500, overlap = 100) {
+  // 500文字ずつ、100文字オーバーラップで分割
+}
+```
+
+### 類似度検索
+
+```javascript
+cosineSimilarity(a, b) = dot(a,b) / (norm(a) * norm(b))
+```
+
+ragTopK 件（デフォルト10）を取得してプロンプトに注入、またはツール結果として返却。
+
+### モデル選択から除外
+
+Embeddingモデルはチャット用途で使えないので、以下パターンに該当するモデルをチャット選択ドロップダウンから自動除外:
+
+```javascript
+const embedPatterns = /embed|embedding|nomic-embed|mxbai-embed|bge-|e5-|gte-/i;
+const names = allNames.filter(n =>
+  n.toLowerCase() !== config.embedModel.toLowerCase() && !embedPatterns.test(n)
+);
+```
+
+---
+
+## ⚡ マルチGPU・複数PCロードバランサ
+
+### 構成
+
+```
+config.json:
+  "ollamaBackends": [
+    { "host": "127.0.0.1", "port": 11434, "label": "PC-0" },
+    { "host": "192.168.1.101", "port": 11434, "label": "PC-1" }
+  ]
+```
+
+### スコアリング
+
+```javascript
+score(backend) = averageGpuUsage(backend) + activeConnections(backend) * 30
+```
+
+最もスコアが低い（=空いている）バックエンドを選択。
+
+### アクティブ接続数管理
+
+```javascript
+backend.activeConns++;
+let connDecremented = false;
+const decrementConn = () => {
+  if (!connDecremented) {
+    connDecremented = true;
+    backend.activeConns--;
+  }
+};
+// 複数のイベント(error/close/end)で二重減算を防ぐ
+```
+
+### GPU情報の取得
+
+- **ローカル**: `rocm-smi` / `nvidia-smi` を子プロセス起動
+- **リモート**: `gpu-agent.js` を対象PCで起動、HTTP経由で情報取得
+  - 認証: `X-Agent-Token` ヘッダー
+- **自動検出**: 自IPが `ollamaBackends` に含まれていたら `gpu-agent` 不要とみなす
+
+### 統合SSE
+
+全バックエンドのGPU情報を1秒ごとに集約し、SSEで `/sse/gpu` から配信:
+
+```javascript
+updateAllGpuData() {
+  for (const backend of ollamaBackends) {
+    const data = isLocal(backend) ? localGpuQuery() : fetchFromAgent(backend);
+    lastKnownGpuData[backend.label] = data || lastKnownGpuData[backend.label]; // 失敗時は前回値保持
+  }
+  broadcastSSE(aggregated);
+}
+```
+
+---
+
+## 🔊 音声入出力
+
+### 音声入力 (Web Speech API)
+
+```javascript
+const recognition = new SpeechRecognition();
+recognition.lang = 'ja-JP';
+recognition.continuous = true;       // 止めるまで認識継続
+recognition.interimResults = true;   // 中間結果取得
+
+// 3秒無音で自動送信
+const resetSilenceTimer = () => {
+  if (timer) clearTimeout(timer);
+  timer = setTimeout(() => {
+    recognition.abort();
+    if (hasText) sendMessageRef.current();  // 自動送信
+  }, 3000);
+};
+```
+
+- HTTPSまたはlocalhostでのみ動作（Secure Context必須）
+- Chrome/Edge対応（Firefoxは非対応）
+- 送信時に `stopRecording()` 自動呼び出し
+
+### 音声出力 (SpeechSynthesis)
+
+```javascript
+function toggleSpeak(content, idx) {
+  if (speakingIndex === idx) { cancel(); return; }
+  cancel();  // 別メッセージを読み上げ中なら止める
+  const text = stripMarkdownForSpeech(content);  // Markdown記号除去
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.lang = 'ja-JP';
+  utter.voice = findJapaneseVoice();
+  speak(utter);
+}
+```
+
+#### 停止トリガー
+- 別メッセージの読み上げボタン押下
+- 新規チャット作成
+- チャット履歴切替
+- ページ離脱（cleanup）
+
+---
+
+## 🐍 Python 実行システム
+
+### WebSocketプロトコル
+
+```
+Client → Server:
+  { type: 'run', code: '...' }           // 実行開始
+  { type: 'stdin', data: '...' }         // 標準入力
+  { type: 'stop' }                       // 強制終了
+
+Server → Client:
+  { type: 'stdout', data: '...' }        // 標準出力
+  { type: 'stderr', data: '...' }        // エラー出力
+  { type: 'image', filename: '...' }     // 画像（matplotlib等）
+  { type: 'exit', exitCode: N }          // 終了
+```
+
+### 作業ディレクトリ
+
+`public/uploads/` をcwdに設定。LLMのファイル操作ツール（read_file/write_file）と統一。
+
+### matplotlib 自動対応 Preamble
+
+ユーザー/LLMコードの前に以下を自動注入:
+
+```python
+import matplotlib
+matplotlib.use('Agg')  # GUIバックエンド無効
+
+# 日本語フォント自動選択
+candidates = ['IPAexGothic', 'Noto Sans CJK JP', 'Hiragino Sans', ...]
+matplotlib.rcParams['font.family'] = first_available(candidates)
+
+# plt.show() → savefig() + マーカー出力
+def _auto_show():
+    fname = f"plot_{run_id}_{n}.png"
+    _orig_savefig(fname)
+    print(f"__OGC_IMAGE__:{fname}")  # server.js が検出
+    plt.close('all')
+
+plt.show = _auto_show
+plt.savefig = _auto_savefig  # savefigも通知
+```
+
+### 画像マーカー検出
+
+```javascript
+// server.js: stdoutから __OGC_IMAGE__:filename.png を検出
+const m = line.match(/^__OGC_IMAGE__:(.+)$/);
+if (m) ws.send({ type: 'image', filename: m[1] });
+```
+
+### セキュリティ
+
+- 実行タイムアウト: `PYTHON_TIMEOUT` (デフォルト60秒)
+- SIGTERM による強制終了
+- 一時ファイルは `/tmp/opengeek_<runId>.py`、終了後即削除
+
+---
+
+## 🌐 Web検索 (DuckDuckGo)
+
+### エンドポイント
+
+```
+GET /web-search?q=<query>&n=5&fetch=1&bodyCount=2500
+```
+
+- `q`: クエリ
+- `n`: 取得件数（デフォルト5）
+- `fetch=1`: 上位3件の本文も取得
+- `bodyCount`: 本文切り詰め文字数
+
+### 処理フロー
+
+```
+1. https://html.duckduckgo.com/html/?q=<query>&kl=jp-jp にPOST
+2. HTMLから .result__a / .result__snippet 等を2段階パーサーで抽出
+3. 上位3件のURLを順次 web_fetch でHTML取得
+4. main > article > bodyの順でメインコンテンツ抽出
+5. HTMLタグ除去 → 2500文字で切り詰め
+```
+
+### なぜ`/api/*` プロキシの外に置くか
+
+`/api/*` は Ollama用のリバースプロキシなので、express.json() 未使用。
+Web検索は Ollama と無関係なので別パスにする必要がある。`/files/*` も同じ理由。
+
+---
+
+## 🖼️ ファイル操作 API
+
+### `safeUploadPath(path)`
+
+パストラバーサル対策:
+
+```javascript
+function safeUploadPath(rel) {
+  // uploads/ プレフィックスの除去
+  rel = rel.replace(/^uploads\//, '');
+  // 正規化 + uploads配下かチェック
+  const abs = path.resolve(UPLOADS_DIR, rel);
+  if (!abs.startsWith(UPLOADS_DIR)) return null;
+  return abs;
+}
+```
+
+### バイナリ配信
+
+拡張子で判定し、画像/PDF/動画/音声は直接配信:
+
+```javascript
+const binaryExts = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', ...
+};
+if (binaryExts[ext]) {
+  res.setHeader('Content-Type', binaryExts[ext]);
+  fs.createReadStream(abs).pipe(res);
+}
+```
+
+テキストファイルはJSON形式で返却（従来互換）:
+```json
+{ "path": "hello.py", "size": 123, "content": "...", "modified": "..." }
+```
+
+---
+
+## 📜 自動スクロール
+
+ストリーミング中、下端に追従しつつ、ユーザーが上にスクロールしたら自動追従停止:
+
+### 検出方法（多重化）
+
+```javascript
+// 1. wheel イベント (document level)
+onWheel: if (deltaY < 0) autoScrollRef = false;
+
+// 2. touchmove (モバイル)
+onTouchMove: if (fingerGoingDown) autoScrollRef = false;
+
+// 3. keydown (ArrowUp, PageUp, Home)
+onKeyDown: autoScrollRef = false;
+
+// 4. rAF で差分チェック（フォールバック）
+if (el.scrollTop < lastProgScroll - 30) autoScrollRef = false;
+```
+
+### 自動追従再開
+
+- 下端まで戻ったら再開
+- 新しいメッセージ送信時にリセット (`autoScrollRef = true`)
+
+### プログラムスクロールの判別
+
+`lastProgScrollRef` に自動スクロール位置を記録し、現在位置と比較することでユーザー操作を検出。
+
+---
+
+## 🔒 HTTPS
+
+### 証明書配置の検出
+
+```javascript
+const HTTPS_ENABLED = fs.existsSync(CERT_PATH) && fs.existsSync(KEY_PATH);
+if (HTTPS_ENABLED) {
+  server = https.createServer({ cert, key, passphrase }, app);
+} else {
+  server = http.createServer(app);
+}
+```
+
+### パスフレーズ対応
+
+```javascript
+const passphrase = process.env.SSL_PASSPHRASE || appConfig.sslPassphrase;
+if (passphrase) sslOptions.passphrase = passphrase;
+```
+
+### 自己署名証明書生成 (`generate-cert.sh`)
+
+複数ホスト/IP対応:
 ```bash
-# 引数指定
-node gpu-agent.js 11400 mysecret
-
-# 環境変数指定（systemd向け）
-GPU_AGENT_PORT=11400 GPU_AGENT_TOKEN=mysecret node gpu-agent.js
+./generate-cert.sh localhost 192.168.1.100 my-server.example.com
 ```
 
-### 6.4 認証
+SAN (Subject Alternative Name) に全ホストを含めて生成。
 
-```
-リクエスト → ヘッダー X-Agent-Token または ?token=... → トークン照合
-不一致 → 401
-```
+### リバースプロキシ対応
 
-`server.js` 側は `fetchRemoteGpu(host, port, token)` でヘッダーに付与して送信。
+nginx経由の場合、Node.js側はHTTPで動作。`X-Forwarded-Proto` ヘッダーでHTTPS判定:
 
----
-
-## 7. Agentic RAG + Web検索
-
-### 7.1 ツール定義
-
-| ツール | 条件 | 説明 |
-|:--|:--|:--|
-| `search_documents` | `documents.length > 0` | ドキュメントRAG検索 |
-| `web_search` | `appConfig.webSearch === true` | DuckDuckGo Web検索 |
-
-### 7.2 フロー（ragMode: "agentic"）
-
-```
-1. LLM呼び出し（stream: false, tools: [search_documents?, web_search?]）
-2. tool_calls があれば実行:
-   - search_documents → retrieveContext() → コサイン類似度Top-K
-   - web_search → GET /web-search → DDGスニペット
-3. LLM呼び出し（stream: true, tools なし）→ ストリーミング応答
-```
-
-### 7.3 システムプロンプト
-
-```
-あなたは親切で知識豊富なAIアシスタントです。日本語で回答してください。
-今日の日付は{年}年{月}月{日}日です。
-[ドキュメント一覧（あれば）]
-[Web検索可能（webSearch有効時）]
-内部的な推論や検索戦略の説明は出力せず、ユーザーへの回答だけを出力してください。
+```javascript
+app.set('trust proxy', 'loopback');
+const isSecure = HTTPS_ENABLED || req.headers['x-forwarded-proto'] === 'https';
 ```
 
 ---
 
-## 8. Three.js / HTMLプレビュー
+## 🚀 起動と systemd
 
-### 対応言語: `/^(html|threejs|three\.js|3d|webgl|canvas)$/`
+### `process.chdir(__dirname)`
 
-### 自動処理パイプライン
+systemd経由で起動するとデフォルトcwdが `/` になるため、server.js先頭で明示的に移動:
 
-```
-LLMコード → 壊れたThree.js scriptタグ全除去
-→ 正規CDN注入(r128 + OrbitControls + window.OrbitControlsシム)
-→ ESM→UMD変換（addons先→three後）
-→ 非HTMLならラッピング
-→ エラーヘルパー注入(onerror→赤オーバーレイ8秒)
-→ iframe.srcdoc(sandbox="allow-scripts")
+```javascript
+const { WebSocketServer } = require('ws');
+process.chdir(__dirname);  // cwd を server.js と同じ場所に固定
 ```
 
-r128 UMD固定。r142以降のAPI不可。
+ただし、主要パスは既に `path.join(__dirname, ...)` で絶対パス化済み。このchdirは保険。
+
+### systemd ユニットファイル
+
+`opengeek-llm-chat.service` がテンプレートとして同梱。`WorkingDirectory` と `ExecStart` を環境に合わせて編集。
 
 ---
 
-## 9. トークン情報 & 推論速度
+## 🔄 思考中断からの復旧
 
-### 9.1 トークン情報（メッセージ下部）
+### 「続きを生成」ボタン
 
-Ollama最終チャンクの `prompt_eval_count` / `eval_count` を取得。  
-表示: `入力: X  出力: Y  計: Z  | 使用率バー(%) コンテキストサイズ`  
-バー色: 緑(<70%) → オレンジ(70-90%) → 赤(90%+)
+Thinkingモデルが応答途中で停止・ループした場合の対策:
 
-### 9.2 推論速度（GPUパネル上部）
-
-`eval_count / eval_duration` を蓄積。`tokenAvgWindow`（デフォルト2000）超で古いものから削除。  
-表示: `23.4 tok/s  直近 1,847 トークン / 5 回`
-
----
-
-## 10. 自動スクロール
-
-```
-autoScrollRef    — 有効フラグ
-programScrollRef — プログラムスクロール中フラグ（scrollイベント誤判定防止）
-ストリーミング中: rAF ループで scrollTop = scrollHeight
-ユーザーが上スクロール: 追従停止 / メッセージ送信: リセット
+```javascript
+function continueGeneration(idx) {
+  // 履歴 + 途中までの思考/応答を assistant メッセージとして追加
+  const partial = [thinking ? `<think>${thinking}</think>` : '', content].join('\n');
+  const nudge = [
+    { role: 'assistant', content: partial },
+    { role: 'user', content: '思考が途中で止まっています。続きから応答を完成させてください。' }
+  ];
+  // 新規応答をストリーミングで取得し、既存メッセージに追記
+}
 ```
 
----
+### 表示条件
 
-## 11. チャット履歴
-
-保存: `{ title, messages, documents }` — 1.5秒デバウンス、生成中は保存しない。  
-画像base64もJSON保存 → `jsonParser` limit `10mb`。  
-グローバル設定（settings.json）: `chatModel`, `numCtx` のみ。  
-`settingsLoadedRef` で読み込み完了まで保存抑制。
+- メッセージが会話の最後
+- かつ `thinking` があるか `content` が空
+- ストリーミング中（isLoading）でない
 
 ---
 
-## 12. 拡張時の注意事項
+## ⚙️ 主要設定一覧
 
-| 項目 | 注意 |
-|:--|:--|
-| express.json() | グローバル適用禁止。個別ルートのみ |
-| /web-search | `/api/*` プロキシの外に配置必須 |
-| ストリーミング | `streamResponse()` に共通化済み |
-| Embeddingモデル | `nomic-embed-text:latest` 固定（`embedModel` 変数） |
-| Agentic RAG | Tool Calling対応モデル必須。非対応は `ragMode: "always"` |
-| 画像保存 | base64でJSON保存。limit: 10mb |
-| Three.js | r128 UMD。ESM import/壊れたURLは自動変換 |
-| コピー機能 | HTTP環境は `execCommand('copy')` フォールバック |
-| 認証 | `fetchModels` と GPU SSE は `[authenticated]` 依存に必須 |
-| 設定保存 | `settingsLoadedRef` で初回読み込み完了前の保存を抑制 |
-| GPU取得 | バックグラウンド共有タイマー1本に集約（並列爆発防止） |
-| アクティブ接続 | `connDecremented` フラグで二重デクリメント防止 |
-| パストラバーサル | `sanitizeChatId()` で英数字・ハイフン・アンダースコアのみ |
-| セッション | サーバー再起動でリセット（Map保持） |
-| HTTPS | 本番運用時はリバースプロキシで終端し Set-Cookie に Secure 属性追加が必要 |
-| rocm-smiキー名 | ROCmバージョンで異なる。電力キーは部分一致 |
+| キー | 型 | デフォルト | 説明 |
+|:--|:--|:--|:--|
+| `appName` | string | "OpenGeekLLMChat" | 表示名 |
+| `defaultModel` | string | "" | 初期モデル |
+| `embedModel` | string | "mxbai-embed-large:latest" | RAG用モデル |
+| `password` | string | "" | MD5/SHA-256ハッシュ |
+| `pythonPath` | string | "python3" | Python実行コマンド |
+| `gpuAgentToken` | string | "" | gpu-agent共有トークン |
+| `ollamaBackends` | array | [{127.0.0.1:11434}] | バックエンド配列 |
+| `sslPassphrase` | string | "" | 秘密鍵パスフレーズ |
+| `webSearch` | bool | true | Web検索 |
+| `fileAccess` | bool | true | ファイル操作 |
+| `ragTopK` | number | 10 | RAG検索件数 |
+| `ragMode` | string | "agentic" | agentic / always |
+| `agentContext.smallCtx` | number | 2048 | ツール判断時のctx |
+| `agentContext.mediumCtx` | number | 8192 | 本応答ctx |
+| `agentContext.smallPredict` | number | 512 | ツール判断時のpredict |
+| `agentContext.largePredict` | number | 8192 | 長文応答のpredict |
+| `agentContext.judgeHistoryCount` | number | 3 | ツール判断時の履歴件数 |
+| `agentContext.largeGenKeywords` | array | null | 長文モードトリガーワード |
+
+---
+
+## 🧪 注意事項（実装時の罠）
+
+1. **`express.json()` をグローバル適用しない**
+   Ollamaプロキシのリクエストボディが消費されてしまうため、必要なエンドポイントのみに個別適用。
+
+2. **`/web-search`, `/files` は `/api/*` の外に置く**
+   同上、プロキシミドルウェアに吸収されないように。
+
+3. **WebSocket認証はCookieから取得**
+   `ws` パッケージは `req.headers.cookie` で標準送信されたCookieを参照可能。
+
+4. **Three.js はr128固定**
+   r142以降のAPI（CapsuleGeometry等）は使わない。CDN URL `https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js`。
+
+5. **rocm-smiキー名はROCmバージョン依存**
+   `GPU use (%)`, `GPU use (Mem) %`, `GPU use (VRAM) %` 等で揺れる。柔軟にパース。
+
+6. **セッションは再起動でリセット**
+   `sessions` はメモリMap。必要ならRedis等に差し替え可能。
+
+7. **HTTPS環境では `Set-Cookie` に `Secure` 属性必須**
+   `HTTPS_ENABLED` または `X-Forwarded-Proto` で判定して自動付与。
+
+8. **LLMの英語独白対策**
+   思考モデルが "I need to..." 等の英語独り言を出す場合、システムプロンプトに「内部的な推論・メタ説明を出力するな」と明示的に指示。
+
+9. **Python preambleで UserWarning 抑制**
+   matplotlibのフォント警告は非表示に。Errorは通常通り表示される。
+
+10. **マルチターンツール実行の無限ループ防止**
+    `MAX_TOOL_TURNS = 3` で必ず終了。それ以降は最終応答フェーズへ移行。
+
+11. **LLMにはツールだけでなくPython実行機能も明示する**
+    システムプロンプトに「グラフや計算はPythonコードブロックで返せば自動実行される」と書かないと、ツールしか選択肢がないと思い込んで思考ループに陥る。

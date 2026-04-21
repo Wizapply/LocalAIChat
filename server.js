@@ -8,6 +8,10 @@ const crypto = require('crypto');
 const os = require('os');
 const { WebSocketServer } = require('ws');
 
+// systemd等で起動された際、カレントディレクトリをserver.jsと同じに固定する
+// これにより相対パスでアクセスされるリソース(モデルキャッシュ等)も安定動作する
+process.chdir(__dirname);
+
 // ─── 設定 ───
 const PORT = process.env.PORT || 3000;
 const OLLAMA_HOST = process.env.OLLAMA_HOST || '127.0.0.1';
@@ -24,9 +28,15 @@ const DEFAULT_CONFIG = {
   welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
   accentColor: '#34d399',
   defaultModel: '',
+  embedModel: 'mxbai-embed-large:latest',
   password: '',
   pythonPath: 'python3',
   gpuAgentToken: '',
+  transcribe: {
+    enabled: false,
+    host: '127.0.0.1',
+    port: 11500,
+  },
   ollamaBackends: [],
   webSearch: true,
   ragTopK: 10,
@@ -166,7 +176,27 @@ function log(ip, message) {
 }
 
 const app = express();
-const server = http.createServer(app);
+app.set('trust proxy', 'loopback'); // リバースプロキシからのX-Forwarded-*ヘッダーを信頼
+
+// ─── HTTP/HTTPS サーバー初期化 ───
+// cert.pem と key.pem がカレントディレクトリにあればHTTPS、なければHTTP
+// 秘密鍵にパスフレーズが設定されている場合は SSL_PASSPHRASE 環境変数 or config.jsonのsslPassphraseに指定
+const CERT_PATH = path.join(__dirname, 'cert.pem');
+const KEY_PATH = path.join(__dirname, 'key.pem');
+const HTTPS_ENABLED = fs.existsSync(CERT_PATH) && fs.existsSync(KEY_PATH);
+let server;
+if (HTTPS_ENABLED) {
+  const https = require('https');
+  const sslOptions = {
+    cert: fs.readFileSync(CERT_PATH),
+    key: fs.readFileSync(KEY_PATH),
+  };
+  const passphrase = process.env.SSL_PASSPHRASE || appConfig.sslPassphrase;
+  if (passphrase) sslOptions.passphrase = passphrase;
+  server = https.createServer(sslOptions, app);
+} else {
+  server = http.createServer(app);
+}
 
 // ─── WebSocket: 対話的Python実行 ───
 const wss = new WebSocketServer({ server, path: '/ws/python' });
@@ -193,13 +223,61 @@ wss.on('connection', (ws, req) => {
 
     if (msg.type === 'run' && msg.code) {
       tmpFile = path.join(os.tmpdir(), `opengeek_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.py`);
-      fs.writeFileSync(tmpFile, msg.code, 'utf-8');
+      // 作業ディレクトリ: public/uploads/（LLMのread_file/write_fileと統一）
+      const pyCwd = path.join(__dirname, 'public', 'uploads');
+      if (!fs.existsSync(pyCwd)) fs.mkdirSync(pyCwd, { recursive: true });
+
+      // matplotlib自動対応のプレアンブル: show()と savefig() の両方をフック
+      const runId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      const preamble = `
+import os as _os, sys as _sys
+import warnings as _warnings
+_warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
+_IMG_COUNTER = [0]
+_RUN_ID = "${runId}"
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    # 日本語フォント自動選択（環境にインストールされているもの優先）
+    from matplotlib import font_manager as _fm
+    _JP_CANDIDATES = [
+        'IPAexGothic', 'IPAGothic',
+        'Noto Sans CJK JP', 'Noto Sans JP',
+        'Hiragino Sans', 'Hiragino Kaku Gothic Pro',
+        'Yu Gothic', 'Meiryo', 'MS Gothic',
+        'TakaoPGothic', 'VL PGothic', 'DejaVu Sans',
+    ]
+    _available = set(f.name for f in _fm.fontManager.ttflist)
+    _jp_font = next((f for f in _JP_CANDIDATES if f in _available), 'DejaVu Sans')
+    matplotlib.rcParams['font.family'] = _jp_font
+    matplotlib.rcParams['axes.unicode_minus'] = False  # マイナス記号豆腐化防止
+    import matplotlib.pyplot as _plt
+    _orig_show = _plt.show
+    _orig_savefig = _plt.savefig
+    def _auto_show(*a, **kw):
+        _IMG_COUNTER[0] += 1
+        fname = f"plot_{_RUN_ID}_{_IMG_COUNTER[0]}.png"
+        _orig_savefig(fname, bbox_inches='tight', dpi=100)
+        print(f"__OGC_IMAGE__:{fname}", flush=True)
+        _plt.close('all')
+    def _auto_savefig(fname, *a, **kw):
+        _orig_savefig(fname, *a, **kw)
+        import os as __os
+        base = __os.path.basename(str(fname))
+        print(f"__OGC_IMAGE__:{base}", flush=True)
+    _plt.show = _auto_show
+    _plt.savefig = _auto_savefig
+except ImportError:
+    pass
+# ─── user code below ───
+`;
+      fs.writeFileSync(tmpFile, preamble + msg.code, 'utf-8');
       const pythonCmd = appConfig.pythonPath || 'python3';
-      log(ip, `PYTHON RUN (${msg.code.length} chars) using ${pythonCmd}`);
+      log(ip, `PYTHON RUN (${msg.code.length} chars) using ${pythonCmd} in ${pyCwd}`);
 
       proc = spawn(pythonCmd, ['-u', tmpFile], {
         env: { ...process.env, PYTHONUNBUFFERED: '1' },
-        cwd: os.tmpdir(),
+        cwd: pyCwd,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
@@ -211,7 +289,20 @@ wss.on('connection', (ws, req) => {
       }, PYTHON_TIMEOUT);
 
       proc.stdout.on('data', (data) => {
-        ws.send(JSON.stringify({ type: 'stdout', data: data.toString() }));
+        const text = data.toString();
+        // __OGC_IMAGE__:filename.png マーカーを検出して画像メッセージに変換
+        const lines = text.split('\n');
+        const normal = [];
+        for (const line of lines) {
+          const m = line.match(/^__OGC_IMAGE__:(.+)$/);
+          if (m) {
+            ws.send(JSON.stringify({ type: 'image', filename: m[1].trim() }));
+          } else {
+            normal.push(line);
+          }
+        }
+        const filtered = normal.join('\n');
+        if (filtered) ws.send(JSON.stringify({ type: 'stdout', data: filtered }));
       });
 
       proc.stderr.on('data', (data) => {
@@ -335,14 +426,166 @@ function ddgSearch(query, maxResults = 5) {
   });
 }
 
+// ─── ページ本文取得 (URL → テキスト) ───
+function fetchPageText(url, maxChars = 3000) {
+  return new Promise((resolve) => {
+    try {
+      const u = new URL(url);
+      const lib = u.protocol === 'https:' ? https : http;
+      const req = lib.request({
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + u.search,
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml',
+          'Accept-Language': 'ja,en-US;q=0.9',
+        },
+        timeout: 8000,
+      }, (res) => {
+        // リダイレクト対応（3xx）
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          const redirectUrl = res.headers.location.startsWith('http')
+            ? res.headers.location
+            : u.origin + res.headers.location;
+          res.destroy();
+          return resolve(fetchPageText(redirectUrl, maxChars));
+        }
+        const contentType = res.headers['content-type'] || '';
+        if (!contentType.includes('text/html') && !contentType.includes('text/plain')) {
+          res.destroy();
+          return resolve('');
+        }
+        let html = '';
+        res.on('data', (d) => {
+          html += d.toString();
+          // サイズ制限（巨大ページの無駄なDL防止）
+          if (html.length > 500000) res.destroy();
+        });
+        res.on('end', () => resolve(extractMainText(html, maxChars)));
+        res.on('close', () => resolve(extractMainText(html, maxChars)));
+      });
+      req.on('error', () => resolve(''));
+      req.on('timeout', () => { req.destroy(); resolve(''); });
+      req.end();
+    } catch { resolve(''); }
+  });
+}
+
+// HTMLから主要テキストを抽出
+function extractMainText(html, maxChars = 3000) {
+  if (!html) return '';
+  // script, style, nav, header, footer を除去
+  let text = html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<nav[\s\S]*?<\/nav>/gi, '')
+    .replace(/<header[\s\S]*?<\/header>/gi, '')
+    .replace(/<footer[\s\S]*?<\/footer>/gi, '')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+    .replace(/<iframe[\s\S]*?<\/iframe>/gi, '');
+
+  // main, article要素があれば優先
+  const mainMatch = text.match(/<(?:main|article)\b[^>]*>([\s\S]*?)<\/(?:main|article)>/i);
+  if (mainMatch) text = mainMatch[1];
+
+  // タグ除去 + エンティティデコード + 空白整理
+  text = text
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return text.slice(0, maxChars);
+}
+
 app.get('/web-search', requireAuth, async (req, res) => {
   const ip = getIP(req);
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: 'q parameter required' });
+  const maxResults = parseInt(req.query.n) || 5;
+  const fetchBodies = req.query.fetch !== '0'; // デフォルト有効
+  const bodyCount = parseInt(req.query.bodyCount) || 3; // 上位何件の本文を取るか
   log(ip, `WEB SEARCH: ${query}`);
-  const results = await ddgSearch(query, parseInt(req.query.n) || 5);
-  log(ip, `WEB SEARCH: ${results.length} results`);
+  const results = await ddgSearch(query, maxResults);
+  log(ip, `WEB SEARCH: ${results.length} results, fetching bodies: ${fetchBodies ? bodyCount : 0}`);
+
+  // 上位N件のページ本文を並列取得
+  if (fetchBodies && results.length > 0) {
+    const targets = results.slice(0, bodyCount);
+    await Promise.all(targets.map(async (r, i) => {
+      try {
+        const body = await fetchPageText(r.url, 2500);
+        if (body) {
+          r.body = body;
+          log(ip, `  [${i+1}] ${r.url}  (${body.length} chars)`);
+        }
+      } catch {}
+    }));
+  }
+
   res.json({ results });
+});
+
+// ─── 音声認識プロキシ (Python Transcribe Server へ転送) ───
+app.post('/transcribe', requireAuth, (req, res) => {
+  const ip = getIP(req);
+  if (!appConfig.transcribe || !appConfig.transcribe.enabled) {
+    return res.status(503).json({ error: '音声認識が無効です。config.jsonでtranscribe.enabledをtrueにしてください。' });
+  }
+  const host = appConfig.transcribe.host || '127.0.0.1';
+  const port = appConfig.transcribe.port || 11500;
+  const contentLength = req.headers['content-length'];
+  log(ip, `TRANSCRIBE POST ${contentLength || '?'} bytes → ${host}:${port}`);
+
+  const proxyReq = http.request({
+    hostname: host, port, path: '/transcribe', method: 'POST',
+    headers: {
+      'Content-Type': req.headers['content-type'] || 'application/octet-stream',
+      ...(contentLength && { 'Content-Length': contentLength }),
+    },
+    timeout: 120000,
+  }, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode, { 'Content-Type': 'application/json' });
+    proxyRes.pipe(res, { end: true });
+  });
+  proxyReq.on('error', (err) => {
+    log(ip, `TRANSCRIBE ERROR: ${err.message}`);
+    if (!res.headersSent) res.status(502).json({ error: '音声認識サーバーに接続できません: ' + err.message });
+  });
+  proxyReq.on('timeout', () => {
+    log(ip, `TRANSCRIBE TIMEOUT`);
+    proxyReq.destroy();
+    if (!res.headersSent) res.status(504).json({ error: '音声認識タイムアウト' });
+  });
+  req.pipe(proxyReq, { end: true });
+});
+
+app.get('/transcribe/health', requireAuth, (req, res) => {
+  if (!appConfig.transcribe || !appConfig.transcribe.enabled) {
+    return res.json({ enabled: false });
+  }
+  const host = appConfig.transcribe.host || '127.0.0.1';
+  const port = appConfig.transcribe.port || 11500;
+  const r = http.get({ hostname: host, port, path: '/health', timeout: 3000 }, (proxyRes) => {
+    let data = '';
+    proxyRes.on('data', d => data += d);
+    proxyRes.on('end', () => {
+      try { res.json({ enabled: true, ...JSON.parse(data) }); }
+      catch { res.json({ enabled: true, status: 'unknown' }); }
+    });
+  });
+  r.on('error', () => res.json({ enabled: true, status: 'offline' }));
+  r.on('timeout', () => { r.destroy(); res.json({ enabled: true, status: 'timeout' }); });
 });
 
 // ─── Ollama APIへのリバースプロキシ ───
@@ -645,6 +888,17 @@ function requireAuth(req, res, next) {
 app.get('/config', (req, res) => {
   const { password, ollamaBackends, ...safeConfig } = appConfig;
   safeConfig.hasPassword = !!password;
+
+  // 既存セッションCookieが有効かどうかを判定
+  if (password) {
+    const cookieToken = (req.headers.cookie || '').split(';')
+      .map(c => c.trim())
+      .find(c => c.startsWith('wz_session='))?.split('=')[1];
+    safeConfig.authenticated = !!(cookieToken && isValidSession(cookieToken));
+  } else {
+    safeConfig.authenticated = true;
+  }
+
   res.json(safeConfig);
 });
 
@@ -662,7 +916,9 @@ app.post('/auth', jsonParser, (req, res) => {
     const token = newSession(ip);
     resetLoginRate(ip);
     log(ip, 'AUTH success');
-    res.setHeader('Set-Cookie', `wz_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(SESSION_TTL / 1000)}`);
+    // HTTPS時（直接or リバースプロキシ経由）は Secure 属性を付与
+    const isSecure = HTTPS_ENABLED || req.headers['x-forwarded-proto'] === 'https';
+    res.setHeader('Set-Cookie', `wz_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(SESSION_TTL / 1000)}${isSecure ? '; Secure' : ''}`);
     return res.json({ ok: true, token });
   }
   recordLoginFail(ip);
@@ -735,6 +991,27 @@ app.get('/files/*', requireAuth, (req, res) => {
     const stat = fs.statSync(abs);
     if (!stat.isFile()) return res.status(400).json({ error: 'Not a file' });
     if (stat.size > MAX_FILE_SIZE) return res.status(413).json({ error: 'File too large' });
+
+    // バイナリ拡張子の場合は直接配信（画像等）
+    const ext = path.extname(abs).toLowerCase();
+    const binaryExts = {
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif', '.webp': 'image/webp',
+      '.svg': 'image/svg+xml', '.bmp': 'image/bmp',
+      '.pdf': 'application/pdf',
+      '.mp4': 'video/mp4', '.webm': 'video/webm',
+      '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg',
+      '.zip': 'application/zip',
+    };
+    if (binaryExts[ext] || req.query.raw === '1') {
+      res.setHeader('Content-Type', binaryExts[ext] || 'application/octet-stream');
+      res.setHeader('Cache-Control', 'private, max-age=60');
+      log(ip, `FILE READ ${relativePath} (${stat.size} bytes, binary)`);
+      return fs.createReadStream(abs).pipe(res);
+    }
+
+    // テキストファイルはJSON形式で返す（従来互換）
     const content = fs.readFileSync(abs, 'utf-8');
     log(ip, `FILE READ ${relativePath} (${stat.size} bytes)`);
     res.json({ path: relativePath, size: stat.size, content, modified: stat.mtime.toISOString() });
@@ -902,7 +1179,7 @@ app.get('*', (req, res) => {
 server.listen(PORT, '0.0.0.0', async () => {
   const name = `${appConfig.appName} Server`;
   const lines = [];
-  lines.push(`  URL   : http://localhost:${PORT}`);
+  lines.push(`  URL   : ${HTTPS_ENABLED ? 'https' : 'http'}://localhost:${PORT}`);
   if (backends.length === 1) {
     lines.push(`  Ollama: http://${backends[0].host}:${backends[0].port}`);
   } else {

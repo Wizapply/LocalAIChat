@@ -7,3 +7,8 @@ Thumbs.db
 # uploadsは追跡するが、中身のファイルは除外
 public/uploads/*
 !public/uploads/.gitkeep
+# HTTPS証明書（秘密鍵を誤コミットしないため）
+cert.pem
+key.pem
+# Python venv
+.venv-transcribe/

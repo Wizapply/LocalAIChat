@@ -6,9 +6,15 @@
   "welcomeHints": ["このコードを解説して", "今日のニュースを教えて", "Pythonで〇〇するスクリプトを書いて"],
   "accentColor": "#34d399",
   "defaultModel": "",
+  "embedModel": "mxbai-embed-large:latest",
   "password": "e10adc3949ba59abbe56e057f20f883e",
   "pythonPath": "python3",
   "gpuAgentToken": "mysecret123",
+  "transcribe": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 11500
+  },
   "ollamaBackends": [
     {
       "host": "127.0.0.1",
@@ -27,6 +33,7 @@
     "largePredict": 8192,
     "smallThreshold": 2000,
     "mediumThreshold": 8000,
+    "judgeHistoryCount": 3,
     "largeGenKeywords": null
   },
   "tokenAvgWindow": 3000,
