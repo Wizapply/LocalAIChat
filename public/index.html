@@ -2079,9 +2079,14 @@ window.runPython = function(codeId, btn) {
       // Python matplotlib で生成された画像を表示
       const url = '/files/' + encodeURIComponent(msg.filename) + '?t=' + Date.now();
       const imgHtml = '<div style="margin:8px 0;padding:8px;background:var(--bg-primary);border-radius:6px;">'
-        + '<img src="' + url + '" style="max-width:100%;height:auto;display:block;cursor:zoom-in;" '
+        + '<img src="' + url + '" style="max-width:100%;height:auto;display:block;cursor:zoom-in;border-radius:4px;" '
         + 'onclick="window.open(this.src, \'_blank\')" alt="' + escapeHtml(msg.filename) + '">'
-        + '<div style="font-size:11px;color:var(--text-muted);margin-top:4px;">📊 ' + escapeHtml(msg.filename) + '</div>'
+        + '<div style="display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--text-muted);margin-top:6px;gap:8px;">'
+        + '<span>📊 ' + escapeHtml(msg.filename) + '</span>'
+        + '<button onclick="window.attachImageToChat(\'' + escapeHtml(msg.filename) + '\')" '
+        + 'style="background:var(--accent-dim);border:1px solid var(--accent);color:var(--accent);padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">'
+        + '📎 チャットに添付</button>'
+        + '</div>'
         + '</div>';
       body.innerHTML += imgHtml;
       body.scrollTop = body.scrollHeight;
@@ -2451,6 +2456,7 @@ function App() {
   const [speakingIndex, setSpeakingIndex] = useState(-1);
   const abortRef = useRef(null);
   const sendMessageRef = useRef(null);
+  const setChatImagesRef = useRef(null);
   const [chatImages, setChatImages] = useState([]); // [{ name, base64, preview }]
   const [lightboxSrc, setLightboxSrc] = useState(null);
 
@@ -2606,15 +2612,16 @@ function App() {
         const tools = [];
 
         if (documents.length > 0) {
+          const docNames = documents.map(d => d.name).join(', ');
           tools.push({
             type: 'function',
             function: {
               name: 'search_documents',
-              description: 'アップロード済みドキュメントから関連情報を検索する。ユーザーの質問に答えるために必要に応じて使用する。',
+              description: `チャットに添付されたドキュメントから関連情報を検索する。検索対象のドキュメント: ${docNames}。これらのドキュメントについての質問は必ずこのツールを使用すること。テキストで関数呼び出しを書くのではなく、必ず実際のtool_callとして呼び出すこと。`,
               parameters: {
                 type: 'object',
                 properties: {
-                  query: { type: 'string', description: '検索クエリ（質問の核心を簡潔に）' }
+                  query: { type: 'string', description: '検索クエリ（質問の核心を簡潔に。ファイル名そのものではなく、内容に関するキーワード）' }
                 },
                 required: ['query']
               }
@@ -2682,19 +2689,21 @@ function App() {
         let agentSystem = systemPrompt;
         if (documents.length > 0) {
           const docListText = documents.map(d => d.name).join(', ');
-          agentSystem += `\n\n以下のドキュメントが参照可能です: ${docListText}`
-            + '\nユーザーの質問に答えるために、必要に応じて search_documents ツールでドキュメントを検索してください。';
+          agentSystem += `\n\n【参照可能なドキュメント】(チャットに添付されたファイル): ${docListText}`
+            + '\nユーザーの質問が「ドキュメントについて」「資料を見て」「添付ファイル」などを示唆する場合、必ず最初に search_documents ツールを使ってください。'
+            + '\nこれらは添付ドキュメントであり、サーバーファイル（uploads配下）とは別物です。';
         }
         if (appConfig.webSearch) {
           agentSystem += '\n\n最新の情報や知らないことについては web_search ツールでインターネット検索できます。';
         }
         if (appConfig.fileAccess !== false) {
-          agentSystem += '\n\nサーバーのuploadsフォルダに対してファイルの読み書きが可能です。'
-            + '\n- list_files: ファイル一覧を取得'
-            + '\n- read_file(path): ファイル読み込み'
-            + '\n- write_file(path, content): ファイル書き込み'
+          agentSystem += '\n\n【サーバーファイル操作】(uploads配下、ドキュメントとは別物)'
+            + '\n- list_files: uploadsフォルダの一覧を取得'
+            + '\n- read_file(path): uploadsフォルダのファイル読み込み'
+            + '\n- write_file(path, content): uploadsフォルダにファイル書き込み'
             + '\n重要: pathには"uploads/"プレフィックスを付けずにファイル名のみを指定してください（例: "hello.py"、"data/config.json"）。'
-            + '\nユーザーがファイル操作やコード保存を依頼した場合は、余計な説明なしに即座にツールを呼び出してください。';
+            + '\nユーザーが明確に「サーバーファイル」「uploadsフォルダ」「ファイルを保存して」など、サーバー側のファイルシステム操作を依頼した場合のみ使用してください。'
+            + '\nチャットに添付されたドキュメントについての質問では list_files/read_file/write_file は使わず、search_documents を使ってください。';
         }
         agentSystem += '\n\nPythonコード実行について:'
           + '\n- 応答に ```python ... ``` のコードブロックを含めると、ユーザー側で実行ボタンが表示されます。'
@@ -2734,10 +2743,16 @@ function App() {
         const needsLargeGen = fileWriteKeywords.some(k => lowerText.includes(k.toLowerCase()));
 
         // ツール判断用の簡潔なシステムプロンプト（メタ的な指示を排除）
+        const docList = documents.length > 0 ? documents.map(d => d.name).join(', ') : '';
         const judgeSystem = '以下の中から必要なツールを呼び出してください。通常の質問に答えられる場合はツールを使わずそのまま応答してください。'
-          + (documents.length > 0 ? '\n- search_documents: アップロード済みドキュメントから検索' : '')
+          + (documents.length > 0
+              ? `\n- search_documents: チャット添付済みドキュメント (${docList}) から検索 ★「資料」「ドキュメント」「添付」関連の質問では最優先`
+              : '')
           + (appConfig.webSearch ? '\n- web_search: インターネット検索（最新情報が必要な場合）' : '')
-          + (appConfig.fileAccess !== false ? '\n- list_files/read_file/write_file: uploadsフォルダへのファイル操作（path は "uploads/" プレフィックスなし）' : '')
+          + (appConfig.fileAccess !== false
+              ? '\n- list_files/read_file/write_file: サーバーuploadsフォルダの操作（明確に「サーバーファイル」「uploadsに」と指示された場合のみ）'
+              : '')
+          + '\n注意: チャット添付ドキュメントとサーバーuploadsファイルは別物。ドキュメント関連は search_documents、サーバーファイル関連は list_files/read_file/write_file。'
           + '\nグラフ・計算・データ処理はツール不要。```python ... ``` コードブロックを応答に含めれば自動実行されます（matplotlibで画像表示可能）。'
           + '\n内部推論は書かず、ツールを呼ぶか直接短く応答するかのみ。';
 
@@ -2787,6 +2802,29 @@ function App() {
           const toolData = await toolRes.json();
           const assistantMsg = toolData.message;
           lastAssistantMsg = assistantMsg;
+
+          // LLMがテキストで「search_documents(query='...')」と書いてしまった場合、
+          // 実際のtool_callに変換するフォールバック
+          if ((!assistantMsg?.tool_calls || assistantMsg.tool_calls.length === 0) && assistantMsg?.content) {
+            const textCallMatch = assistantMsg.content.match(/(search_documents|web_search|read_file|list_files|write_file)\s*\(\s*([^)]*)\)/);
+            if (textCallMatch) {
+              const fname = textCallMatch[1];
+              const argsStr = textCallMatch[2];
+              const fakeCall = { function: { name: fname, arguments: {} } };
+              // query='...' / path='...' などを抽出
+              const queryMatch = argsStr.match(/query\s*=\s*['"]([^'"]+)['"]/);
+              const pathMatch = argsStr.match(/(?:path|filename|file)\s*=\s*['"]([^'"]+)['"]/);
+              if (queryMatch) fakeCall.function.arguments.query = queryMatch[1];
+              if (pathMatch) fakeCall.function.arguments.path = pathMatch[1];
+              // queryもpathもないがlist_filesなら引数なし
+              if (fname === 'list_files' || Object.keys(fakeCall.function.arguments).length > 0) {
+                console.log(`[ツールテキスト検出] ${fname} を実ツール呼び出しに変換`);
+                assistantMsg.tool_calls = [fakeCall];
+                // contentは上書きで空にする（テキスト応答を破棄）
+                assistantMsg.content = '';
+              }
+            }
+          }
 
           // ツール呼び出しがなければループ終了
           if (!assistantMsg?.tool_calls || assistantMsg.tool_calls.length === 0) break;
@@ -3054,6 +3092,12 @@ function App() {
     let assistantContent = '';
     let assistantThinking = '';
     let tokenInfo = null;
+    // ループ検出用: 直近の思考文字列を100文字単位でハッシュ化して回数カウント
+    let loopDetected = false;
+    const seenChunks = new Map(); // chunk → count
+    const LOOP_CHUNK_SIZE = 100;
+    const LOOP_THRESHOLD = 3;
+    let lastCheckedLen = 0;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -3092,6 +3136,25 @@ function App() {
             }
           }
 
+          // ─── 思考ループ検出 ───
+          // 思考文字列が一定量増えるたびに、末尾100文字ウィンドウで重複カウント
+          const fullText = assistantThinking + assistantContent;
+          if (fullText.length - lastCheckedLen >= LOOP_CHUNK_SIZE) {
+            lastCheckedLen = fullText.length;
+            // 末尾を100文字ウィンドウでスライス（最新の思考片）
+            const chunkText = fullText.slice(-LOOP_CHUNK_SIZE).replace(/\s+/g, ' ').trim();
+            if (chunkText.length >= 50) {
+              const count = (seenChunks.get(chunkText) || 0) + 1;
+              seenChunks.set(chunkText, count);
+              if (count >= LOOP_THRESHOLD) {
+                console.log('[ループ検出] 同一思考が', count, '回繰り返し:', chunkText.slice(0, 60));
+                loopDetected = true;
+                if (abortRef.current) abortRef.current.abort();
+                break;
+              }
+            }
+          }
+
           let displayContent = assistantContent;
           let displayThinking = assistantThinking;
           const thinkMatch = assistantContent.match(/^<think>([\s\S]*?)(<\/think>)?([\s\S]*)$/);
@@ -3110,13 +3173,15 @@ function App() {
               thinking: displayThinking,
               contexts: contextInfo,
               searchQueries: searchQueries,
-              agentStatus: null,
+              agentStatus: loopDetected ? '⚠️ 思考ループを検出しました。「続きを生成」ボタンで回答を要求できます。' : null,
               tokenInfo: tokenInfo,
+              loopDetected: loopDetected,
             };
             return copy;
           });
         } catch {}
       }
+      if (loopDetected) break;
     }
   }
 
@@ -3505,6 +3570,40 @@ function App() {
 
   // sendMessageを常に最新状態で音声認識から呼び出せるようにref保持
   useEffect(() => { sendMessageRef.current = sendMessage; });
+  useEffect(() => { setChatImagesRef.current = setChatImages; });
+
+  // Python実行結果の画像をチャット入力欄に添付するグローバル関数
+  // （vanilla JSのターミナルUIから呼び出す）
+  useEffect(() => {
+    window.attachImageToChat = async (filename) => {
+      try {
+        const url = '/files/' + encodeURIComponent(filename);
+        const res = await fetch(url);
+        if (!res.ok) {
+          setError('画像取得失敗: ' + filename);
+          return;
+        }
+        const blob = await res.blob();
+        // BlobをbaseDataURLに変換
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const dataUrl = e.target.result;
+          const base64 = dataUrl.split(',')[1];
+          setChatImagesRef.current?.(prev => [
+            ...prev,
+            { name: filename, base64, preview: dataUrl }
+          ]);
+          // 入力欄付近にスクロール
+          const inputEl = document.querySelector('.input-area, textarea');
+          if (inputEl) inputEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        };
+        reader.readAsDataURL(blob);
+      } catch (e) {
+        setError('画像添付エラー: ' + e.message);
+      }
+    };
+    return () => { delete window.attachImageToChat; };
+  }, []);
 
   // 新規チャット/ページ離脱時に音声停止
   useEffect(() => {
@@ -4110,7 +4209,7 @@ function App() {
                       {/* 思考のみで本応答が空 or 応答が途中で切れた場合に「続ける」ボタン */}
                       {i === messages.length - 1 && (!msg.content || msg.thinking) && (
                         <button className="msg-action-btn continue-btn" onClick={() => continueGeneration(i)}>
-                          🔄 続きを生成
+                          {msg.loopDetected ? '⚠️ 思考ループを中断・回答を要求' : '🔄 続きを生成'}
                         </button>
                       )}
                     </div>
