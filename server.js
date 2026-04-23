@@ -226,15 +226,21 @@ wss.on('connection', (ws, req) => {
       // 作業ディレクトリ: public/uploads/（LLMのread_file/write_fileと統一）
       const pyCwd = path.join(__dirname, 'public', 'uploads');
       if (!fs.existsSync(pyCwd)) fs.mkdirSync(pyCwd, { recursive: true });
+      // matplotlibで生成した画像は public/plots/ に保存（uploadsとは分離）
+      const plotsDir = path.join(__dirname, 'public', 'plots');
+      if (!fs.existsSync(plotsDir)) fs.mkdirSync(plotsDir, { recursive: true });
 
       // matplotlib自動対応のプレアンブル: show()と savefig() の両方をフック
       const runId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      // Windowsパス対応のため絶対パスをJSON形式でエスケープ
+      const plotsDirEscaped = JSON.stringify(plotsDir);
       const preamble = `
 import os as _os, sys as _sys
 import warnings as _warnings
 _warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
 _IMG_COUNTER = [0]
 _RUN_ID = "${runId}"
+_PLOTS_DIR = ${plotsDirEscaped}
 try:
     import matplotlib
     matplotlib.use('Agg')
@@ -257,13 +263,15 @@ try:
     def _auto_show(*a, **kw):
         _IMG_COUNTER[0] += 1
         fname = f"plot_{_RUN_ID}_{_IMG_COUNTER[0]}.png"
-        _orig_savefig(fname, bbox_inches='tight', dpi=100)
-        print(f"__OGC_IMAGE__:{fname}", flush=True)
+        full_path = _os.path.join(_PLOTS_DIR, fname)
+        _orig_savefig(full_path, bbox_inches='tight', dpi=100)
+        # フロント側では /plots/<fname> でアクセスされるので plots/ プレフィックス付きマーカー
+        print(f"__OGC_IMAGE__:plots/{fname}", flush=True)
         _plt.close('all')
     def _auto_savefig(fname, *a, **kw):
+        # ユーザーがsavefigに明示指定したパスはそのまま尊重（uploadsに保存される）
         _orig_savefig(fname, *a, **kw)
-        import os as __os
-        base = __os.path.basename(str(fname))
+        base = _os.path.basename(str(fname))
         print(f"__OGC_IMAGE__:{base}", flush=True)
     _plt.show = _auto_show
     _plt.savefig = _auto_savefig
@@ -1167,8 +1175,31 @@ app.delete('/chats/:id', requireAuth, (req, res) => {
   }
 });
 
+// ─── matplotlib生成画像の配信（認証必須） ───
+// uploadsとは別管理。LLMのファイル操作ツール（list_files/read_file/write_file）からは見えない。
+app.get('/plots/*', requireAuth, (req, res) => {
+  const relativePath = req.params[0];
+  const PLOTS_DIR = path.join(__dirname, 'public', 'plots');
+  // パストラバーサル防止
+  const abs = path.resolve(PLOTS_DIR, relativePath);
+  if (!abs.startsWith(PLOTS_DIR)) return res.status(400).json({ error: 'Invalid path' });
+  if (!fs.existsSync(abs)) return res.status(404).json({ error: 'Not found' });
+  const ext = path.extname(abs).toLowerCase();
+  const mimes = {
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+  };
+  res.setHeader('Content-Type', mimes[ext] || 'application/octet-stream');
+  res.setHeader('Cache-Control', 'private, max-age=300');
+  fs.createReadStream(abs).pipe(res);
+});
+
 // ─── 静的ファイル配信 ───
-app.use(express.static(path.join(__dirname, 'public')));
+// /plots/ は認証付きの専用ルート（上記）で処理するため、静的配信の対象外にする
+app.use((req, res, next) => {
+  if (req.path.startsWith('/plots/')) return next();
+  express.static(path.join(__dirname, 'public'))(req, res, next);
+});
 
 // ─── フォールバック ───
 app.get('*', (req, res) => {

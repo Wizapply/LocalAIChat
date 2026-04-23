@@ -2077,12 +2077,17 @@ window.runPython = function(codeId, btn) {
     }
     if (msg.type === 'image') {
       // Python matplotlib で生成された画像を表示
-      const url = '/files/' + encodeURIComponent(msg.filename) + '?t=' + Date.now();
+      // filename が "plots/xxx.png" なら /plots/xxx.png（自動生成画像）
+      // それ以外は /files/xxx.png（ユーザーが明示的にsavefigしたuploads配下）
+      const url = (msg.filename.startsWith('plots/')
+        ? '/' + msg.filename
+        : '/files/' + encodeURIComponent(msg.filename)) + '?t=' + Date.now();
+      const displayName = msg.filename.replace(/^plots\//, '');
       const imgHtml = '<div style="margin:8px 0;padding:8px;background:var(--bg-primary);border-radius:6px;">'
         + '<img src="' + url + '" style="max-width:100%;height:auto;display:block;cursor:zoom-in;border-radius:4px;" '
-        + 'onclick="window.open(this.src, \'_blank\')" alt="' + escapeHtml(msg.filename) + '">'
+        + 'onclick="window.open(this.src, \'_blank\')" alt="' + escapeHtml(displayName) + '">'
         + '<div style="display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--text-muted);margin-top:6px;gap:8px;">'
-        + '<span>📊 ' + escapeHtml(msg.filename) + '</span>'
+        + '<span>📊 ' + escapeHtml(displayName) + '</span>'
         + '<button onclick="window.attachImageToChat(\'' + escapeHtml(msg.filename) + '\')" '
         + 'style="background:var(--accent-dim);border:1px solid var(--accent);color:var(--accent);padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">'
         + '📎 チャットに添付</button>'
@@ -2558,6 +2563,21 @@ function App() {
       abortRef.current.abort();
       abortRef.current = null;
     }
+    // Ollama側も止める: 現在のモデルを強制アンロード (keep_alive: 0)
+    // これによりGPU上の生成処理が中断される
+    if (chatModel) {
+      fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: chatModel,
+          prompt: '',
+          keep_alive: 0,  // モデルをアンロード → 実行中の生成も止まる
+          stream: false
+        })
+      }).catch(() => {});
+    }
+    setIsLoading(false);
   }
 
   // ─── チャット送信 ───
@@ -3577,7 +3597,10 @@ function App() {
   useEffect(() => {
     window.attachImageToChat = async (filename) => {
       try {
-        const url = '/files/' + encodeURIComponent(filename);
+        // filename が "plots/xxx.png" なら /plots/xxx.png、それ以外は /files/xxx.png
+        const url = filename.startsWith('plots/')
+          ? '/' + filename
+          : '/files/' + encodeURIComponent(filename);
         const res = await fetch(url);
         if (!res.ok) {
           setError('画像取得失敗: ' + filename);
@@ -3589,9 +3612,10 @@ function App() {
         reader.onload = (e) => {
           const dataUrl = e.target.result;
           const base64 = dataUrl.split(',')[1];
+          const displayName = filename.replace(/^plots\//, '');
           setChatImagesRef.current?.(prev => [
             ...prev,
-            { name: filename, base64, preview: dataUrl }
+            { name: displayName, base64, preview: dataUrl }
           ]);
           // 入力欄付近にスクロール
           const inputEl = document.querySelector('.input-area, textarea');
