@@ -2728,7 +2728,10 @@ function App() {
         agentSystem += '\n\nPythonコード実行について:'
           + '\n- 応答に ```python ... ``` のコードブロックを含めると、ユーザー側で実行ボタンが表示されます。'
           + '\n- グラフ・図の作成依頼には matplotlib を使ったPythonコードを提示してください（matplotlib.use(\'Agg\')の指定は不要、plt.show()で自動的にチャットに画像表示されます）。'
-          + '\n- データ処理・計算・可視化の依頼では、迷わずPythonコードブロックを返してください。それだけで完結します。ツール呼び出しは不要です。';
+          + '\n- データ処理・計算・可視化の依頼では、迷わずPythonコードブロックを返してください。それだけで完結します。ツール呼び出しは不要です。'
+          + '\n- 大量データ・CSV/Parquet/JSON処理・複雑な集計には DuckDB を使ってください。SQLでpandasより高速かつメモリ効率良く処理できます。'
+          + '\n  使い方: import duckdb; con = duckdb.connect(); df = con.execute("SELECT ... FROM \'data.csv\'").df()'
+          + '\n  CSVやParquetを直接 FROM で参照可能。pandasのDataFrameもテーブルとして使えます（con.execute("SELECT ... FROM df")）。';
         agentSystem += '\n\n重要な指示:'
           + '\n- 内部的な推論・検索戦略・計画・メタ的な説明は一切出力しないでください。'
           + '\n- "I need to...", "The user wants...", "I should..." のような独り言を書かないでください。'
@@ -2773,7 +2776,7 @@ function App() {
               ? '\n- list_files/read_file/write_file: サーバーuploadsフォルダの操作（明確に「サーバーファイル」「uploadsに」と指示された場合のみ）'
               : '')
           + '\n注意: チャット添付ドキュメントとサーバーuploadsファイルは別物。ドキュメント関連は search_documents、サーバーファイル関連は list_files/read_file/write_file。'
-          + '\nグラフ・計算・データ処理はツール不要。```python ... ``` コードブロックを応答に含めれば自動実行されます（matplotlibで画像表示可能）。'
+          + '\nグラフ・計算・データ処理はツール不要。```python ... ``` コードブロックを応答に含めれば自動実行されます（matplotlibで画像表示、DuckDBで高速SQL処理可能）。'
           + '\n内部推論は書かず、ツールを呼ぶか直接短く応答するかのみ。';
 
         // 判断用のapiMessages（短縮版）— 直近の履歴だけ使う
@@ -4173,7 +4176,7 @@ function App() {
                   {msg.thinking && (
                     <ThinkingBlock
                       thinking={msg.thinking}
-                      isStreaming={isLoading && i === messages.length - 1 && !msg.content}
+                      isStreaming={isLoading && i === messages.length - 1}
                     />
                   )}
                   {(msg.searchQueries?.length > 0 || msg.agentStatus) && (
