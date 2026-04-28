@@ -727,6 +727,333 @@ isStreaming={isLoading && i === messages.length - 1}
 | `agentContext.largePredict` | number | 8192 | 長文応答のpredict |
 | `agentContext.judgeHistoryCount` | number | 3 | ツール判断時の履歴件数 |
 | `agentContext.largeGenKeywords` | array | null | 長文モードトリガーワード |
+| `systemPrompts.base` | string | (デフォルトプロンプト) | ベース指示文（{date}展開） |
+| `systemPrompts.documents` | string | (同上) | ドキュメント添付時追記（{docList}展開） |
+| `systemPrompts.webSearch` | string | (同上) | Web検索案内 |
+| `systemPrompts.fileAccess` | string | (同上) | サーバーファイル操作案内 |
+| `systemPrompts.python` | string | (同上) | Python実行案内 |
+| `systemPrompts.meta` | string | (同上) | メタ抑制指示 |
+| `systemPrompts.judge` | string | (同上) | ツール判断用プロンプト（{toolList}展開） |
+
+---
+
+## 🎨 システムプロンプトのカスタマイズ
+
+`config.json` の `systemPrompts` で全プロンプトを上書き可能。`loadConfig()` で **深いマージ** されるため、`systemPrompts` 内の特定キーだけを上書きしたい場合も部分的に書ける:
+
+```javascript
+function loadConfig() {
+  const merged = { ...DEFAULT_CONFIG, ...userConfig };
+  ['systemPrompts', 'agentContext', 'transcribe'].forEach(key => {
+    if (DEFAULT_CONFIG[key] && typeof DEFAULT_CONFIG[key] === 'object') {
+      merged[key] = { ...DEFAULT_CONFIG[key], ...(userConfig[key] || {}) };
+    }
+  });
+  return merged;
+}
+```
+
+### テンプレート変数
+
+フロント側で `fillTemplate(str, vars)` を使って展開する `{varname}` 形式の変数:
+
+| 変数 | 展開タイミング | 値 |
+|:--|:--|:--|
+| `{date}` | `base` プロンプト | "2026年4月25日" 形式 |
+| `{docList}` | `documents` プロンプト | "file1.csv, file2.pdf" |
+| `{toolList}` | `judge` プロンプト | 動的生成された箇条書きのツール一覧 |
+
+### 組み立てロジック（フロント側）
+
+```javascript
+const sp = appConfig.systemPrompts || {};
+const fillTemplate = (str, vars) =>
+  (str || '').replace(/\{(\w+)\}/g, (_, k) => vars[k] != null ? vars[k] : '');
+
+let agentSystem = fillTemplate(sp.base, { date: dateStr });
+if (documents.length > 0 && sp.documents) {
+  agentSystem += '\n\n' + fillTemplate(sp.documents, { docList });
+}
+if (appConfig.webSearch && sp.webSearch) agentSystem += '\n\n' + sp.webSearch;
+if (appConfig.fileAccess && sp.fileAccess) agentSystem += '\n\n' + sp.fileAccess;
+if (sp.python) agentSystem += '\n\n' + sp.python;
+if (sp.meta) agentSystem += '\n\n' + sp.meta;
+```
+
+ドキュメントなし、Web検索OFF、ファイルアクセスOFFのときは、対応する追記がスキップされる。
+
+### `judge` プロンプトの `{toolList}` 動的構築
+
+```javascript
+const toolListLines = [];
+if (documents.length > 0) toolListLines.push('- search_documents: ...');
+if (appConfig.webSearch) toolListLines.push('- web_search: ...');
+if (appConfig.fileAccess) toolListLines.push('- list_files/read_file/write_file: ...');
+const judgeSystem = fillTemplate(sp.judge, { toolList: toolListLines.join('\n') });
+```
+
+これにより、無効化された機能のツール案内を出さない（LLMが存在しないツールを呼ばないように）。
+
+---
+
+## 📐 履歴の重み付け（直近優先）
+
+長い会話で「最新質問に集中させる」ためのプロンプト整形:
+
+```
+[system] あなたは親切なアシスタント...                  ← ベースsystem
+[system] 【参考: 過去の会話履歴 (4件)】                  ← 古いメッセージは
+        以下は背景情報です。最新の質問への回答に           圧縮要約として
+        直接関連する場合のみ参照してください。              system扱い
+        [ユーザー] こんにちは
+        [アシスタント] こんにちは...
+[user] CSVを処理したい                                   ← 直近6件は
+[assistant] DuckDB を使うと...                            そのまま
+[user] グラフにできる?
+[assistant] matplotlibで...
+[user] 【今この質問に回答してください】                   ← 最新質問は
+       seabornでもできますか?                              強調マーカー
+```
+
+### 構築ロジック
+
+```javascript
+const RECENT_COUNT = appConfig.recentMessageCount || 6;
+const recentSlice = allMessages.slice(-20);
+const splitIdx = Math.max(0, recentSlice.length - RECENT_COUNT);
+const oldMessages = recentSlice.slice(0, splitIdx);
+const recentMessages = recentSlice.slice(splitIdx);
+
+if (oldMessages.length > 0) {
+  // 各500文字に圧縮、システムロールで「参考情報」として包む
+  const summary = oldMessages.map(m => `[${role}] ${m.content.slice(0, 500)}`).join('\n\n');
+  history.push({ role: 'system', content: `【参考: 過去の会話履歴】\n${summary}` });
+}
+
+recentMessages.forEach((m, i) => {
+  const isLast = i === recentMessages.length - 1;
+  const h = { role: m.role, content: m.content };
+  if (isLast && m.role === 'user') {
+    h.content = `【今この質問に回答してください】\n${m.content}`;
+  }
+  history.push(h);
+});
+```
+
+### 効果
+
+| 項目 | 効果 |
+|:--|:--|
+| 古い会話の引きずり防止 | 「参考情報」と明示することでLLMの注意度を下げる |
+| 最新質問への集中 | マーカー追加で確実にフォーカス誘導 |
+| コンテキスト圧迫軽減 | 古いメッセージは500文字に圧縮 |
+
+`config.recentMessageCount` で調整可能（3〜20、デフォルト6）。
+
+---
+
+## 🌐 Web検索ON/OFFトグル
+
+### 状態管理
+
+`webSearchEnabled` Reactステートで管理。初期値は `appConfig.webSearch` を反映:
+
+```javascript
+const [webSearchEnabled, setWebSearchEnabled] = useState(true);
+
+useEffect(() => {
+  // /config 取得後、デフォルト値を反映
+  setWebSearchEnabled(cfg.webSearch !== false);
+}, []);
+```
+
+### 判定の二段構え
+
+```javascript
+const webSearchActive = appConfig.webSearch !== false && webSearchEnabled;
+```
+
+- `appConfig.webSearch === false` → トグル自体が表示されない（管理者が完全無効化）
+- `appConfig.webSearch === true` + トグルON → 利用可能
+- `appConfig.webSearch === true` + トグルOFF → 一時無効
+
+### UI
+
+`.toolbar-btn.web-search-toggle.active` でアクセントカラー強調、非active時は不透明度0.4。
+
+---
+
+## 🎯 ドラッグ&ドロップ統合
+
+3つのドロップゾーンが用途で振り分け:
+
+| ゾーン | クラス | ハンドラ | 動作 |
+|:--|:--|:--|:--|
+| ドキュメントリスト（左） | `.docs-list.drag-active` | `handleDrop` | 全ファイルをRAG用ドキュメントに取り込み |
+| チャット入力欄 | `.input-area.drag-active` | `handleChatDrop` | 画像→Vision添付、その他→ドキュメント |
+| サーバーファイル（右） | `.files-panel-body.drag-active` | `handleServerDrop` | 全ファイルを `public/uploads/` にアップロード |
+
+### handleChatDrop の振り分けロジック
+
+```javascript
+async function handleChatDrop(e) {
+  const files = Array.from(e.dataTransfer.files);
+  const images = files.filter(f => f.type.startsWith('image/'));
+  const others = files.filter(f => !f.type.startsWith('image/'));
+
+  // 画像 → チャット添付（base64化）
+  for (const file of images) {
+    const dataUrl = await readAsDataURL(file);
+    const base64 = dataUrl.split(',')[1];
+    setChatImages(prev => [...prev, { name, base64, preview: dataUrl }]);
+  }
+
+  // その他 → RAG用ドキュメント
+  if (others.length > 0) handleFiles(others);
+}
+```
+
+### dragLeave の誤発火防止
+
+```javascript
+onDragLeave={e => {
+  // 子要素に入ったときのdragLeaveは無視
+  if (e.currentTarget.contains(e.relatedTarget)) return;
+  setDragActive(false);
+}}
+```
+
+子要素を跨ぐとイベントが発火するため、`relatedTarget` で判定。
+
+---
+
+## 📦 バイナリファイルのアップロード/ダウンロード
+
+### 問題
+
+旧実装は `file.text()` でUTF-8テキストとして読み込んで JSON送信していたため、PNG等のバイナリが破損（先頭バイト `\x89` が `\xef\xbf\xbd` U+FFFDに置換される）。
+
+### 解決: クライアント側
+
+拡張子・MIMEタイプで分岐し、バイナリは FormData送信:
+
+```javascript
+const binaryExts = ['png', 'jpg', 'pdf', 'zip', ...];
+const isBinary = binaryExts.includes(ext) || !file.type.startsWith('text/');
+
+if (isBinary) {
+  const fd = new FormData();
+  fd.append('file', file);
+  await fetch(`/files/${name}`, { method: 'POST', body: fd });
+} else {
+  const text = await file.text();
+  await fetch(`/files/${name}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content: text }),
+  });
+}
+```
+
+### 解決: サーバー側
+
+依存追加なしの最小multipartパーサー:
+
+```javascript
+function parseMultipart(req) {
+  // boundaryをContent-Typeから抽出
+  // \r\n\r\n でヘッダーとファイル本体を分離
+  // \r\n--boundary で末尾を切る
+  // → fileBuf を返す
+}
+
+app.post('/files/*', requireAuth, async (req, res) => {
+  if (req.headers['content-type'].startsWith('multipart/form-data')) {
+    const fileBuf = await parseMultipart(req);
+    fs.writeFileSync(abs, fileBuf);  // バイナリ書き込み
+  } else {
+    jsonParser(req, res, () => {
+      fs.writeFileSync(abs, content, 'utf-8');  // テキスト書き込み
+    });
+  }
+});
+```
+
+### ダウンロード側もContent-Type分岐
+
+```javascript
+const ct = res.headers.get('Content-Type');
+let blob;
+if (ct.startsWith('application/json')) {
+  // テキスト: { content: "..." } をパース
+  const data = await res.json();
+  blob = new Blob([data.content], { type: 'text/plain' });
+} else {
+  // バイナリ: そのまま blob で取得
+  blob = await res.blob();
+}
+```
+
+---
+
+## 📱 モバイル対応
+
+### 100dvh + safe-area
+
+`100vh` はモバイルブラウザのアドレスバー込みの高さで、下部が見切れる。`100dvh`（dynamic viewport height）に変更:
+
+```css
+body, .app-layout, .chat-area {
+  height: 100vh;     /* フォールバック */
+  height: 100dvh;    /* 動的高さ */
+}
+
+.input-area {
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 12px);
+}
+```
+
+`<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">` でセーフエリア対応。
+
+### 2行ヘッダー（≤768px）
+
+```css
+@media (max-width: 768px) {
+  .chat-header {
+    flex-direction: column;       /* 縦に並べる */
+    align-items: stretch;
+  }
+  .chat-header-left {
+    width: 100%;                  /* 上段: メニュー+ステータス+タイトル */
+  }
+  .chat-header-right {
+    width: 100%;
+    justify-content: flex-end;     /* 下段: アクションボタンを右寄せ */
+    flex-wrap: wrap;
+  }
+}
+```
+
+### iOS自動ズーム抑制
+
+```css
+.input-box {
+  font-size: 16px;  /* 16px未満だとフォーカス時に自動ズームする */
+}
+```
+
+### サイドバー: ドロワー化
+
+```css
+.sidebar {
+  position: fixed;
+  transform: translateX(-100%);
+  transition: transform 0.3s;
+}
+.sidebar.open {
+  transform: translateX(0);
+}
+```
 
 ---
 
@@ -764,3 +1091,18 @@ isStreaming={isLoading && i === messages.length - 1}
 
 11. **LLMにはツールだけでなくPython実行機能も明示する**
     システムプロンプトに「グラフや計算はPythonコードブロックで返せば自動実行される」と書かないと、ツールしか選択肢がないと思い込んで思考ループに陥る。
+
+12. **`file.text()` でバイナリを読まない**
+    UTF-8として解釈不能なバイト（PNGの `\x89` 等）が U+FFFD（`\xef\xbf\xbd`）に置換され、ファイルが破損する。バイナリは必ず FormData / Blob 経由で扱う。
+
+13. **`100vh` はモバイルで見切れる**
+    アドレスバーの分が含まれて画面下が隠れるため、`100dvh` を使用。フォールバックで `100vh` も併記する。
+
+14. **dragLeave は子要素遷移でも発火する**
+    `e.currentTarget.contains(e.relatedTarget)` で子に入った場合を除外しないと、ドラッグ中にドロップゾーンのハイライトがチカチカする。
+
+15. **ツール判断時は `think: false` で高速化**
+    Ollamaの新オプション。対応モデル（Qwen3, gpt-oss等）でのみ効果あり。非対応モデルは無視されるだけなので副作用なし。最終応答時は通常通り思考有効。
+
+16. **`/api/*` にPOSTする時の content-type 競合**
+    `/files/*` は multipart と JSON の両方を受けるため、`jsonParser` をミドルウェア配列ではなくハンドラ内で条件付きで呼ぶ必要がある。

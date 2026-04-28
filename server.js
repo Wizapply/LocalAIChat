@@ -39,8 +39,25 @@ const DEFAULT_CONFIG = {
   },
   ollamaBackends: [],
   webSearch: true,
+  fileAccess: true,
   ragTopK: 10,
   ragMode: 'agentic',
+  systemPrompts: {
+    // ベース: すべてのチャットに共通する土台。{date}は実行時に展開される
+    base: 'あなたは親切で知識豊富なAIアシスタントです。日本語で簡潔に回答してください。今日の日付は{date}です。\n\n重要な指示:\n- 思考は手短に済ませ、ユーザーへの回答を必ず出力してください。\n- ツールから取得した情報は信頼し、そのまま使ってください（妥当性を過度に疑わないこと）。\n- 日付に関する自己矛盾を感じても、与えられた{date}を真として処理してください。過去の学習データとの整合性を気にする必要はありません。\n- 天気・ニュース・株価など現在情報は、ツールの結果をそのまま引用してください。',
+    // ドキュメントが添付されている時の追記。{docList}=ファイル名カンマ区切り
+    documents: '【参照可能なドキュメント】(チャットに添付されたファイル): {docList}\nユーザーの質問が「ドキュメントについて」「資料を見て」「添付ファイル」などを示唆する場合、必ず最初に search_documents ツールを使ってください。\nこれらは添付ドキュメントであり、サーバーファイル（uploads配下）とは別物です。',
+    // Web検索が有効な時の追記
+    webSearch: '最新の情報や知らないことについては web_search ツールでインターネット検索できます。',
+    // ファイルアクセスが有効な時の追記
+    fileAccess: '【サーバーファイル操作】(uploads配下、ドキュメントとは別物)\n- list_files: uploadsフォルダの一覧を取得\n- read_file(path): uploadsフォルダのファイル読み込み\n- write_file(path, content): uploadsフォルダにファイル書き込み\n重要: pathには"uploads/"プレフィックスを付けずにファイル名のみを指定してください（例: "hello.py"、"data/config.json"）。\nユーザーが明確に「サーバーファイル」「uploadsフォルダ」「ファイルを保存して」など、サーバー側のファイルシステム操作を依頼した場合のみ使用してください。\nチャットに添付されたドキュメントについての質問では list_files/read_file/write_file は使わず、search_documents を使ってください。',
+    // Python実行案内（常時）
+    python: 'Pythonコード実行について:\n- 応答に ```python ... ``` のコードブロックを含めると、ユーザー側で実行ボタンが表示されます。\n- グラフ・図の作成依頼には matplotlib を使ったPythonコードを提示してください（matplotlib.use(\'Agg\')の指定は不要、plt.show()で自動的にチャットに画像表示されます）。\n- データ処理・計算・可視化の依頼では、迷わずPythonコードブロックを返してください。それだけで完結します。ツール呼び出しは不要です。\n- 大量データ・CSV/Parquet/JSON処理・複雑な集計には DuckDB を使ってください。SQLでpandasより高速かつメモリ効率良く処理できます。\n  使い方: import duckdb; con = duckdb.connect(); df = con.execute("SELECT ... FROM \'data.csv\'").df()\n  CSVやParquetを直接 FROM で参照可能。pandasのDataFrameもテーブルとして使えます（con.execute("SELECT ... FROM df")）。',
+    // 重要な指示（メタ抑制、常時）
+    meta: '重要な指示:\n- 内部的な推論・検索戦略・計画・メタ的な説明は一切出力しないでください。\n- "I need to...", "The user wants...", "I should..." のような独り言を書かないでください。\n- ツールを呼び出すと決めたら、即座にツールを呼び出してください。テキスト応答と併用しないでください。\n- 検索結果が得られなかった場合は、その旨を簡潔に伝え、自分の知識で回答してください。',
+    // ツール判断専用の軽量プロンプト（{docList}, {hasDocs}, {hasWebSearch}, {hasFileAccess}が使える）
+    judge: '以下の中から必要なツールを呼び出してください。通常の質問に答えられる場合はツールを使わずそのまま応答してください。\n{toolList}\n注意: チャット添付ドキュメントとサーバーuploadsファイルは別物。ドキュメント関連は search_documents、サーバーファイル関連は list_files/read_file/write_file。\nグラフ・計算・データ処理はツール不要。```python ... ``` コードブロックを応答に含めれば自動実行されます（matplotlibで画像表示、DuckDBで高速SQL処理可能）。\n内部推論は書かず、ツールを呼ぶか直接短く応答するかのみ。',
+  },
   agentContext: {
     smallCtx: 2048,
     mediumCtx: 8192,
@@ -51,6 +68,7 @@ const DEFAULT_CONFIG = {
     largeGenKeywords: null,
   },
   tokenAvgWindow: 2000,
+  recentMessageCount: 6,  // 直近N件をそのまま送信、それ以前は「参考情報」として要約圧縮
   topK: 40,
   topP: 0.9,
   temperature: 0.7,
@@ -58,7 +76,15 @@ const DEFAULT_CONFIG = {
 function loadConfig() {
   try {
     if (fs.existsSync(CONFIG_FILE)) {
-      return { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')) };
+      const userConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
+      // ネストされたオブジェクト(systemPrompts, agentContext, transcribe)は深いマージ
+      const merged = { ...DEFAULT_CONFIG, ...userConfig };
+      ['systemPrompts', 'agentContext', 'transcribe'].forEach(key => {
+        if (DEFAULT_CONFIG[key] && typeof DEFAULT_CONFIG[key] === 'object') {
+          merged[key] = { ...DEFAULT_CONFIG[key], ...(userConfig[key] || {}) };
+        }
+      });
+      return merged;
     }
   } catch {}
   return { ...DEFAULT_CONFIG };
@@ -1029,23 +1055,85 @@ app.get('/files/*', requireAuth, (req, res) => {
 });
 
 // ファイル書き込み（新規 or 上書き）
-app.post('/files/*', requireAuth, jsonParser, (req, res) => {
+// バイナリファイルのアップロード（multipart/form-data）パーサー
+// 単一ファイル想定、依存を増やさない最小実装
+function parseMultipart(req) {
+  return new Promise((resolve, reject) => {
+    const ct = req.headers['content-type'] || '';
+    const m = ct.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+    if (!m) return reject(new Error('No boundary in Content-Type'));
+    const boundary = m[1] || m[2];
+    const chunks = [];
+    let total = 0;
+    req.on('data', (c) => {
+      total += c.length;
+      if (total > MAX_FILE_SIZE + 4096) { // 余裕分のmultipartヘッダ用
+        req.destroy();
+        return reject(new Error('File too large'));
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      try {
+        const buf = Buffer.concat(chunks);
+        const boundaryBuf = Buffer.from('--' + boundary);
+        const headerSepBuf = Buffer.from('\r\n\r\n');
+        // 最初のboundaryを探す
+        let start = buf.indexOf(boundaryBuf);
+        if (start < 0) return reject(new Error('Boundary not found'));
+        start += boundaryBuf.length + 2; // skip CRLF
+        const headerEnd = buf.indexOf(headerSepBuf, start);
+        if (headerEnd < 0) return reject(new Error('Headers not found'));
+        const contentStart = headerEnd + headerSepBuf.length;
+        // 終端: \r\n--boundary
+        const endBoundary = buf.indexOf(Buffer.from('\r\n--' + boundary), contentStart);
+        if (endBoundary < 0) return reject(new Error('End boundary not found'));
+        const fileBuf = buf.slice(contentStart, endBoundary);
+        resolve(fileBuf);
+      } catch (e) { reject(e); }
+    });
+    req.on('error', reject);
+  });
+}
+
+app.post('/files/*', requireAuth, async (req, res, next) => {
   const ip = getIP(req);
   const relativePath = req.params[0];
   const abs = safeUploadPath(relativePath);
   if (!abs) return res.status(400).json({ error: 'Invalid path' });
-  const { content } = req.body || {};
-  if (typeof content !== 'string') return res.status(400).json({ error: 'content required (string)' });
-  const size = Buffer.byteLength(content, 'utf-8');
-  if (size > MAX_FILE_SIZE) return res.status(413).json({ error: `File too large (${size} bytes, max ${MAX_FILE_SIZE})` });
-  try {
-    fs.mkdirSync(path.dirname(abs), { recursive: true });
-    fs.writeFileSync(abs, content, 'utf-8');
-    log(ip, `FILE WRITE ${relativePath} (${size} bytes)`);
-    res.json({ ok: true, path: relativePath, size });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  const ct = req.headers['content-type'] || '';
+
+  // multipart/form-data（バイナリファイル）
+  if (ct.startsWith('multipart/form-data')) {
+    try {
+      const fileBuf = await parseMultipart(req);
+      if (fileBuf.length > MAX_FILE_SIZE) {
+        return res.status(413).json({ error: `File too large (${fileBuf.length} bytes)` });
+      }
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, fileBuf);
+      log(ip, `FILE WRITE ${relativePath} (${fileBuf.length} bytes, binary)`);
+      return res.json({ ok: true, path: relativePath, size: fileBuf.length });
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
   }
+
+  // application/json（テキストファイル、従来動作）
+  jsonParser(req, res, () => {
+    const { content } = req.body || {};
+    if (typeof content !== 'string') return res.status(400).json({ error: 'content required (string)' });
+    const size = Buffer.byteLength(content, 'utf-8');
+    if (size > MAX_FILE_SIZE) return res.status(413).json({ error: `File too large (${size} bytes, max ${MAX_FILE_SIZE})` });
+    try {
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, content, 'utf-8');
+      log(ip, `FILE WRITE ${relativePath} (${size} bytes)`);
+      res.json({ ok: true, path: relativePath, size });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
 });
 
 // ファイル削除
