@@ -149,8 +149,8 @@ OSError: google/gemma-4-E2B-it does not appear to be a valid repository
 torch.cuda.OutOfMemoryError
 ```
 
-→ Ollamaが大きなモデルを常駐させている場合があります。以下を試してください:
-- Ollama側で `OLLAMA_KEEP_ALIVE=0` 環境変数を設定してモデルを即座にアンロード
+→ llama-serverが大きなモデルを常駐させている場合があります。以下を試してください:
+- `config.json` に `"llamaServer": { "idleUnloadMs": 600000 }` を設定してアイドル時に自動アンロード
 - より小さいチャットモデルを使う
 - CPUに移行: `TRANSCRIBE_DEVICE=cpu python3 transcribe-server.py`（ただし遅い）
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WIZAPPLY AI CHAT — パスワードハッシュ生成ツール
+OpenGeekLLMChat — パスワードハッシュ生成ツール
 
 使い方:
   python3 hashpass.py

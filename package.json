@@ -1,13 +1,13 @@
 {
   "name": "opengeek-llm-chat",
   "version": "1.0.0",
-  "description": "OpenGeekLLMChat - A geek-oriented browser-based chat app for local LLMs (Ollama)",
+  "description": "OpenGeekLLMChat - A geek-oriented browser-based chat app for local LLMs (llama.cpp backend)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
-  "keywords": ["ollama", "rag", "chat", "llm", "ai", "gpu-monitor", "agentic", "local-llm", "self-hosted"],
+  "keywords": ["llama.cpp", "rag", "chat", "llm", "ai", "gpu-monitor", "agentic", "local-llm", "self-hosted", "vision"],
   "license": "MIT",
   "repository": {
     "type": "git",

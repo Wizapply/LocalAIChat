@@ -104,6 +104,29 @@
     text-transform: uppercase; letter-spacing: 0.06em;
   }
 
+  .setting-locked-hint {
+    margin-left: 6px;
+    font-size: 11px;
+    cursor: help;
+    opacity: 0.8;
+  }
+
+  .setting-input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .setting-readonly {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px 12px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    cursor: help;
+  }
+
   .setting-input {
     background: var(--bg-tertiary);
     border: 1px solid var(--border);
@@ -1937,6 +1960,38 @@
     animation: fadeIn 0.3s ease;
   }
 
+  .loading-toast {
+    position: fixed;
+    bottom: 80px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(251, 146, 60, 0.12);
+    border: 1px solid #fb923c;
+    color: #fb923c;
+    padding: 10px 20px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    z-index: 100;
+    animation: fadeIn 0.3s ease;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .loading-toast::before {
+    content: '';
+    width: 12px;
+    height: 12px;
+    border: 2px solid #fb923c;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
   /* ── Mobile Menu Button ── */
   .menu-btn {
     display: none;
@@ -2593,17 +2648,13 @@ function App() {
     welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
     accentColor: '#34d399',
     defaultModel: '',
-    embedModel: 'mxbai-embed-large:latest',
     webSearch: true,
     ragTopK: 10,
     ragMode: 'agentic',
     agentContext: {
-      smallCtx: 2048,
-      mediumCtx: 8192,
       smallPredict: 512,
       largePredict: 8192,
-      smallThreshold: 2000,
-      mediumThreshold: 8000,
+      judgeHistoryCount: 3,
     },
     tokenAvgWindow: 2000,
     topK: 40,
@@ -2612,21 +2663,28 @@ function App() {
     transcribe: { enabled: false },
   });
 
-  // ─── Ollama接続先（変更する場合はここを編集）───
-  const [ollamaUrl] = useState('');
+  // チャット用モデル選択（chatModelsから選ぶ）
   const [chatModel, setChatModel] = useState('');
-  const embedModel = appConfig.embedModel || 'mxbai-embed-large:latest';
   const [availableModels, setAvailableModels] = useState([]);
+  const [availableModelsInfo, setAvailableModelsInfo] = useState([]); // [{name, ctx, ngl, loaded}]
   const [connected, setConnected] = useState(false);
+  const [modelReady, setModelReady] = useState(false);  // チャットモデルが利用可能か（current && !starting）
+  const [modelStarting, setModelStarting] = useState(false);  // モデル起動中
+  const [autoUnloadedName, setAutoUnloadedName] = useState(null);  // アイドルアンロード中のモデル名
+  const [firstLoadPending, setFirstLoadPending] = useState(false);  // 起動後の初回ロード待ち
 
   const [documents, setDocuments] = useState([]); // { name, text, chunks, embeddings }
   const ragEnabled = true; // RAGはドキュメントがあれば常に有効
-  const [numCtx, setNumCtx] = useState(32768);
+  // 現在ロード中のチャットモデルのコンテキストサイズ（config.json由来、読み取り専用）
+  const [currentModelCtx, setCurrentModelCtx] = useState(0);
+  // numCtxはトークン使用率(◯/32K)の表示用。currentModelCtxと連動する
+  const numCtx = currentModelCtx || 32768;
 
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+  const [loadingMessage, setLoadingMessage] = useState('');  // モデルロード等の進行表示（オレンジ）
   const [dragActive, setDragActive] = useState(false);  // ドキュメントリストD&D
   const [chatDragActive, setChatDragActive] = useState(false);  // チャット欄D&D
   const [serverDragActive, setServerDragActive] = useState(false);  // サーバーファイルD&D
@@ -2661,28 +2719,61 @@ function App() {
   // ─── モデル一覧取得 ───
   const fetchModels = useCallback(async () => {
     try {
-      const res = await fetch(`${ollamaUrl}/api/tags`);
+      // llama.cppバックエンド: 独自エンドポイント /models から取得
+      const res = await fetch('/models');
       if (!res.ok) throw new Error();
       const data = await res.json();
-      const allNames = (data.models || []).map(m => m.name);
-      // Embedding系モデルをチャット選択肢から除外
-      const embedPatterns = /embed|embedding|nomic-embed|mxbai-embed|bge-|e5-|gte-/i;
-      const currentEmbedModel = (appConfig.embedModel || '').toLowerCase();
-      const names = allNames.filter(n =>
-        n.toLowerCase() !== currentEmbedModel && !embedPatterns.test(n)
-      );
+      const names = (data.models || []).map(m => m.name);
       setAvailableModels(names);
+      setAvailableModelsInfo(data.models || []);
       setConnected(true);
-      if (!chatModel && names.length > 0) setChatModel(names[0]);
+      // モデル起動状態を更新
+      // modelStarting: 実際にllama-server起動中（chatProcStarting=true）
+      // modelReady: ロード完了（current あり、起動中でない、アンロード状態でない）
+      setModelStarting(!!data.starting);
+      setModelReady(!!data.current && !data.starting && !data.autoUnloaded);
+      setAutoUnloadedName(data.autoUnloaded || null);
+      setFirstLoadPending(!!data.firstLoadPending);
+      // 現在ロード中モデルのctxを反映（読み取り専用）
+      const loaded = (data.models || []).find(m => m.loaded);
+      if (loaded && loaded.ctx) {
+        setCurrentModelCtx(loaded.ctx);
+      } else if (data.current) {
+        // currentがあるがloadedフラグが立っていないケース
+        const m = (data.models || []).find(mm => mm.name === data.current);
+        if (m && m.ctx) setCurrentModelCtx(m.ctx);
+      }
+      // 現在ロード中モデルを自動選択（指定がなければ）
+      // 優先: 1) ロード中(current), 2) 自動アンロード状態(autoUnloaded=前回モデル), 3) 一覧先頭
+      if (!chatModel) {
+        if (data.current) setChatModel(data.current);
+        else if (data.autoUnloaded) setChatModel(data.autoUnloaded);
+        else if (names.length > 0) setChatModel(names[0]);
+      }
     } catch {
       setConnected(false);
       setAvailableModels([]);
+      setModelReady(false);
+      setModelStarting(false);
     }
-  }, [ollamaUrl, appConfig.embedModel]);
+  }, []);
 
   useEffect(() => {
-    if (authenticated) fetchModels();
-  }, [authenticated, fetchModels]);
+    if (!authenticated) return;
+    fetchModels();
+    // 高頻度ポーリング: 接続不良 or 実際のモデル起動中なら3秒ごと
+    // 低頻度ポーリング: 通常時も状態変化検出のため15秒ごと
+    const intervalId = setInterval(() => {
+      if (!connected || modelStarting) fetchModels();
+    }, 3000);
+    const slowIntervalId = setInterval(() => {
+      if (connected && !modelStarting) fetchModels();
+    }, 15000);
+    return () => {
+      clearInterval(intervalId);
+      clearInterval(slowIntervalId);
+    };
+  }, [authenticated, fetchModels, connected, modelStarting]);
 
   // ─── GPU 監視 (SSE) ───
   useEffect(() => {
@@ -2695,16 +2786,17 @@ function App() {
     return () => evtSource.close();
   }, [authenticated]);
 
-  // ─── Embedding取得 ───
+  // ─── Embedding取得（llama-server OpenAI互換 /v1/embeddings） ───
   async function getEmbedding(text) {
-    const res = await fetch(`${ollamaUrl}/api/embed`, {
+    const res = await fetch('/embed/v1/embeddings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: embedModel, input: text }),
+      body: JSON.stringify({ model: 'embedding', input: text }),
     });
-    if (!res.ok) throw new Error('Embedding取得に失敗しました');
+    if (!res.ok) throw new Error('Embedding取得に失敗しました（embeddingサーバー未起動の可能性）');
     const data = await res.json();
-    return data.embeddings?.[0] || data.embedding;
+    // OpenAI互換: { data: [{ embedding: [...] }] }
+    return data.data?.[0]?.embedding;
   }
 
   // ─── ドキュメント追加 ───
@@ -2756,20 +2848,8 @@ function App() {
       abortRef.current.abort();
       abortRef.current = null;
     }
-    // Ollama側も止める: 現在のモデルを強制アンロード (keep_alive: 0)
-    // これによりGPU上の生成処理が中断される
-    if (chatModel) {
-      fetch('/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: chatModel,
-          prompt: '',
-          keep_alive: 0,  // モデルをアンロード → 実行中の生成も止まる
-          stream: false
-        })
-      }).catch(() => {});
-    }
+    // llama-server: HTTPストリーム切断でリクエストはキャンセルされる。
+    // GPU使用率は生成中だったスロット分は次のサンプリング後に解放される。
     setIsLoading(false);
   }
 
@@ -2778,6 +2858,82 @@ function App() {
     const text = input.trim();
     const hasImages = chatImages.length > 0;
     if ((!text && !hasImages) || isLoading || !chatModel) return;
+
+    // モデル未ロード時は送信できない（ただし firstLoadPending = 初回ロード待ち、または autoUnloadedName = アイドルアンロード状態 は送信時にロードするのでOK）
+    if (!modelReady && !firstLoadPending && !autoUnloadedName) {
+      setError(modelStarting
+        ? 'モデルを起動中です。完了までお待ちください...'
+        : 'モデルがロードされていません。しばらくお待ちください...');
+      return;
+    }
+
+    // Embedding処理中（ドキュメントの埋め込み生成中）は送信を待たせる
+    // 並行リクエストでllama-serverが詰まるのを防ぐ
+    if (embeddingJobs.length > 0) {
+      setError('ドキュメントのEmbedding生成中です。完了までお待ちください...');
+      return;
+    }
+
+    // 送信直前に /models で最新状態を確認（アイドルアンロード後の競合回避）
+    try {
+      const mres = await fetch('/models');
+      if (mres.ok) {
+        const mdata = await mres.json();
+        // アンロード状態 or 起動中なら、ロード完了を待ってから送信続行
+        if (!mdata.current || mdata.starting || mdata.autoUnloaded) {
+          setModelReady(false);
+
+          // 自動アンロードからの復帰: ダミーリクエストで再ロード開始
+          if (mdata.autoUnloaded) {
+            const isFirst = mdata.firstLoadPending;
+            console.log(`[${isFirst ? '初回ロード' : 'アイドル復帰'}] モデル「${mdata.autoUnloaded}」のロードを開始`);
+            setLoadingMessage(isFirst
+              ? `モデル「${mdata.autoUnloaded}」をロード中`
+              : `モデル「${mdata.autoUnloaded}」を再ロード中`);
+            // 503を期待しつつヘルスチェック的に叩いて再ロードトリガー
+            fetch('/v1/chat/completions', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model: chatModel, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, stream: false }),
+            }).catch(() => {});
+          } else if (mdata.starting) {
+            setLoadingMessage(`モデルを起動中`);
+          } else {
+            setLoadingMessage(`モデルをロード中`);
+          }
+
+          // ロード完了をポーリングで待機（最大2分）
+          const maxWaitMs = 120000;
+          const startWait = Date.now();
+          let ready = false;
+          while (Date.now() - startWait < maxWaitMs) {
+            await new Promise(r => setTimeout(r, 2000));
+            try {
+              const pres = await fetch('/models');
+              if (!pres.ok) continue;
+              const pdata = await pres.json();
+              if (pdata.current && !pdata.starting && !pdata.autoUnloaded) {
+                ready = true;
+                setModelReady(true);
+                setModelStarting(false);
+                setAutoUnloadedName(null);
+                setLoadingMessage('');
+                break;
+              }
+            } catch {}
+          }
+          if (!ready) {
+            setError('モデルのロードがタイムアウトしました。しばらくしてから再度送信してください。');
+            setLoadingMessage('');
+            return;
+          }
+          // ロード完了 → 続けて送信処理を実行
+          console.log('[アイドル復帰] ロード完了、送信処理を続行');
+        }
+      }
+    } catch (e) {
+      console.warn('モデル状態確認エラー:', e);
+    }
 
     // 録音中なら停止（送信テキストが確定したので）
     if (isRecording) stopRecording();
@@ -2835,17 +2991,38 @@ function App() {
       // 直近メッセージはそのまま、ただし最後のユーザー質問は強調
       recentMessages.forEach((m, i) => {
         const isLast = i === recentMessages.length - 1;
-        const h = { role: m.role, content: m.content };
-        if (m.images && m.images.length > 0) {
-          h.images = m.images.map(img => img.base64);
+        const hasImages = m.images && m.images.length > 0;
+        let textContent = m.content || '';
+        if (isLast && m.role === 'user' && textContent) {
+          textContent = `【今この質問に回答してください】\n${textContent}`;
         }
-        // 最後のユーザー質問のみ「今これに答えて」と明示的にラップ
-        if (isLast && m.role === 'user' && m.content) {
-          h.content = `【今この質問に回答してください】\n${m.content}`;
+
+        const h = { role: m.role };
+        if (hasImages) {
+          // OpenAI互換 (llama-server): content配列で text + image_url を送る
+          h.content = [];
+          if (textContent) h.content.push({ type: 'text', text: textContent });
+          for (const img of m.images) {
+            // base64がdata URI形式(data:image/png;base64,...)を含むかチェックして整形
+            const dataUrl = img.base64.startsWith('data:')
+              ? img.base64
+              : `data:image/png;base64,${img.base64}`;
+            h.content.push({ type: 'image_url', image_url: { url: dataUrl } });
+          }
+        } else {
+          h.content = textContent;
         }
         history.push(h);
       });
-      const ollamaOptions = { num_ctx: numCtx, top_k: appConfig.topK, top_p: appConfig.topP, temperature: appConfig.temperature };
+      // OpenAI互換パラメータ（llama-server）
+      // num_ctxはサーバー起動時に固定されるためリクエスト時は不要
+      const llamaCommonOptions = {
+        top_k: appConfig.topK,
+        top_p: appConfig.topP,
+        temperature: appConfig.temperature,
+        // llama.cpp拡張: cache_promptで高速化
+        cache_prompt: true,
+      };
 
       // Web検索が利用可能か: configで許可されており、かつチャット欄でONになっている
       const webSearchActive = appConfig.webSearch !== false && webSearchEnabled;
@@ -2967,8 +3144,7 @@ function App() {
           // 英語
           'write ', 'save ', 'create file', 'generate ', 'write_file', 'write to',
         ];
-        const smallCtx = agentCtx.smallCtx ?? 2048;
-        const mediumCtx = agentCtx.mediumCtx ?? 8192;
+        // llama.cppではctxはサーバー起動時固定なので、predictのみ動的調整
         const smallPredict = agentCtx.smallPredict ?? 512;
         const largePredict = agentCtx.largePredict ?? 8192;
         const judgeHistoryCount = agentCtx.judgeHistoryCount ?? 3; // ツール判断時の履歴件数
@@ -2995,12 +3171,14 @@ function App() {
         // 初回ツール判断用プロンプト
         let judgeMessages = [{ role: 'system', content: judgeSystem }, ...judgeHistory];
 
-        const judgeNumCtx = needsLargeGen ? numCtx : smallCtx;
         const judgeNumPredict = needsLargeGen ? largePredict : smallPredict;
-        console.log(`[ツール判断] num_ctx=${judgeNumCtx}, num_predict=${judgeNumPredict}, history=${judgeHistory.length}件 (needsLargeGen=${needsLargeGen})`);
+        console.log(`[ツール判断] max_tokens=${judgeNumPredict}, history=${judgeHistory.length}件 (needsLargeGen=${needsLargeGen})`);
 
-        // ─── ツール実行ループ（最大3ターンまで繰り返し） ───
-        const MAX_TOOL_TURNS = 3;
+        // ─── ツール実行ループ ───
+        // Gemma系モデルはマルチターンのツール呼び出しが不安定（テキスト形式の<|tool_call|>を出力することがある）
+        // → 1ターンのみに制限。Qwen系等は3ターンまで
+        const isGemmaModel = /gemma/i.test(chatModel);
+        const MAX_TOOL_TURNS = isGemmaModel ? 1 : 3;
         let toolTurn = 0;
         let lastAssistantMsg = null;
 
@@ -3019,7 +3197,8 @@ function App() {
           }
 
           // ツール呼び出し判断（非ストリーミング、thinkingオフで高速化）
-          const toolRes = await fetch(`${ollamaUrl}/api/chat`, {
+          // Qwen3/Qwen3.6 系の thinking モードは tool_calls 判断時に時間を浪費するため明示的に無効化
+          const toolRes = await fetch('/v1/chat/completions', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -3027,33 +3206,80 @@ function App() {
               messages: turnMessages,
               tools,
               stream: false,
-              think: false, // ツール判断は素早く決めたいのでthinkingを無効化（思考ループ防止にも効果）
-              options: { ...ollamaOptions, num_ctx: judgeNumCtx, num_predict: judgeNumPredict },
+              max_tokens: judgeNumPredict,
+              // Qwen3系: chat_template_kwargs.enable_thinking=false で思考スキップ
+              chat_template_kwargs: { enable_thinking: false },
+              ...llamaCommonOptions,
             }),
             signal: controller.signal,
           });
 
           if (!toolRes.ok) throw new Error(`API Error: ${toolRes.status}`);
           const toolData = await toolRes.json();
-          const assistantMsg = toolData.message;
+          // OpenAI互換: { choices: [{ message: { role, content, tool_calls } }] }
+          const choice = toolData.choices?.[0];
+          // OllamaのassistantMsg形式に正規化（既存のロジックを再利用するため）
+          const assistantMsg = {
+            role: 'assistant',
+            content: choice?.message?.content || '',
+            tool_calls: choice?.message?.tool_calls || null,
+          };
           lastAssistantMsg = assistantMsg;
 
           // LLMがテキストで「search_documents(query='...')」と書いてしまった場合、
           // 実際のtool_callに変換するフォールバック
           if ((!assistantMsg?.tool_calls || assistantMsg.tool_calls.length === 0) && assistantMsg?.content) {
+            // パターン1: Gemma独自トークン形式（非対称対応）
+            // <|tool_call|>, <|tool_call>, <tool_call|>, <tool_call> 全て対応
+            // 例: <|tool_call|>call:web_search{query:<|"|>今日のニュース<|"|>}<tool_call|>
+            const gemmaCallMatch = assistantMsg.content.match(/<\|?tool_call\|?>\s*call:\s*(\w+)\s*\{([\s\S]*?)\}\s*<\/?\|?tool_call\|?>/i);
+            if (gemmaCallMatch) {
+              const fname = gemmaCallMatch[1];
+              const argsBody = gemmaCallMatch[2];
+              const args = {};
+              // key:<|"|>value<|"|> の囲みも非対称対応
+              const argRe = /(\w+)\s*:\s*<\|?"?\|?>\s*([\s\S]*?)\s*<\|?"?\|?>/g;
+              let m;
+              while ((m = argRe.exec(argsBody)) !== null) {
+                args[m[1]] = m[2];
+              }
+              // フォールバック: シンプルな key: value 形式
+              if (Object.keys(args).length === 0) {
+                const simpleMatch = argsBody.match(/(\w+)\s*:\s*"?([^",}]+)"?/);
+                if (simpleMatch) args[simpleMatch[1]] = simpleMatch[2].trim();
+              }
+              if (Object.keys(args).length > 0 || fname === 'list_files') {
+                console.log(`[Gemmaトークン検出] ${fname}(${JSON.stringify(args)}) を実ツール呼び出しに変換`);
+                assistantMsg.tool_calls = [{
+                  id: 'call_' + Date.now(),
+                  type: 'function',
+                  function: { name: fname, arguments: JSON.stringify(args) }
+                }];
+                assistantMsg.content = '';
+              }
+            }
+          }
+          // パターン2: Python関数呼び出し形式 funcname(query='...')
+          if ((!assistantMsg?.tool_calls || assistantMsg.tool_calls.length === 0) && assistantMsg?.content) {
             const textCallMatch = assistantMsg.content.match(/(search_documents|web_search|read_file|list_files|write_file)\s*\(\s*([^)]*)\)/);
             if (textCallMatch) {
               const fname = textCallMatch[1];
               const argsStr = textCallMatch[2];
-              const fakeCall = { function: { name: fname, arguments: {} } };
-              // query='...' / path='...' などを抽出
+              // OpenAI互換のtool_call形式
+              const fakeCall = {
+                id: 'call_' + Date.now(),
+                type: 'function',
+                function: { name: fname, arguments: '{}' }
+              };
+              const args = {};
               const queryMatch = argsStr.match(/query\s*=\s*['"]([^'"]+)['"]/);
               const pathMatch = argsStr.match(/(?:path|filename|file)\s*=\s*['"]([^'"]+)['"]/);
-              if (queryMatch) fakeCall.function.arguments.query = queryMatch[1];
-              if (pathMatch) fakeCall.function.arguments.path = pathMatch[1];
+              if (queryMatch) args.query = queryMatch[1];
+              if (pathMatch) args.path = pathMatch[1];
               // queryもpathもないがlist_filesなら引数なし
-              if (fname === 'list_files' || Object.keys(fakeCall.function.arguments).length > 0) {
+              if (fname === 'list_files' || Object.keys(args).length > 0) {
                 console.log(`[ツールテキスト検出] ${fname} を実ツール呼び出しに変換`);
+                fakeCall.function.arguments = JSON.stringify(args);
                 assistantMsg.tool_calls = [fakeCall];
                 // contentは上書きで空にする（テキスト応答を破棄）
                 assistantMsg.content = '';
@@ -3069,7 +3295,11 @@ function App() {
 
           for (const tc of assistantMsg.tool_calls) {
             const fnName = tc.function?.name;
-            const fnArgs = tc.function?.arguments || {};
+            // OpenAI互換: argumentsはJSON文字列で来る。Ollama互換コードのため両対応
+            let fnArgs = tc.function?.arguments || {};
+            if (typeof fnArgs === 'string') {
+              try { fnArgs = JSON.parse(fnArgs); } catch { fnArgs = {}; }
+            }
 
             if (fnName === 'search_documents') {
               const query = fnArgs.query || text;
@@ -3102,7 +3332,7 @@ function App() {
               const resultText = results.length > 0
                 ? results.map((c, i) => `[資料${i + 1}: ${c.docName}]\n${c.chunk}`).join('\n\n')
                 : '関連する資料が見つかりませんでした。';
-              apiMessages.push({ role: 'tool', content: resultText });
+              apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: resultText });
 
             } else if (fnName === 'web_search') {
               const query = fnArgs.query || text;
@@ -3145,7 +3375,7 @@ function App() {
                     return entry;
                   }).join('\n\n===\n\n')
                 : 'Web検索結果が見つかりませんでした。';
-              apiMessages.push({ role: 'tool', content: resultText });
+              apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: resultText });
 
             } else if (fnName === 'list_files') {
               searchQueries.push({ query: 'サーバーファイル一覧', resultCount: null, type: 'file' });
@@ -3168,7 +3398,7 @@ function App() {
               const resultText = files.length > 0
                 ? files.map(f => `${f.path} (${f.size}バイト, ${f.modified})`).join('\n')
                 : 'uploadsフォルダは空です。';
-              apiMessages.push({ role: 'tool', content: resultText });
+              apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: resultText });
 
             } else if (fnName === 'read_file') {
               const fpath = fnArgs.path || fnArgs.filename || fnArgs.file || fnArgs.filepath || '';
@@ -3198,7 +3428,7 @@ function App() {
               const resultText = content != null
                 ? `ファイル「${fpath}」の内容:\n\`\`\`\n${content}\n\`\`\``
                 : `ファイル「${fpath}」の読み込みに失敗: ${error}`;
-              apiMessages.push({ role: 'tool', content: resultText });
+              apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: resultText });
 
             } else if (fnName === 'write_file') {
               const fpath = fnArgs.path || fnArgs.filename || fnArgs.file || fnArgs.filepath || '';
@@ -3232,7 +3462,7 @@ function App() {
               const resultText = ok
                 ? `ファイル「${fpath}」に${size}バイト書き込みました。`
                 : `書き込みに失敗: ${error}`;
-              apiMessages.push({ role: 'tool', content: resultText });
+              apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: resultText });
               // ファイル一覧を再読み込み
               loadFileList();
             }
@@ -3266,20 +3496,128 @@ function App() {
           return copy;
         });
 
-        const finalRes = await fetch(`${ollamaUrl}/api/chat`, {
+        const finalRes = await fetch('/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: chatModel,
             messages: apiMessages,
             stream: true,
-            options: ollamaOptions,
+            stream_options: { include_usage: true },
+            ...llamaCommonOptions,
           }),
           signal: controller.signal,
         });
 
         if (!finalRes.ok) throw new Error(`API Error: ${finalRes.status}`);
         await streamResponse(finalRes, contextInfo, searchQueries);
+
+        // ─── ストリーミング最終応答後の救済処理 ───
+        // Gemma系などが最終応答中に <|tool_call|> を出すケース
+        // → 内容を抽出して手動でツール実行 → 再度ストリーミング応答
+        const MAX_RECOVERY_TURNS = 2;
+        for (let recoveryTurn = 0; recoveryTurn < MAX_RECOVERY_TURNS; recoveryTurn++) {
+          // 最終応答に <|tool_call|> が残っているか確認
+          const lastMsg = await new Promise(resolve => {
+            setMessages(prev => { resolve(prev[prev.length - 1]); return prev; });
+          });
+          if (!lastMsg || lastMsg.role !== 'assistant') break;
+          const lastContent = lastMsg.content || '';
+          // Gemma4の非対称トークン対応: <|tool_call> や <tool_call|> など、|の数がまちまちでもマッチ
+          // パターン: <[|]?tool_call[|]?> ... <[/]?[|]?tool_call[|]?>
+          const gemmaMatch = lastContent.match(/<\|?tool_call\|?>\s*call:\s*(\w+)\s*\{([\s\S]*?)\}\s*<\/?\|?tool_call\|?>/i);
+          if (!gemmaMatch) {
+            console.log('[救済処理] <|tool_call|>パターン未検出、ループ終了');
+            break;
+          }
+
+          const fname = gemmaMatch[1];
+          const argsBody = gemmaMatch[2];
+          const args = {};
+          // 引数値の囲み記号も非対称対応: <|"> や <"> でもOK
+          const argRe = /(\w+)\s*:\s*<\|?"?\|?>\s*([\s\S]*?)\s*<\|?"?\|?>/g;
+          let m;
+          while ((m = argRe.exec(argsBody)) !== null) {
+            args[m[1]] = m[2];
+          }
+          // 万一 <|"|> パターンが取れなかった場合のフォールバック: " で囲まれた値、生の値
+          if (!args.query) {
+            const simpleMatch = argsBody.match(/(\w+)\s*:\s*"?([^",}]+)"?/);
+            if (simpleMatch) args[simpleMatch[1]] = simpleMatch[2].trim();
+          }
+          if (fname !== 'web_search' || !args.query) {
+            console.log(`[救済処理] パース失敗: fname=${fname}, args=`, args);
+            break;
+          }
+
+          console.log(`[最終応答中の<|tool_call|>検出] web_search("${args.query}") を実行`);
+
+          // 検索を実行
+          const query = args.query;
+          searchQueries.push({ query: `Web検索: ${query}`, resultCount: null, type: 'web' });
+          setMessages(prev => {
+            const copy = [...prev];
+            copy[copy.length - 1] = {
+              ...copy[copy.length - 1],
+              agentStatus: `🌐 追加Web検索「${query}」中...`,
+              searchQueries: [...searchQueries],
+            };
+            return copy;
+          });
+
+          let webResults = [];
+          try {
+            const wsRes = await fetch(`/web-search?q=${encodeURIComponent(query)}&n=5`);
+            if (wsRes.ok) {
+              const wsData = await wsRes.json();
+              webResults = wsData.results || [];
+            }
+          } catch (e) { console.warn('web-search error', e); }
+
+          // 結果を会話履歴に追加
+          const resultText = webResults.length > 0
+            ? webResults.map((r, i) => `[${i + 1}] ${r.title}\n${r.url}\n${r.body || r.snippet || ''}`).join('\n\n')
+            : '検索結果が見つかりませんでした。';
+
+          // 前の不完全な応答を会話履歴から削除して、tool結果を追加
+          // 注: assistantメッセージにtool_calls形式で追加するのではなく、systemの追記として渡す
+          // (既にmaxTurns済みのため、追加検索結果を含めて再生成)
+          apiMessages.push({
+            role: 'system',
+            content: `追加のWeb検索を実行しました（クエリ: ${query}）。以下の結果を参考に最終的な回答を作成してください:\n\n${resultText}\n\n重要: <|tool_call|>のような書式は使わず、自然な日本語で回答してください。`
+          });
+
+          searchQueries[searchQueries.length - 1].resultCount = webResults.length;
+
+          // 既存の最終応答メッセージをクリアして再ストリーミング
+          setMessages(prev => {
+            const copy = [...prev];
+            copy[copy.length - 1] = {
+              role: 'assistant', content: '', thinking: '',
+              contexts: contextInfo,
+              agentStatus: '回答生成中...',
+              searchQueries: [...searchQueries],
+            };
+            return copy;
+          });
+
+          const retryRes = await fetch('/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: chatModel,
+              messages: apiMessages,
+              stream: true,
+              stream_options: { include_usage: true },
+              ...llamaCommonOptions,
+            }),
+            signal: controller.signal,
+          });
+
+          if (!retryRes.ok) break;
+          await streamResponse(retryRes, contextInfo, searchQueries);
+          // 次のループで再度<|tool_call|>が出ていないかチェック
+        }
 
       } else {
         // ─── 従来モード（always）: 常にRAG検索してプロンプト注入 ───
@@ -3290,14 +3628,15 @@ function App() {
           fullSystemPrompt += `\n\n以下の参考資料に基づいて回答してください。資料に無い情報は推測であることを明示してください。\n\n${ctxText}`;
         }
 
-        const res = await fetch(`${ollamaUrl}/api/chat`, {
+        const res = await fetch('/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: chatModel,
             messages: [{ role: 'system', content: fullSystemPrompt }, ...history],
             stream: true,
-            options: ollamaOptions,
+            stream_options: { include_usage: true },
+            ...llamaCommonOptions,
           }),
           signal: controller.signal,
         });
@@ -3327,9 +3666,12 @@ function App() {
     let assistantContent = '';
     let assistantThinking = '';
     let tokenInfo = null;
-    // ループ検出用: 直近の思考文字列を100文字単位でハッシュ化して回数カウント
+    let buffer = '';  // SSE分割行のバッファ
+    let firstTokenTime = 0;
+    const startTime = Date.now();
+    // ループ検出用
     let loopDetected = false;
-    const seenChunks = new Map(); // chunk → count
+    const seenChunks = new Map();
     const LOOP_CHUNK_SIZE = 100;
     const LOOP_THRESHOLD = 3;
     let lastCheckedLen = 0;
@@ -3337,25 +3679,43 @@ function App() {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      const chunk = decoder.decode(value);
-      const lines = chunk.split('\n').filter(Boolean);
-      for (const line of lines) {
-        try {
-          const json = JSON.parse(line);
-          if (json.message?.thinking) assistantThinking += json.message.thinking;
-          if (json.message?.content) assistantContent += json.message.content;
+      buffer += decoder.decode(value, { stream: true });
 
-          // 最終チャンク（done: true）にトークン情報が含まれる
-          if (json.done && json.prompt_eval_count != null) {
+      // SSE: 各イベントは "\n\n" で区切られる、各行は "data: ..." または ": comment"
+      const events = buffer.split('\n\n');
+      buffer = events.pop() || '';  // 最後の不完全なイベントは次のループで処理
+
+      for (const event of events) {
+        const dataLines = event.split('\n')
+          .filter(l => l.startsWith('data: '))
+          .map(l => l.slice(6));
+        if (dataLines.length === 0) continue;
+        const dataStr = dataLines.join('\n');
+        if (dataStr === '[DONE]') continue;
+
+        try {
+          const json = JSON.parse(dataStr);
+
+          // OpenAI互換: { choices: [{ delta: { content, reasoning_content, tool_calls } }] }
+          const delta = json.choices?.[0]?.delta || {};
+          // llama.cppは reasoning_content (DeepSeek/QwQ系) をthinking扱い
+          if (delta.reasoning_content) assistantThinking += delta.reasoning_content;
+          if (delta.content) {
+            if (!firstTokenTime) firstTokenTime = Date.now();
+            assistantContent += delta.content;
+          }
+
+          // usageは最終チャンクで来る（stream_options.include_usage: trueの時）
+          if (json.usage) {
             tokenInfo = {
-              promptTokens: json.prompt_eval_count || 0,
-              completionTokens: json.eval_count || 0,
+              promptTokens: json.usage.prompt_tokens || 0,
+              completionTokens: json.usage.completion_tokens || 0,
             };
-            // トークン速度履歴を更新
-            if (json.eval_count > 0 && json.eval_duration > 0) {
+            // トークン速度の計算（最初のトークンから最終までの実時間ベース）
+            const evalMs = Date.now() - (firstTokenTime || startTime);
+            if (json.usage.completion_tokens > 0 && evalMs > 0) {
               const hist = tokenHistoryRef.current;
-              hist.push({ tokens: json.eval_count, durationNs: json.eval_duration });
-              // ウィンドウサイズを超えたら古いものから削除
+              hist.push({ tokens: json.usage.completion_tokens, durationNs: evalMs * 1e6 });
               const win = appConfig.tokenAvgWindow || 2000;
               let totalTok = hist.reduce((s, h) => s + h.tokens, 0);
               while (hist.length > 1 && totalTok > win) {
@@ -3371,12 +3731,10 @@ function App() {
             }
           }
 
-          // ─── 思考ループ検出 ───
-          // 思考文字列が一定量増えるたびに、末尾100文字ウィンドウで重複カウント
+          // 思考ループ検出
           const fullText = assistantThinking + assistantContent;
           if (fullText.length - lastCheckedLen >= LOOP_CHUNK_SIZE) {
             lastCheckedLen = fullText.length;
-            // 末尾を100文字ウィンドウでスライス（最新の思考片）
             const chunkText = fullText.slice(-LOOP_CHUNK_SIZE).replace(/\s+/g, ' ').trim();
             if (chunkText.length >= 50) {
               const count = (seenChunks.get(chunkText) || 0) + 1;
@@ -3390,6 +3748,7 @@ function App() {
             }
           }
 
+          // <think>タグでthinkingが入る場合のフォールバック処理（プロンプトテンプレ依存）
           let displayContent = assistantContent;
           let displayThinking = assistantThinking;
           const thinkMatch = assistantContent.match(/^<think>([\s\S]*?)(<\/think>)?([\s\S]*)$/);
@@ -3414,15 +3773,37 @@ function App() {
             };
             return copy;
           });
-        } catch {}
+        } catch (e) {
+          console.warn('SSE parse error:', e, dataStr.slice(0, 100));
+        }
       }
       if (loopDetected) break;
     }
+
+    // ─── ストリーミング完了後の救済処理 ───
+    // <think>タグが閉じられないまま終わった場合、または reasoning_content だけで content が空の場合
+    // → thinking内容を最終応答にコピー
+    setMessages(prev => {
+      const copy = [...prev];
+      const last = copy[copy.length - 1];
+      if (last && last.role === 'assistant' && !last.content && last.thinking) {
+        console.warn('[救済] 最終応答が空、thinking内容を本文に昇格');
+        copy[copy.length - 1] = {
+          ...last,
+          content: last.thinking,
+          thinking: '',  // 重複表示を避けるためクリア
+        };
+      }
+      return copy;
+    });
   }
 
   // ─── ファイルハンドリング ───
   function handleFiles(files) {
-    for (const file of files) {
+    // FileList / Array / 配列風オブジェクト どれでも受け付ける
+    const fileArray = Array.from(files || []);
+    for (const file of fileArray) {
+      if (!file || typeof file.type !== 'string') continue;
       if (file.type.startsWith('image/')) {
         const reader = new FileReader();
         reader.onload = (e) => {
@@ -3493,11 +3874,9 @@ function App() {
       const base64 = dataUrl.split(',')[1];
       setChatImages(prev => [...prev, { name: file.name, base64, preview: dataUrl }]);
     }
-    // その他 → ドキュメントに取り込む（既存のhandleFiles使用）
+    // その他 → ドキュメントに取り込む（配列を直接渡す）
     if (others.length > 0) {
-      const fakeFileList = { length: others.length, ...others, item: i => others[i] };
-      others.forEach((f, i) => fakeFileList[i] = f);
-      handleFiles(fakeFileList);
+      handleFiles(others);
     }
   }
 
@@ -3938,11 +4317,20 @@ function App() {
       const systemPrompt = fillTemplate(sp.base || '', { date: dateStr });
 
       // idxまでの会話履歴 + thinking情報を引き継ぎ、続きを促す
-      const history = messages.slice(0, idx).map(m => ({
-        role: m.role,
-        content: m.content,
-        ...(m.images && m.images.length > 0 ? { images: m.images.map(img => img.base64) } : {}),
-      }));
+      const history = messages.slice(0, idx).map(m => {
+        const hasImages = m.images && m.images.length > 0;
+        if (!hasImages) return { role: m.role, content: m.content };
+        // OpenAI互換: content配列形式
+        const content = [];
+        if (m.content) content.push({ type: 'text', text: m.content });
+        for (const img of m.images) {
+          const dataUrl = img.base64.startsWith('data:')
+            ? img.base64
+            : `data:image/png;base64,${img.base64}`;
+          content.push({ type: 'image_url', image_url: { url: dataUrl } });
+        }
+        return { role: m.role, content };
+      });
 
       // 途中までの思考+応答を「部分応答」として追加し、続きを書くよう促す
       const partial = [target.thinking ? `<think>${target.thinking}</think>` : '', target.content || ''].filter(Boolean).join('\n').trim();
@@ -3957,23 +4345,23 @@ function App() {
         nudgeMessages.push({ role: 'user', content: '先ほどの質問への回答をお願いします。簡潔に答えてください。' });
       }
 
-      const numCtx = appConfig.agentContext?.mediumCtx || 8192;
-      const ollamaOptions = {
-        num_ctx: numCtx,
-        num_predict: appConfig.agentContext?.largePredict || 8192,
+      const llamaOptions = {
+        max_tokens: appConfig.agentContext?.largePredict || 8192,
         top_k: appConfig.topK,
         top_p: appConfig.topP,
         temperature: appConfig.temperature,
+        cache_prompt: true,
       };
 
-      const res = await fetch(`${ollamaUrl}/api/chat`, {
+      const res = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: chatModel,
           messages: nudgeMessages,
           stream: true,
-          options: ollamaOptions,
+          stream_options: { include_usage: true },
+          ...llamaOptions,
         }),
         signal: controller.signal,
       });
@@ -3985,17 +4373,26 @@ function App() {
       const decoder = new TextDecoder();
       let addedContent = '';
       let addedThinking = '';
+      let buffer = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n').filter(Boolean);
-        for (const line of lines) {
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split('\n\n');
+        buffer = events.pop() || '';
+        for (const event of events) {
+          const dataLines = event.split('\n')
+            .filter(l => l.startsWith('data: '))
+            .map(l => l.slice(6));
+          if (dataLines.length === 0) continue;
+          const dataStr = dataLines.join('\n');
+          if (dataStr === '[DONE]') continue;
           try {
-            const json = JSON.parse(line);
-            if (json.message?.thinking) addedThinking += json.message.thinking;
-            if (json.message?.content) addedContent += json.message.content;
+            const json = JSON.parse(dataStr);
+            const delta = json.choices?.[0]?.delta || {};
+            if (delta.reasoning_content) addedThinking += delta.reasoning_content;
+            if (delta.content) addedContent += delta.content;
 
             // <think>タグ形式も処理
             let displayAddedContent = addedContent;
@@ -4128,7 +4525,6 @@ function App() {
           const s = await setRes.json();
           if (s.chatModel) setChatModel(s.chatModel);
           else if (cfg?.defaultModel) setChatModel(cfg.defaultModel);
-          if (s.numCtx) setNumCtx(s.numCtx);
         } else if (cfg?.defaultModel) {
           setChatModel(cfg.defaultModel);
         }
@@ -4146,12 +4542,106 @@ function App() {
         await fetch('/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chatModel, numCtx }),
+          body: JSON.stringify({ chatModel }),
         });
       } catch {}
     }, 500);
     return () => clearTimeout(t);
-  }, [chatModel, numCtx]);
+  }, [chatModel]);
+
+  // chatModel変更時、llama-serverのチャットモデルをロード（リスタート）
+  useEffect(() => {
+    if (!settingsLoadedRef.current) return;
+    if (!chatModel) return;
+    if (isLoading) return;  // 生成中はモデル切替しない
+    let aborted = false;
+    (async () => {
+      try {
+        // 現在ロード中モデルを確認、同じならスキップ
+        const sres = await fetch('/models');
+        if (!sres.ok) return;
+        const sdata = await sres.json();
+        // 既にロード中、または自動アンロードされた同じモデルなら何もしない
+        // （リクエスト時に自動再ロードされるため）
+        if (sdata.current === chatModel) return;
+        if (sdata.autoUnloaded === chatModel) return;
+        if (aborted) return;
+        // モデル切替を要求
+        setLoadingMessage(`モデル「${chatModel}」をロード中`);
+        setError('');
+        const res = await fetch('/models/load', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: chatModel }),
+        });
+        if (aborted) return;
+        setLoadingMessage('');
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          setError(`モデル切替失敗: ${data.error || res.status}`);
+        } else {
+          setError('');
+        }
+      } catch (e) {
+        if (!aborted) {
+          setLoadingMessage('');
+          setError(`モデル切替エラー: ${e.message}`);
+        }
+      }
+    })();
+    return () => { aborted = true; };
+  }, [chatModel, isLoading]);
+
+  // モデル未ロード/起動中の状態をオレンジトーストで自動表示
+  useEffect(() => {
+    if (!authenticated || !connected) return;
+    // ユーザーが手動でモデル切替中（既にloadingMessage設定済み）は上書きしない
+    if (loadingMessage && loadingMessage.includes('をロード中') && !loadingMessage.includes('再ロード中')) return;
+    // 初回ロード待ち or アイドルアンロード状態（実際に起動中ではない）→ トースト不要
+    // 実際に起動中(modelStarting=true)になってからトーストを出す
+    if (firstLoadPending || (autoUnloadedName && !modelStarting)) {
+      // 古い表示は消す
+      if (loadingMessage && (loadingMessage.includes('を再ロード中') || loadingMessage.includes('をロードします'))) {
+        setLoadingMessage('');
+      }
+      return;
+    }
+    if (modelStarting) {
+      // ロード中: autoUnloadedName が分かれば「再ロード中」、なければ「起動中」
+      if (autoUnloadedName) {
+        setLoadingMessage(`モデル「${autoUnloadedName}」を再ロード中`);
+      } else {
+        setLoadingMessage(`モデルを起動中`);
+      }
+    } else if (!modelReady && availableModels.length > 0) {
+      setLoadingMessage(`モデルをロード中`);
+    } else {
+      // ロード完了したら自動表示はクリア（ユーザー操作のloadingMessageは別経路）
+      if (loadingMessage === 'モデルを起動中'
+          || loadingMessage === 'モデルをロード中'
+          || (loadingMessage && (loadingMessage.includes('を再ロード中') || loadingMessage.includes('をロードします')))) {
+        setLoadingMessage('');
+      }
+    }
+  }, [modelReady, modelStarting, autoUnloadedName, firstLoadPending, authenticated, connected, availableModels.length]);
+
+  // 新規チャットで最初のユーザーメッセージから自動タイトル生成
+  useEffect(() => {
+    if (chatTitle) return;  // 既にタイトルがあれば何もしない
+    if (isLoading) return;  // 生成中は待つ
+    if (messages.length === 0) return;
+    // 最初のユーザーメッセージを探す
+    const firstUser = messages.find(m => m.role === 'user');
+    if (!firstUser) return;
+    // 内容から30文字程度のタイトルを抽出
+    const raw = (firstUser.content || '').trim();
+    if (!raw || raw === '(画像を送信)') return;
+    // 先頭30文字、改行は空白に、複数空白は1つに
+    let title = raw.replace(/\s+/g, ' ').slice(0, 30);
+    // 文末が中途半端なら省略記号
+    if (raw.length > 30) title += '…';
+    setChatTitle(title);
+  }, [messages, isLoading, chatTitle]);
 
   // メッセージ・ドキュメント変更時に自動保存（1.5秒デバウンス）
   useEffect(() => {
@@ -4255,18 +4745,25 @@ function App() {
           </div>
           <div className="settings-group">
             <div className="setting-row">
-              <span className="setting-label">チャットモデル</span>
-              <select className="setting-input" value={chatModel} onChange={e => setChatModel(e.target.value)}>
+              <span className="setting-label">
+                チャットモデル
+                {isLoading && <span className="setting-locked-hint" title="生成中はモデルを切り替えられません">🔒</span>}
+              </span>
+              <select
+                className="setting-input"
+                value={chatModel}
+                onChange={e => setChatModel(e.target.value)}
+                disabled={isLoading}
+                title={isLoading ? '生成中はモデルを切り替えられません。停止してからやり直してください。' : ''}
+              >
                 {availableModels.length === 0 && <option value="">未接続</option>}
-                {availableModels.map(m => <option key={m} value={m}>{m}</option>)}
-              </select>
-            </div>
-            <div className="setting-row">
-              <span className="setting-label">コンテキストサイズ</span>
-              <select className="setting-input" value={numCtx} onChange={e => setNumCtx(parseInt(e.target.value))}>
-                {[2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144].map(v => (
-                  <option key={v} value={v}>{(v / 1024).toFixed(0)}K ({v.toLocaleString()})</option>
-                ))}
+                {availableModels.map(m => {
+                  const info = availableModelsInfo.find(x => x.name === m);
+                  const label = info && info.ctx
+                    ? `${m} (${info.ctx.toLocaleString()})`
+                    : m;
+                  return <option key={m} value={m}>{label}</option>;
+                })}
               </select>
             </div>
           </div>
@@ -4335,7 +4832,6 @@ function App() {
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".txt,.md,.csv,.json,.log,.html,.xml,.py,.js,.ts,.java,.c,.cpp,.rs,.go,image/*"
               style={{ display: 'none' }}
               onChange={e => { handleFiles(e.target.files); e.target.value = ''; }}
             />
@@ -4405,7 +4901,7 @@ function App() {
             <button className="menu-btn" onClick={() => setSidebarOpen(!sidebarOpen)}>☰</button>
             <div className={`status-dot ${connected ? 'connected' : ''}`} />
             <span className="chat-header-title">
-              {connected ? chatModel || 'モデル未選択' : 'Ollama未接続'}
+              {connected ? chatModel || 'モデル未選択' : 'llama.cpp未接続'}
             </span>
             {messages.length > 0 && (
               <>
@@ -4630,7 +5126,7 @@ function App() {
               onChange={e => setInput(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
               onPaste={handlePaste}
-              placeholder={connected ? 'メッセージを入力...（画像も貼り付け可）' : 'Ollamaに接続してください...'}
+              placeholder={connected ? 'メッセージを入力...（画像も貼り付け可）' : 'llama.cppサーバーに接続してください...'}
               rows={1}
               disabled={!connected}
               onInput={e => { e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px'; }}
@@ -4667,7 +5163,18 @@ function App() {
                   <div className="stop-icon" />
                 </button>
               ) : (
-                <button className="send-btn" onClick={sendMessage} disabled={(!input.trim() && chatImages.length === 0) || !connected}>
+                <button
+                  className="send-btn"
+                  onClick={sendMessage}
+                  disabled={(!input.trim() && chatImages.length === 0) || !connected || embeddingJobs.length > 0 || (!modelReady && !firstLoadPending && !autoUnloadedName)}
+                  title={
+                    firstLoadPending ? '送信時にモデルをロードします'
+                    : autoUnloadedName && !modelReady ? '送信時にモデルを再ロードします'
+                    : !modelReady ? (modelStarting ? 'モデル起動中です' : 'モデルがロードされていません')
+                    : embeddingJobs.length > 0 ? 'ドキュメントのEmbedding生成中です。完了までお待ちください'
+                    : ''
+                  }
+                >
                   ➤
                 </button>
               )}
@@ -4830,6 +5337,7 @@ function App() {
         </div>
       </div>
 
+      {loadingMessage && <div className="loading-toast">{loadingMessage}</div>}
       {error && <div className="error-toast">{error}</div>}
       {lightboxSrc && (
         <div className="image-lightbox" onClick={() => setLightboxSrc(null)}>

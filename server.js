@@ -14,8 +14,6 @@ process.chdir(__dirname);
 
 // ─── 設定 ───
 const PORT = process.env.PORT || 3000;
-const OLLAMA_HOST = process.env.OLLAMA_HOST || '127.0.0.1';
-const OLLAMA_PORT = process.env.OLLAMA_PORT || 11434;
 const PYTHON_TIMEOUT = parseInt(process.env.PYTHON_TIMEOUT) || 60000;
 
 // ─── アプリ設定 (config.json) ───
@@ -27,59 +25,80 @@ const DEFAULT_CONFIG = {
   welcomeMessage: 'ドキュメントをアップロードしてRAGベースの質問応答を行うか、自由にチャットを開始できます。',
   welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
   accentColor: '#34d399',
-  defaultModel: '',
-  embedModel: 'mxbai-embed-large:latest',
+  defaultModel: '',  // chatModelsのname。空なら一覧の先頭
   password: '',
   pythonPath: 'python3',
-  gpuAgentToken: '',
   transcribe: {
     enabled: false,
     host: '127.0.0.1',
     port: 11500,
   },
-  ollamaBackends: [],
+  // ─── llama.cpp 設定 ───
+  llamaServer: {
+    binPath: '/usr/local/bin/llama-server',  // llama-server バイナリのパス
+    chatHost: '127.0.0.1',
+    chatPort: 8080,
+    embeddingHost: '127.0.0.1',
+    embeddingPort: 8081,
+    // 起動時の追加共通引数（GPU offload等、chatModelsのextraArgsで上書き可）
+    commonArgs: ['--host', '127.0.0.1', '-fa', 'on'],
+    // 起動から ready 判定までのタイムアウト(ms)
+    readyTimeoutMs: 120000,
+    // モデルアンロードまでのアイドル時間(ms)、0で無効。※将来用、現在未使用
+    idleUnloadMs: 0,
+  },
+  // チャット用モデル一覧
+  chatModels: [
+    // {
+    //   name: 'Gemma3 12B',
+    //   path: '/models/gemma-3-12b-it-Q4_K_M.gguf',
+    //   ctx: 8192,
+    //   ngl: 99,
+    //   chatTemplate: '',  // 空ならGGUFのメタデータ使用
+    //   extraArgs: []
+    // }
+  ],
+  // RAG用Embeddingモデル（別ポートで起動）
+  embeddingModel: {
+    // path: '/models/mxbai-embed-large-v1-f16.gguf',
+    // ctx: 512,
+    // ngl: 99,
+    // poolingType: 'mean'  // mean, cls, last, none
+  },
   webSearch: true,
   fileAccess: true,
   ragTopK: 10,
   ragMode: 'agentic',
   systemPrompts: {
-    // ベース: すべてのチャットに共通する土台。{date}は実行時に展開される
     base: 'あなたは親切で知識豊富なAIアシスタントです。日本語で簡潔に回答してください。今日の日付は{date}です。\n\n重要な指示:\n- 思考は手短に済ませ、ユーザーへの回答を必ず出力してください。\n- ツールから取得した情報は信頼し、そのまま使ってください（妥当性を過度に疑わないこと）。\n- 日付に関する自己矛盾を感じても、与えられた{date}を真として処理してください。過去の学習データとの整合性を気にする必要はありません。\n- 天気・ニュース・株価など現在情報は、ツールの結果をそのまま引用してください。',
-    // ドキュメントが添付されている時の追記。{docList}=ファイル名カンマ区切り
     documents: '【参照可能なドキュメント】(チャットに添付されたファイル): {docList}\nユーザーの質問が「ドキュメントについて」「資料を見て」「添付ファイル」などを示唆する場合、必ず最初に search_documents ツールを使ってください。\nこれらは添付ドキュメントであり、サーバーファイル（uploads配下）とは別物です。',
-    // Web検索が有効な時の追記
     webSearch: '最新の情報や知らないことについては web_search ツールでインターネット検索できます。',
-    // ファイルアクセスが有効な時の追記
     fileAccess: '【サーバーファイル操作】(uploads配下、ドキュメントとは別物)\n- list_files: uploadsフォルダの一覧を取得\n- read_file(path): uploadsフォルダのファイル読み込み\n- write_file(path, content): uploadsフォルダにファイル書き込み\n重要: pathには"uploads/"プレフィックスを付けずにファイル名のみを指定してください（例: "hello.py"、"data/config.json"）。\nユーザーが明確に「サーバーファイル」「uploadsフォルダ」「ファイルを保存して」など、サーバー側のファイルシステム操作を依頼した場合のみ使用してください。\nチャットに添付されたドキュメントについての質問では list_files/read_file/write_file は使わず、search_documents を使ってください。',
-    // Python実行案内（常時）
     python: 'Pythonコード実行について:\n- 応答に ```python ... ``` のコードブロックを含めると、ユーザー側で実行ボタンが表示されます。\n- グラフ・図の作成依頼には matplotlib を使ったPythonコードを提示してください（matplotlib.use(\'Agg\')の指定は不要、plt.show()で自動的にチャットに画像表示されます）。\n- データ処理・計算・可視化の依頼では、迷わずPythonコードブロックを返してください。それだけで完結します。ツール呼び出しは不要です。\n- 大量データ・CSV/Parquet/JSON処理・複雑な集計には DuckDB を使ってください。SQLでpandasより高速かつメモリ効率良く処理できます。\n  使い方: import duckdb; con = duckdb.connect(); df = con.execute("SELECT ... FROM \'data.csv\'").df()\n  CSVやParquetを直接 FROM で参照可能。pandasのDataFrameもテーブルとして使えます（con.execute("SELECT ... FROM df")）。',
-    // 重要な指示（メタ抑制、常時）
     meta: '重要な指示:\n- 内部的な推論・検索戦略・計画・メタ的な説明は一切出力しないでください。\n- "I need to...", "The user wants...", "I should..." のような独り言を書かないでください。\n- ツールを呼び出すと決めたら、即座にツールを呼び出してください。テキスト応答と併用しないでください。\n- 検索結果が得られなかった場合は、その旨を簡潔に伝え、自分の知識で回答してください。',
-    // ツール判断専用の軽量プロンプト（{docList}, {hasDocs}, {hasWebSearch}, {hasFileAccess}が使える）
     judge: '以下の中から必要なツールを呼び出してください。通常の質問に答えられる場合はツールを使わずそのまま応答してください。\n{toolList}\n注意: チャット添付ドキュメントとサーバーuploadsファイルは別物。ドキュメント関連は search_documents、サーバーファイル関連は list_files/read_file/write_file。\nグラフ・計算・データ処理はツール不要。```python ... ``` コードブロックを応答に含めれば自動実行されます（matplotlibで画像表示、DuckDBで高速SQL処理可能）。\n内部推論は書かず、ツールを呼ぶか直接短く応答するかのみ。',
   },
   agentContext: {
-    smallCtx: 2048,
-    mediumCtx: 8192,
-    smallPredict: 512,
-    largePredict: 8192,
-    smallThreshold: 2000,
-    mediumThreshold: 8000,
-    largeGenKeywords: null,
+    smallPredict: 512,        // ツール判断時のmax_tokens (短文モード)
+    largePredict: 8192,       // ツール判断時のmax_tokens (長文モード) + continueGen時
+    judgeHistoryCount: 3,     // ツール判断時に送信する直近メッセージ数
+    largeGenKeywords: null,   // 長文モード判定キーワード (null=デフォルト使用)
   },
   tokenAvgWindow: 2000,
-  recentMessageCount: 6,  // 直近N件をそのまま送信、それ以前は「参考情報」として要約圧縮
+  recentMessageCount: 6,
   topK: 40,
   topP: 0.9,
   temperature: 0.7,
+  // ログレベル: 'verbose' (全ログ), 'normal' (デフォルト), 'quiet' (最小限)
+  // 'quiet' にすると /v1/* プロキシの毎リクエストログとllama-serverのstdoutを抑制
+  logLevel: 'normal',
 };
 function loadConfig() {
   try {
     if (fs.existsSync(CONFIG_FILE)) {
       const userConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
-      // ネストされたオブジェクト(systemPrompts, agentContext, transcribe)は深いマージ
       const merged = { ...DEFAULT_CONFIG, ...userConfig };
-      ['systemPrompts', 'agentContext', 'transcribe'].forEach(key => {
+      ['systemPrompts', 'agentContext', 'transcribe', 'llamaServer', 'embeddingModel'].forEach(key => {
         if (DEFAULT_CONFIG[key] && typeof DEFAULT_CONFIG[key] === 'object') {
           merged[key] = { ...DEFAULT_CONFIG[key], ...(userConfig[key] || {}) };
         }
@@ -91,96 +110,269 @@ function loadConfig() {
 }
 const appConfig = loadConfig();
 
-// ─── Ollamaバックエンド管理 ───
-const backends = (appConfig.ollamaBackends && appConfig.ollamaBackends.length > 0)
-  ? appConfig.ollamaBackends.map((b, i) => ({
-      host: b.host || OLLAMA_HOST,
-      port: b.port || OLLAMA_PORT,
-      gpuAgentPort: b.gpuAgentPort || 11400,
-      gpuAgentToken: b.gpuAgentToken || appConfig.gpuAgentToken || '',
-      label: b.label || `PC-${i}`,
-      activeConns: 0,
-      gpus: [],
-    }))
-  : [{ host: OLLAMA_HOST, port: parseInt(OLLAMA_PORT), gpuAgentPort: 0, gpuAgentToken: '', label: 'localhost', activeConns: 0, gpus: [] }];
+// ─── llama-server プロセス管理 ───
+// 1チャットモデル + 1Embeddingモデルを別プロセスで管理
+// チャットモデル切替時はチャットサーバーを再起動
 
-function selectBackend() {
-  if (backends.length === 1) return backends[0];
+const chatModels = (appConfig.chatModels || []).map((m, i) => ({
+  name: m.name || `model-${i}`,
+  path: m.path,
+  ctx: m.ctx || 4096,
+  ngl: typeof m.ngl === 'number' ? m.ngl : 99,
+  chatTemplate: m.chatTemplate || '',
+  extraArgs: m.extraArgs || [],
+}));
 
-  let best = null;
-  let bestScore = Infinity;
+let chatProc = null;          // 現在起動中のチャットモデルプロセス
+let chatProcModel = null;     // 起動中のモデル名
+let chatProcStarting = false; // 起動中フラグ
+let chatLastUsed = 0;         // 最終使用時刻（idleUnload用）
+let firstChatLoadDone = false; // 起動後の初回チャットモデルロード完了フラグ
+let embedProc = null;         // Embeddingプロセス
+let embedProcStarting = false; // Embedding起動中フラグ
+let embedLastUsed = 0;        // Embedding最終使用時刻（idleUnload用）
 
-  for (const b of backends) {
-    // GPU平均使用率を算出
-    let gpuUsage = 0;
-    if (b.gpus.length > 0) {
-      gpuUsage = b.gpus.reduce((s, g) => s + (g.usage || 0), 0) / b.gpus.length;
-    }
-    const score = gpuUsage + b.activeConns * 30;
-    if (score < bestScore) {
-      bestScore = score;
-      best = b;
-    }
-  }
-  return best || backends[0];
+function findModelByName(name) {
+  return chatModels.find(m => m.name === name);
 }
 
-// リモートGPUエージェントからデータ取得
-function fetchRemoteGpu(host, port, token) {
+// llama-serverのreadyを待つ（/health か /v1/models をポーリング）
+function waitForReady(host, port, timeoutMs) {
   return new Promise((resolve) => {
-    const headers = {};
-    if (token) headers['x-agent-token'] = token;
-    const req = http.request({ hostname: host, port, path: '/', method: 'GET', timeout: 5000, headers }, (res) => {
-      let data = '';
-      res.on('data', (d) => { data += d.toString(); });
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch { resolve([]); }
+    const start = Date.now();
+    const check = () => {
+      const req = http.request({
+        hostname: host, port, path: '/health', method: 'GET', timeout: 2000
+      }, (res) => {
+        let body = '';
+        res.on('data', d => body += d);
+        res.on('end', () => {
+          // status 200 でステータスがloadingでなければOK
+          if (res.statusCode === 200) {
+            try {
+              const j = JSON.parse(body);
+              if (j.status === 'ok' || !j.status) return resolve(true);
+            } catch { return resolve(true); }
+          }
+          if (Date.now() - start > timeoutMs) return resolve(false);
+          setTimeout(check, 1000);
+        });
       });
-    });
-    req.on('error', () => resolve([]));
-    req.on('timeout', () => { req.destroy(); resolve([]); });
-    req.end();
+      req.on('error', () => {
+        if (Date.now() - start > timeoutMs) return resolve(false);
+        setTimeout(check, 1000);
+      });
+      req.on('timeout', () => { req.destroy(); });
+      req.end();
+    };
+    check();
   });
 }
 
-// ローカルマシンのIPアドレス一覧を取得
-function getLocalIps() {
-  const ips = new Set(['127.0.0.1', 'localhost', '::1', OLLAMA_HOST]);
-  const ifaces = os.networkInterfaces();
-  for (const name of Object.keys(ifaces)) {
-    for (const iface of ifaces[name] || []) {
-      if (iface.address) ips.add(iface.address);
+function spawnLlamaServer(args, label) {
+  const ls = appConfig.llamaServer;
+  log('-', `[${label}] spawn: ${ls.binPath} ${args.join(' ')}`);
+  const isQuiet = appConfig.logLevel === 'quiet';
+  const proc = spawn(ls.binPath, args, {
+    // quietモードではstdout/stderrを完全に捨てる
+    stdio: isQuiet ? ['ignore', 'ignore', 'ignore'] : ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env },
+  });
+  if (!isQuiet) {
+    proc.stdout.on('data', (d) => process.stdout.write(`[${label}] ${d}`));
+    proc.stderr.on('data', (d) => process.stderr.write(`[${label}] ${d}`));
+  }
+  proc.on('exit', (code) => log('-', `[${label}] exited with code ${code}`));
+  return proc;
+}
+
+async function startChatModel(modelName) {
+  if (chatProcStarting) throw new Error('既にモデル起動処理中です');
+  const model = findModelByName(modelName);
+  if (!model) throw new Error(`モデルが見つかりません: ${modelName}`);
+  if (!fs.existsSync(model.path)) throw new Error(`モデルファイルが存在しません: ${model.path}`);
+
+  chatProcStarting = true;
+  try {
+    await stopChatModel();
+    const ls = appConfig.llamaServer;
+    // commonArgsから --port と --host （値とペア）を除外
+    const filterPairArgs = (args, exclude) => {
+      const out = [];
+      for (let i = 0; i < args.length; i++) {
+        if (exclude.includes(args[i])) {
+          i++; // 値もスキップ
+          continue;
+        }
+        out.push(args[i]);
+      }
+      return out;
+    };
+
+    const args = [
+      '-m', model.path,
+      '-c', String(model.ctx),
+      '-ngl', String(model.ngl),
+      '--port', String(ls.chatPort),
+      '--host', ls.chatHost,
+      ...filterPairArgs(ls.commonArgs || [], ['--port', '--host']),
+      ...(model.chatTemplate ? ['--chat-template', model.chatTemplate] : []),
+      ...(model.extraArgs || []),
+    ];
+    chatProc = spawnLlamaServer(args, `chat:${model.name}`);
+    chatProcModel = model.name;
+
+    const ready = await waitForReady(ls.chatHost, ls.chatPort, ls.readyTimeoutMs);
+    if (!ready) {
+      await stopChatModel();
+      throw new Error(`チャットモデル起動タイムアウト: ${model.name}`);
+    }
+    chatLastUsed = Date.now();
+    firstChatLoadDone = true;
+    log('-', `チャットモデル起動完了: ${model.name}`);
+  } finally {
+    chatProcStarting = false;
+  }
+}
+
+function stopChatModel() {
+  return new Promise((resolve) => {
+    if (!chatProc) return resolve();
+    const p = chatProc;
+    chatProc = null;
+    chatProcModel = null;
+    p.once('exit', () => resolve());
+    try { p.kill('SIGTERM'); } catch {}
+    setTimeout(() => { try { p.kill('SIGKILL'); } catch {} resolve(); }, 5000);
+  });
+}
+
+// ─── アイドル時の自動アンロード ───
+// idleUnloadMs > 0 のとき、最終使用時刻から指定msアイドルでチャットモデルをアンロード
+let chatProcAutoUnloaded = null;  // 自動アンロード時のモデル名（再ロードに使用）
+
+setInterval(async () => {
+  const ls = appConfig.llamaServer;
+  if (!ls.idleUnloadMs || ls.idleUnloadMs <= 0) return;
+  // チャットモデルのアイドルチェック
+  if (chatProc && !chatProcStarting && chatLastUsed) {
+    const idleMs = Date.now() - chatLastUsed;
+    if (idleMs >= ls.idleUnloadMs) {
+      log('-', `アイドル ${Math.floor(idleMs/1000)}秒経過、モデル「${chatProcModel}」を自動アンロード`);
+      chatProcAutoUnloaded = chatProcModel;
+      await stopChatModel();
+      chatLastUsed = 0;
     }
   }
-  return ips;
-}
-const LOCAL_IPS = getLocalIps();
-
-// 全バックエンドのGPUデータを更新
-async function updateAllGpuData() {
-  await Promise.all(backends.map(async (b) => {
-    const isLocal = LOCAL_IPS.has(b.host);
-    if (isLocal) {
-      // ローカルは直接実行（gpu-agent不要）
-      b.gpus = await queryGpu();
-    } else if (b.gpuAgentPort) {
-      // リモートはgpu-agent経由
-      const remoteGpus = await fetchRemoteGpu(b.host, b.gpuAgentPort, b.gpuAgentToken);
-      // 取得失敗時は前回のキャッシュを維持（一時的な接続エラーでUIをちらつかせない）
-      if (remoteGpus.length > 0) b.gpus = remoteGpus;
+  // Embeddingモデルのアイドルチェック（同じidleUnloadMsを使用）
+  if (embedProc && !embedProcStarting && embedLastUsed) {
+    const idleMs = Date.now() - embedLastUsed;
+    if (idleMs >= ls.idleUnloadMs) {
+      log('-', `アイドル ${Math.floor(idleMs/1000)}秒経過、Embeddingモデルを自動アンロード`);
+      await stopEmbeddingModel();
+      embedLastUsed = 0;
     }
-  }));
+  }
+}, 30000);  // 30秒ごとにチェック
+
+// 自動アンロード後のリクエスト時に再ロード
+async function ensureChatModelLoaded() {
+  if (chatProc) return true;  // 既にロード済み
+  if (chatProcStarting) return false;  // 起動中（プロキシ側で503応答）
+  if (!chatProcAutoUnloaded) return false;  // 自動アンロードされてない（手動で停止された）
+  const modelToReload = chatProcAutoUnloaded;
+  chatProcAutoUnloaded = null;
+  log('-', `アイドル復帰: モデル「${modelToReload}」を再ロード`);
+  startChatModel(modelToReload).catch(e => log('-', `再ロードエラー: ${e.message}`));
+  return false;  // 起動中なのでこのリクエストは503扱い
 }
 
-// SSE用のデータ構築
-function buildGpuSseData() {
-  return backends.map(b => ({
-    label: b.label,
-    host: b.host,
-    port: b.port,
-    gpus: b.gpus,
-  }));
+// Embedding未起動時に再ロード（Promise返却、完了を待てる）
+async function ensureEmbeddingLoaded() {
+  if (embedProc) {
+    embedLastUsed = Date.now();
+    return true;
+  }
+  if (embedProcStarting) {
+    // 起動中: 完了を待つ
+    const startWait = Date.now();
+    while (embedProcStarting && Date.now() - startWait < 60000) {
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (embedProc) {
+      embedLastUsed = Date.now();
+      return true;
+    }
+    return false;
+  }
+  // 未起動: 起動して待つ
+  log('-', 'Embeddingアイドル復帰: 再起動');
+  await startEmbeddingModel();
+  if (embedProc) {
+    embedLastUsed = Date.now();
+    return true;
+  }
+  return false;
 }
+
+async function startEmbeddingModel() {
+  const em = appConfig.embeddingModel;
+  if (!em || !em.path) {
+    log('-', 'Embeddingモデル未設定（RAGは無効化されます）');
+    return;
+  }
+  if (!fs.existsSync(em.path)) {
+    log('-', `Embeddingモデルファイルが存在しません: ${em.path}`);
+    return;
+  }
+  if (embedProc || embedProcStarting) return;
+  embedProcStarting = true;
+  try {
+    const ls = appConfig.llamaServer;
+    const args = [
+      '-m', em.path,
+      '-c', String(em.ctx || 512),
+      '-ngl', String(typeof em.ngl === 'number' ? em.ngl : 99),
+      '--port', String(ls.embeddingPort),
+      '--host', ls.embeddingHost,
+      '--embedding',
+      ...(em.poolingType ? ['--pooling', em.poolingType] : []),
+      ...(em.extraArgs || []),
+    ];
+    embedProc = spawnLlamaServer(args, `embed`);
+    const ready = await waitForReady(ls.embeddingHost, ls.embeddingPort, ls.readyTimeoutMs);
+    if (!ready) {
+      log('-', 'Embeddingサーバー起動タイムアウト（RAGが動作しない可能性があります）');
+      try { embedProc.kill('SIGTERM'); } catch {}
+      embedProc = null;
+    } else {
+      log('-', 'Embeddingサーバー起動完了');
+      embedLastUsed = Date.now();
+    }
+  } finally {
+    embedProcStarting = false;
+  }
+}
+
+function stopEmbeddingModel() {
+  return new Promise((resolve) => {
+    if (!embedProc) return resolve();
+    const p = embedProc;
+    embedProc = null;
+    p.once('exit', () => resolve());
+    try { p.kill('SIGTERM'); } catch {}
+    setTimeout(() => { try { p.kill('SIGKILL'); } catch {} resolve(); }, 5000);
+  });
+}
+
+// プロセス終了時のクリーンアップ
+function cleanup() {
+  if (chatProc) try { chatProc.kill('SIGTERM'); } catch {}
+  if (embedProc) try { embedProc.kill('SIGTERM'); } catch {}
+}
+process.on('SIGINT', () => { cleanup(); process.exit(0); });
+process.on('SIGTERM', () => { cleanup(); process.exit(0); });
+process.on('exit', cleanup);
 
 // ─── ログ ───
 function timestamp() {
@@ -203,6 +395,10 @@ function log(ip, message) {
 
 const app = express();
 app.set('trust proxy', 'loopback'); // リバースプロキシからのX-Forwarded-*ヘッダーを信頼
+
+// ─── 共通JSONパーサー（必要なエンドポイントのみで個別適用） ───
+// /v1/* (LLMプロキシ) 等では使わない。bodyを再ストリームする必要があるため。
+const jsonParser = express.json({ limit: '10mb' });
 
 // ─── HTTP/HTTPS サーバー初期化 ───
 // cert.pem と key.pem がカレントディレクトリにあればHTTPS、なければHTTP
@@ -622,72 +818,169 @@ app.get('/transcribe/health', requireAuth, (req, res) => {
   r.on('timeout', () => { r.destroy(); res.json({ enabled: true, status: 'timeout' }); });
 });
 
-// ─── Ollama APIへのリバースプロキシ ───
-app.use('/api', requireAuth, (req, res) => {
-  const ip = getIP(req);
-  const targetPath = '/api' + req.url;
-  const backend = selectBackend();
-  backend.activeConns++;
-  let connDecremented = false;
-  const decrementConn = () => {
-    if (!connDecremented) {
-      connDecremented = true;
-      backend.activeConns = Math.max(0, backend.activeConns - 1);
+// ─── llama-server (OpenAI互換) へのリバースプロキシ ───
+// /v1/* をlocalhost:chatPortへ転送（チャット推論用）
+// /embed/v1/* をlocalhost:embeddingPortへ転送（Embedding用）
+function proxyToLlama(targetHost, targetPort, pathPrefix, isChatProxy) {
+  return async (req, res) => {
+    const ip = getIP(req);
+    const targetPath = pathPrefix + req.url;
+    const isQuiet = appConfig.logLevel === 'quiet';
+
+    // チャットプロキシの場合: モデル起動中なら503で早期返却（ユーザーに明確な状態を伝える）
+    if (isChatProxy) {
+      if (chatProcStarting) {
+        if (!isQuiet) log(ip, `503 ${req.method} ${targetPath} (model starting)`);
+        return res.status(503).json({
+          error: 'モデル起動中です。10〜30秒お待ちください。',
+          starting: true,
+          model: chatProcModel || appConfig.defaultModel,
+        });
+      }
+      if (!chatProc) {
+        // 自動アンロードされていれば自動再ロード開始
+        if (chatProcAutoUnloaded) {
+          ensureChatModelLoaded();  // バックグラウンドで再ロード開始
+          if (!isQuiet) log(ip, `503 ${req.method} ${targetPath} (auto-reloading)`);
+          return res.status(503).json({
+            error: 'アイドル状態からモデルを再ロード中です。10〜30秒お待ちください。',
+            starting: true,
+            model: chatProcModel || appConfig.defaultModel,
+          });
+        }
+        if (!isQuiet) log(ip, `503 ${req.method} ${targetPath} (no model loaded)`);
+        return res.status(503).json({
+          error: 'チャットモデルがロードされていません。',
+          starting: false,
+        });
+      }
+      chatLastUsed = Date.now();
+    } else {
+      // Embeddingプロキシ: アイドルアンロード後なら起動を待ってから処理を続行
+      if (!embedProc) {
+        if (!isQuiet) log(ip, `Embedding未起動、再ロードを待機 (${targetPath})`);
+        const ready = await ensureEmbeddingLoaded();
+        if (!ready) {
+          if (!isQuiet) log(ip, `503 ${req.method} ${targetPath} (embed reload failed)`);
+          return res.status(503).json({ error: 'Embeddingモデルの再ロードに失敗しました。' });
+        }
+      }
+      embedLastUsed = Date.now();
     }
-  };
-  const backendLabel = backends.length > 1 ? ` [${backend.host}:${backend.port}]` : '';
-  log(ip, `${req.method} ${targetPath}${backendLabel}`);
 
-  const options = {
-    hostname: backend.host,
-    port: backend.port,
-    path: targetPath,
-    method: req.method,
-    headers: {
-      'content-type': req.headers['content-type'] || 'application/json',
-      'accept': req.headers['accept'] || '*/*',
-    },
-    timeout: 300000,
-  };
+    if (!isQuiet) {
+      log(ip, `${req.method} ${targetPath} -> ${targetHost}:${targetPort}`);
+    }
 
-  if (req.headers['content-length']) {
-    options.headers['content-length'] = req.headers['content-length'];
-  }
-
-  const proxyReq = http.request(options, (proxyRes) => {
-    log(ip, `${proxyRes.statusCode} ${req.method} ${targetPath}${backendLabel}`);
-    const headers = {
-      'content-type': proxyRes.headers['content-type'] || 'application/json',
-      'cache-control': 'no-cache',
+    const options = {
+      hostname: targetHost,
+      port: targetPort,
+      path: targetPath,
+      method: req.method,
+      headers: {
+        'content-type': req.headers['content-type'] || 'application/json',
+        'accept': req.headers['accept'] || '*/*',
+      },
+      timeout: 600000,
     };
-    if (proxyRes.headers['transfer-encoding']) {
-      headers['transfer-encoding'] = proxyRes.headers['transfer-encoding'];
+    if (req.headers['content-length']) {
+      options.headers['content-length'] = req.headers['content-length'];
     }
-    res.writeHead(proxyRes.statusCode, headers);
-    proxyRes.pipe(res, { end: true });
+
+    const proxyReq = http.request(options, (proxyRes) => {
+      if (!isQuiet) {
+        log(ip, `${proxyRes.statusCode} ${req.method} ${targetPath}`);
+      }
+      const headers = {
+        'content-type': proxyRes.headers['content-type'] || 'application/json',
+        'cache-control': 'no-cache',
+      };
+      if (proxyRes.headers['transfer-encoding']) {
+        headers['transfer-encoding'] = proxyRes.headers['transfer-encoding'];
+      }
+      res.writeHead(proxyRes.statusCode, headers);
+      proxyRes.pipe(res, { end: true });
+    });
+
+    proxyReq.on('error', (err) => {
+      log(ip, `ERROR ${targetPath} ${err.message}`);
+      if (!res.headersSent) {
+        res.status(502).json({ error: 'llama-server に接続できません: ' + err.message });
+      }
+    });
+    proxyReq.on('timeout', () => {
+      log(ip, `TIMEOUT ${targetPath}`);
+      proxyReq.destroy();
+      if (!res.headersSent) {
+        res.status(504).json({ error: 'llama-server タイムアウト' });
+      }
+    });
+
+    req.pipe(proxyReq, { end: true });
+  };
+}
+
+// チャット推論: /v1/chat/completions, /v1/completions, /v1/models 等
+app.use('/v1', requireAuth, proxyToLlama(
+  appConfig.llamaServer.chatHost,
+  appConfig.llamaServer.chatPort,
+  '/v1',
+  true  // isChatProxy
+));
+
+// Embedding: /embed/v1/embeddings
+app.use('/embed/v1', requireAuth, proxyToLlama(
+  appConfig.llamaServer.embeddingHost,
+  appConfig.llamaServer.embeddingPort,
+  '/v1',
+  false
+));
+
+// ─── モデル管理API ───
+// 利用可能モデル一覧（config.jsonから）+ 現在のロード状態
+app.get('/models', requireAuth, (req, res) => {
+  res.json({
+    models: chatModels.map(m => ({
+      name: m.name,
+      ctx: m.ctx,
+      ngl: m.ngl,
+      loaded: m.name === chatProcModel,
+    })),
+    current: chatProcModel,
+    starting: chatProcStarting,
+    embeddingReady: !!embedProc,
+    autoUnloaded: chatProcAutoUnloaded,  // アイドルでアンロード済みのモデル名（次のリクエストで再ロードされる）
+    idleUnloadMs: appConfig.llamaServer.idleUnloadMs || 0,
+    firstLoadPending: !firstChatLoadDone,  // サーバー起動後、まだ一度もチャットモデルがロードされていない
   });
+});
 
-  proxyReq.on('error', (err) => {
-    log(ip, `ERROR ${targetPath}${backendLabel} ${err.message}`);
-    decrementConn();
-    if (!res.headersSent) {
-      res.status(502).json({ error: 'Ollama に接続できません: ' + err.message });
-    }
-  });
+// モデル切替（再起動）
+app.post('/models/load', requireAuth, jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const { name } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'name required' });
+  // 自動アンロード状態をクリア（手動切替が始まったので）
+  chatProcAutoUnloaded = null;
+  if (name === chatProcModel) return res.json({ ok: true, current: chatProcModel, message: 'すでにロード中' });
+  if (chatProcStarting) return res.status(409).json({ error: '別のモデルが起動中です' });
 
-  proxyReq.on('timeout', () => {
-    log(ip, `TIMEOUT ${targetPath}${backendLabel}`);
-    decrementConn();
-    proxyReq.destroy();
-    if (!res.headersSent) {
-      res.status(504).json({ error: 'Ollama タイムアウト' });
-    }
-  });
+  log(ip, `MODEL LOAD ${name}`);
+  try {
+    await startChatModel(name);
+    res.json({ ok: true, current: chatProcModel });
+  } catch (e) {
+    log(ip, `MODEL LOAD ERROR ${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
+});
 
-  // クライアント切断・正常完了時にカウンタ減算
-  res.on('close', decrementConn);
-
-  req.pipe(proxyReq, { end: true });
+// モデルアンロード
+app.post('/models/unload', requireAuth, async (req, res) => {
+  const ip = getIP(req);
+  log(ip, `MODEL UNLOAD ${chatProcModel}`);
+  await stopChatModel();
+  res.json({ ok: true });
 });
 
 // ─── GPU ステータス (SSE) ───
@@ -839,7 +1132,6 @@ app.get('/sse/gpu', requireAuth, (req, res) => {
 });
 
 // ─── アプリ設定配信 ───
-const jsonParser = express.json({ limit: '10mb' });
 
 // ─── セッショントークン管理 ───
 const SESSION_TTL = 24 * 60 * 60 * 1000; // 24時間
@@ -920,7 +1212,13 @@ function requireAuth(req, res, next) {
 }
 
 app.get('/config', (req, res) => {
-  const { password, ollamaBackends, ...safeConfig } = appConfig;
+  // 公開しない: password, llamaServer内のbinPath, embeddingModelの実体パス
+  const { password, llamaServer, embeddingModel, ...rest } = appConfig;
+  const safeConfig = {
+    ...rest,
+    // llamaServer情報は最小限のみ
+    llamaServer: { chatPort: llamaServer.chatPort, embeddingPort: llamaServer.embeddingPort },
+  };
   safeConfig.hasPassword = !!password;
 
   // 既存セッションCookieが有効かどうかを判定
@@ -1297,19 +1595,20 @@ app.get('*', (req, res) => {
 // ─── サーバー起動 ───
 server.listen(PORT, '0.0.0.0', async () => {
   const name = `${appConfig.appName} Server`;
+  const ls = appConfig.llamaServer;
   const lines = [];
-  lines.push(`  URL   : ${HTTPS_ENABLED ? 'https' : 'http'}://localhost:${PORT}`);
-  if (backends.length === 1) {
-    lines.push(`  Ollama: http://${backends[0].host}:${backends[0].port}`);
-  } else {
-    lines.push(`  Ollama: ${backends.length} backends (load-balanced)`);
-    backends.forEach((b, i) => {
-      lines.push(`    [${i}] ${b.label} http://${b.host}:${b.port} (agent :${b.gpuAgentPort || '-'})`);
-    });
-  }
-  lines.push(`  Python: ${appConfig.pythonPath || 'python3'}`);
+  lines.push(`  URL    : ${HTTPS_ENABLED ? 'https' : 'http'}://localhost:${PORT}`);
+  lines.push(`  Backend: llama.cpp (llama-server)`);
+  lines.push(`  Bin    : ${ls.binPath}`);
+  lines.push(`  Chat   : ${ls.chatHost}:${ls.chatPort}`);
+  lines.push(`  Embed  : ${ls.embeddingHost}:${ls.embeddingPort}`);
+  lines.push(`  Models : ${chatModels.length} chat model(s)`);
+  chatModels.forEach((m, i) => {
+    lines.push(`    [${i}] ${m.name} (ctx=${m.ctx}, ngl=${m.ngl})`);
+  });
+  lines.push(`  Python : ${appConfig.pythonPath || 'python3'}`);
   const w = Math.max(name.length + 6, ...lines.map(l => l.length + 2), 40);
-  const pad = (s) => s + ' '.repeat(w - s.length);
+  const pad = (s) => s + ' '.repeat(Math.max(0, w - s.length));
   console.log('');
   console.log(`  ╔${'═'.repeat(w)}╗`);
   console.log(`  ║${pad('   ' + name)}║`);
@@ -1317,15 +1616,45 @@ server.listen(PORT, '0.0.0.0', async () => {
   for (const l of lines) console.log(`  ║${pad(l)}║`);
   console.log(`  ╚${'═'.repeat(w)}╝`);
   console.log('');
-  // 起動時にGPUデータを取得
-  await updateAllGpuData();
+
+  // 起動時にGPUデータ取得
+  await updateGpuData();
+
+  // 初期モデル名のみ決定（実際のロードは最初のリクエスト時）
+  // 優先順位: 1) settings.json の前回モデル, 2) defaultModel, 3) chatModels[0]
+  if (chatModels.length > 0) {
+    let initialModel = null;
+    try {
+      if (fs.existsSync(SETTINGS_FILE)) {
+        const settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
+        if (settings.chatModel && findModelByName(settings.chatModel)) {
+          initialModel = settings.chatModel;
+        }
+      }
+    } catch (e) {
+      log('-', `settings.json読み込みエラー: ${e.message}`);
+    }
+    if (!initialModel) initialModel = appConfig.defaultModel || chatModels[0].name;
+    // VRAM節約のため起動はせず、「自動アンロード状態」として記録 → 初回リクエスト時に自動ロード
+    chatProcAutoUnloaded = initialModel;
+    log('-', `初期モデル: ${initialModel}（最初のリクエスト時にロード）`);
+  } else {
+    log('-', 'chatModels が空です。config.json でモデルを設定してください。');
+  }
+  // Embeddingも同様に初回リクエスト時にロード
+  log('-', 'Embeddingモデル: 最初のリクエスト時にロード');
 });
 
-// ─── バックグラウンドGPU監視（全クライアントで共有キャッシュ） ───
+// ─── バックグラウンドGPU監視（ローカル単体） ───
+let cachedGpuData = [];
 let gpuUpdating = false;
-async function safeUpdateGpu() {
+
+async function updateGpuData() {
   if (gpuUpdating) return;
   gpuUpdating = true;
-  try { await updateAllGpuData(); } finally { gpuUpdating = false; }
+  try { cachedGpuData = await queryGpu(); } finally { gpuUpdating = false; }
 }
-setInterval(safeUpdateGpu, GPU_INTERVAL);
+function buildGpuSseData() {
+  return [{ label: 'localhost', host: '127.0.0.1', port: appConfig.llamaServer.chatPort, gpus: cachedGpuData }];
+}
+setInterval(updateGpuData, GPU_INTERVAL);

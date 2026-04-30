@@ -3,9 +3,9 @@
 #
 # 使い方:
 #   ./generate-cert.sh                                            # localhostのみ
-#   ./generate-cert.sh ssh.wizapply.net                           # ホスト名1つ
-#   ./generate-cert.sh 192.168.10.201 ssh.wizapply.net            # 複数指定（スペース区切り）
-#   ./generate-cert.sh ssh.wizapply.net 192.168.10.201 10.0.0.5   # 3つ以上もOK
+#   ./generate-cert.sh llm.example.com                            # ホスト名1つ
+#   ./generate-cert.sh 192.168.10.201 llm.example.com             # 複数指定（スペース区切り）
+#   ./generate-cert.sh llm.example.com 192.168.10.201 10.0.0.5    # 3つ以上もOK
 #
 # cert.pem / key.pem が生成されます。再起動で自動的にHTTPSモードになります。
 
