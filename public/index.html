@@ -3122,7 +3122,27 @@ function App() {
           });
         }
 
-        if (appConfig.fileAccess !== false) {
+        // サーバーファイル系ツール: 明示的なサーバー操作キーワードがある時のみ提供
+        // （単純なコード作成依頼などで誤呼び出しを防ぐため）
+        const serverFileKeywords = [
+          'サーバーファイル', 'サーバーに', 'サーバー側', 'サーバー上',
+          'uploadsフォルダ', 'uploadsに', 'uploads/',
+          'ファイルとして保存', 'ファイルに保存', 'ファイルに書き込',
+          'として保存して', 'に保存して', 'に書き出して',
+          'ファイル一覧', 'ファイルリスト',
+          'list_files', 'read_file', 'write_file',
+        ];
+        const lowerTextForFile = text.toLowerCase();
+        const wantsServerFileOps = serverFileKeywords.some(k => lowerTextForFile.includes(k.toLowerCase()));
+        // write_file 専用の意図検出（より強いキーワード）
+        const writeIntentKeywords = [
+          'サーバーに保存', 'ファイルに保存', 'ファイルとして保存',
+          'として保存して', 'に書き込んで', 'に書き出して', 'ファイルに書き',
+          'save as', 'save to', 'write to file',
+        ];
+        const wantsFileWrite = writeIntentKeywords.some(k => lowerTextForFile.includes(k.toLowerCase()));
+
+        if (appConfig.fileAccess !== false && wantsServerFileOps) {
           tools.push({
             type: 'function',
             function: {
@@ -3145,21 +3165,24 @@ function App() {
               }
             }
           });
-          tools.push({
-            type: 'function',
-            function: {
-              name: 'write_file',
-              description: 'uploadsフォルダ内のファイルに書き込む（新規作成または上書き）。引数は必ず "path"（相対パス）と "content"（ファイル内容の文字列）の2つ。10MBまで。',
-              parameters: {
-                type: 'object',
-                properties: {
-                  path: { type: 'string', description: 'uploadsフォルダからの相対パス（例: "hello.py"）' },
-                  content: { type: 'string', description: 'ファイルに書き込む内容（文字列）' }
-                },
-                required: ['path', 'content']
+          // write_file は明確な保存依頼がある時のみ
+          if (wantsFileWrite) {
+            tools.push({
+              type: 'function',
+              function: {
+                name: 'write_file',
+                description: 'uploadsフォルダ内のファイルに書き込む（新規作成または上書き）。引数は必ず "path"（相対パス）と "content"（ファイル内容の文字列）の2つ。10MBまで。',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    path: { type: 'string', description: 'uploadsフォルダからの相対パス（例: "hello.py"）' },
+                    content: { type: 'string', description: 'ファイルに書き込む内容（文字列）' }
+                  },
+                  required: ['path', 'content']
+                }
               }
-            }
-          });
+            });
+          }
         }
 
         let agentSystem = systemPrompt;
@@ -3215,8 +3238,12 @@ function App() {
         if (webSearchActive) {
           toolListLines.push('- web_search: インターネット検索（最新情報が必要な場合）');
         }
-        if (appConfig.fileAccess !== false) {
-          toolListLines.push('- list_files/read_file/write_file: サーバーuploadsフォルダの操作（明確に「サーバーファイル」「uploadsに」と指示された場合のみ）');
+        if (appConfig.fileAccess !== false && wantsServerFileOps) {
+          if (wantsFileWrite) {
+            toolListLines.push('- list_files/read_file/write_file: サーバーuploadsフォルダの操作');
+          } else {
+            toolListLines.push('- list_files/read_file: サーバーuploadsフォルダの参照');
+          }
         }
         const judgeSystem = fillTemplate(sp.judge || '', { toolList: toolListLines.join('\n') });
 
@@ -3252,21 +3279,34 @@ function App() {
 
           // ツール呼び出し判断（非ストリーミング、thinkingオフで高速化）
           // Qwen3/Qwen3.6 系の thinking モードは tool_calls 判断時に時間を浪費するため明示的に無効化
-          const toolRes = await fetch('/v1/chat/completions', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model: chatModel,
-              messages: turnMessages,
-              tools,
-              stream: false,
-              max_tokens: judgeNumPredict,
-              // Qwen3系: chat_template_kwargs.enable_thinking=false で思考スキップ
-              chat_template_kwargs: { enable_thinking: false },
-              ...llamaCommonOptions,
-            }),
-            signal: controller.signal,
-          });
+          let toolRes;
+          let retryCount = 0;
+          const MAX_RETRIES = 3;
+          while (retryCount <= MAX_RETRIES) {
+            toolRes = await fetch('/v1/chat/completions', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                model: chatModel,
+                messages: turnMessages,
+                tools,
+                stream: false,
+                max_tokens: judgeNumPredict,
+                chat_template_kwargs: { enable_thinking: false },
+                ...llamaCommonOptions,
+              }),
+              signal: controller.signal,
+            });
+            // 503の場合はモデル起動中なので少し待ってリトライ
+            if (toolRes.status === 503 && retryCount < MAX_RETRIES) {
+              const errData = await toolRes.json().catch(() => ({}));
+              console.log(`[ツール判断 503] ${errData.error || ''} - 5秒後にリトライ (${retryCount + 1}/${MAX_RETRIES})`);
+              await new Promise(r => setTimeout(r, 5000));
+              retryCount++;
+              continue;
+            }
+            break;
+          }
 
           if (!toolRes.ok) throw new Error(`API Error: ${toolRes.status}`);
           const toolData = await toolRes.json();
@@ -3490,6 +3530,27 @@ function App() {
               // オブジェクトで渡された場合はJSON文字列化
               if (typeof fcontent === 'object') fcontent = JSON.stringify(fcontent, null, 2);
               if (typeof fcontent !== 'string') fcontent = String(fcontent);
+
+              // デバッグログ
+              console.log(`[write_file] path="${fpath}", content size=${fcontent.length}, args keys=`, Object.keys(fnArgs));
+
+              // パスが空の場合は早期エラー
+              if (!fpath || fpath.trim() === '') {
+                console.error('[write_file] パスが空のためスキップ');
+                searchQueries.push({ query: `サーバーファイル書込: (パスなし)`, resultCount: 0, type: 'file' });
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: '書き込みエラー: ファイルパスが指定されていません。' });
+                continue;
+              }
+
+              // コンテンツサイズ上限チェック (10MB)
+              const MAX_CONTENT_SIZE = 10 * 1024 * 1024;
+              if (fcontent.length > MAX_CONTENT_SIZE) {
+                console.error(`[write_file] コンテンツが大きすぎます: ${fcontent.length} bytes`);
+                searchQueries.push({ query: `サーバーファイル書込: ${fpath}`, resultCount: 0, type: 'file' });
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: `書き込みエラー: コンテンツが大きすぎます (${fcontent.length} bytes、上限10MB)` });
+                continue;
+              }
+
               searchQueries.push({ query: `サーバーファイル書込: ${fpath}`, resultCount: null, type: 'file' });
               setMessages(prev => {
                 const copy = [...prev];
@@ -3498,15 +3559,25 @@ function App() {
               });
               let ok = false, error = null, size = 0;
               try {
+                // 30秒タイムアウト付きfetch
+                const writeCtrl = new AbortController();
+                const writeTimer = setTimeout(() => writeCtrl.abort(), 30000);
+                console.log(`[write_file] fetch開始: /files/${fpath}`);
                 const res = await fetch(`/files/${encodeURI(fpath)}`, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ content: fcontent }),
+                  signal: writeCtrl.signal,
                 });
+                clearTimeout(writeTimer);
+                console.log(`[write_file] fetch完了: status=${res.status}`);
                 const data = await res.json().catch(() => ({}));
                 if (res.ok) { ok = true; size = data.size || 0; }
                 else error = data.error || `HTTP ${res.status}`;
-              } catch (e) { error = e.message; }
+              } catch (e) {
+                console.error('[write_file] エラー:', e);
+                error = e.name === 'AbortError' ? 'タイムアウト(30秒)' : e.message;
+              }
               searchQueries[searchQueries.length - 1].resultCount = ok ? 1 : 0;
               setMessages(prev => {
                 const copy = [...prev];
