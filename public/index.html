@@ -2799,11 +2799,62 @@ function App() {
     return data.data?.[0]?.embedding;
   }
 
+  // ─── Embeddingサーバー起動を待つ（ロード中・未起動時に対応） ───
+  async function waitForEmbedding() {
+    // /models APIで状態確認
+    let embedReady = false;
+    try {
+      const mres = await fetch('/models');
+      if (mres.ok) {
+        const mdata = await mres.json();
+        embedReady = !!mdata.embeddingReady;
+      }
+    } catch {}
+    if (embedReady) return true;
+
+    // 未起動: ダミーEmbeddingリクエストで起動トリガー
+    setLoadingMessage('Embeddingモデルをロード中');
+    try {
+      // 起動を待機しつつトリガー（プロキシ側で自動ロード処理）
+      await fetch('/embed/v1/embeddings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'embedding', input: 'ping' }),
+      });
+    } catch {}
+
+    // 起動完了をポーリング(最大1分、2秒間隔)
+    const startWait = Date.now();
+    while (Date.now() - startWait < 60000) {
+      try {
+        const pres = await fetch('/models');
+        if (pres.ok) {
+          const pdata = await pres.json();
+          if (pdata.embeddingReady) {
+            setLoadingMessage('');
+            return true;
+          }
+        }
+      } catch {}
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    setLoadingMessage('');
+    return false;
+  }
+
   // ─── ドキュメント追加 ───
   async function addDocument(name, text) {
     const chunks = chunkText(text);
     const jobId = Date.now() + '-' + Math.random().toString(36).slice(2, 6);
     setError('');
+
+    // Embeddingサーバーが起動していない場合は待機
+    const embReady = await waitForEmbedding();
+    if (!embReady) {
+      setError(`Embeddingモデルの起動に失敗しました。「${name}」をアップロードできません。`);
+      return;
+    }
+
     setEmbeddingJobs(prev => [...prev, { id: jobId, name, current: 0, total: chunks.length }]);
     try {
       const embeddings = [];
@@ -2823,6 +2874,9 @@ function App() {
   // ─── RAG検索 ───
   async function retrieveContext(query) {
     if (!ragEnabled || documents.length === 0) return [];
+    // Embedding未起動なら起動を待つ
+    const embReady = await waitForEmbedding();
+    if (!embReady) return [];
     try {
       const qEmb = await getEmbedding(query);
       const scored = [];
