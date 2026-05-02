@@ -1615,6 +1615,180 @@
     background: var(--accent-dim);
   }
 
+  /* ── 役割設定UI ── */
+  .role-editor-section {
+    width: 100%;
+    max-width: 600px;
+    margin: 32px auto 0;
+  }
+  .role-editor-toggle {
+    display: block;
+    margin: 0 auto;
+    background: transparent;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 10px 20px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 13px;
+    transition: all 0.2s;
+  }
+  .role-editor-toggle:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-dim);
+  }
+  .role-display {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .role-display:hover { border-color: var(--accent); }
+  .role-badge {
+    display: inline-block;
+    background: var(--accent-dim);
+    color: var(--accent);
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    margin-bottom: 6px;
+  }
+  .role-preview {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .role-editor {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .role-editor-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 8px;
+  }
+  .role-editor-textarea {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    color: var(--text);
+    font-size: 13px;
+    font-family: inherit;
+    resize: vertical;
+    box-sizing: border-box;
+    line-height: 1.6;
+  }
+  .role-editor-textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .role-editor-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 8px;
+  }
+  .role-btn-cancel, .role-btn-save {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 14px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: all 0.2s;
+  }
+  .role-btn-cancel {
+    background: transparent;
+    color: var(--text-secondary);
+  }
+  .role-btn-cancel:hover { background: var(--bg-hover); }
+  .role-btn-save {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
+  .role-btn-save:hover { opacity: 0.9; }
+  .role-editor-hint {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.5;
+  }
+  .role-indicator-btn {
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    border-radius: 6px;
+    padding: 4px 8px;
+    cursor: pointer;
+    font-size: 14px;
+    margin-left: 8px;
+    margin-right: 12px;
+    transition: all 0.2s;
+    flex-shrink: 0;
+  }
+  .role-indicator-btn:hover { background: var(--accent); color: white; }
+
+  /* ── 役割編集モーダル ── */
+  .role-modal-overlay {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .role-modal {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    max-width: 600px;
+    width: 100%;
+    max-height: 80vh;
+    overflow-y: auto;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    /* 背景を完全に不透明に */
+    background-color: var(--bg);
+    opacity: 1;
+  }
+  .role-modal .role-editor-textarea {
+    background: var(--surface);
+  }
+  .role-modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .role-modal-close {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 24px;
+    cursor: pointer;
+    line-height: 1;
+    padding: 0 4px;
+  }
+  .role-modal-close:hover { color: var(--text); }
+
   /* ── Input Area (Claude-style) ── */
   .input-area {
     padding: 12px 24px 20px;
@@ -2705,6 +2879,8 @@ function App() {
   const [chatList, setChatList] = useState([]);
   const [fileList, setFileList] = useState([]);
   const [chatTitle, setChatTitle] = useState('');
+  const [chatRole, setChatRole] = useState('');  // ユーザーがチャット開始時に設定したLLMの役割
+  const [showRoleEditor, setShowRoleEditor] = useState(false);  // 役割エディタの表示状態
   const [chatLoading, setChatLoading] = useState(false);
   const saveTimerRef = useRef(null);
 
@@ -3207,6 +3383,10 @@ function App() {
         }
         if (sp.meta) {
           agentSystem += '\n\n' + sp.meta;
+        }
+        // ユーザー設定の役割（最後に追加して最も影響力を持たせる）
+        if (chatRole && chatRole.trim()) {
+          agentSystem += '\n\n【ユーザー指定の役割・指示】\n' + chatRole.trim();
         }
 
         let apiMessages = [{ role: 'system', content: agentSystem }, ...history];
@@ -3757,6 +3937,10 @@ function App() {
         if (contexts.length > 0) {
           const ctxText = contexts.map((c, i) => `[資料${i + 1}: ${c.docName}]\n${c.chunk}`).join('\n\n');
           fullSystemPrompt += `\n\n以下の参考資料に基づいて回答してください。資料に無い情報は推測であることを明示してください。\n\n${ctxText}`;
+        }
+        // ユーザー設定の役割
+        if (chatRole && chatRole.trim()) {
+          fullSystemPrompt += '\n\n【ユーザー指定の役割・指示】\n' + chatRole.trim();
         }
 
         const res = await fetch('/v1/chat/completions', {
@@ -4569,6 +4753,7 @@ function App() {
         body: JSON.stringify({
           title: autoTitle,
           messages: msgs,
+          role: chatRole || '',
           documents: documents.map(d => ({ name: d.name, text: d.text, chunks: d.chunks, embeddings: d.embeddings })),
         }),
       });
@@ -4586,6 +4771,8 @@ function App() {
       const data = await res.json();
       setChatId(id);
       setChatTitle(data.title || '');
+      setChatRole(data.role || '');
+      setShowRoleEditor(false);
       setMessages(data.messages || []);
       setDocuments(data.documents || []);
     } catch {} finally {
@@ -4598,6 +4785,8 @@ function App() {
     setSpeakingIndex(-1);
     setChatId(Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
     setChatTitle('');
+    setChatRole('');
+    setShowRoleEditor(false);
     setMessages([]);
     setDocuments([]);
   }
@@ -4758,6 +4947,7 @@ ${conversationText}
     setChatTitle('');
     setMessages([]);
     setDocuments(prevDocs);  // 既存ドキュメントは引き継ぐ
+    // 注: chatRoleは引き継ぎ（継続チャットなので役割設定は維持）
 
     // 新ドキュメントを追加（addDocument 内で waitForEmbedding が呼ばれる）
     try {
@@ -5218,6 +5408,15 @@ ${conversationText}
                   placeholder="タイトル未設定"
                   title="クリックで編集"
                 />
+                {chatRole && (
+                  <button
+                    className="role-indicator-btn"
+                    onClick={() => setShowRoleEditor(v => !v)}
+                    title={`役割設定済み:\n${chatRole}\n\nクリックで表示/編集`}
+                  >
+                    🎭
+                  </button>
+                )}
               </>
             )}
           </div>
@@ -5243,6 +5442,32 @@ ${conversationText}
         </div>
 
         <div className="messages-container" ref={containerRef}>
+          {/* メッセージ送信後の役割編集モーダル */}
+          {messages.length > 0 && showRoleEditor && (
+            <div className="role-modal-overlay" onClick={() => setShowRoleEditor(false)}>
+              <div className="role-modal" onClick={e => e.stopPropagation()}>
+                <div className="role-modal-header">
+                  <span>🎭 LLMの役割・指示</span>
+                  <button className="role-modal-close" onClick={() => setShowRoleEditor(false)}>×</button>
+                </div>
+                <textarea
+                  className="role-editor-textarea"
+                  value={chatRole}
+                  onChange={e => setChatRole(e.target.value)}
+                  placeholder="例: あなたは熟練のPythonエンジニアです。"
+                  rows={8}
+                  autoFocus
+                />
+                <div className="role-editor-actions">
+                  <button className="role-btn-cancel" onClick={() => { setChatRole(''); setShowRoleEditor(false); }}>クリア</button>
+                  <button className="role-btn-save" onClick={() => setShowRoleEditor(false)}>確定</button>
+                </div>
+                <div className="role-editor-hint">
+                  💡 役割は次のメッセージから反映されます。チャット履歴に保存されます。
+                </div>
+              </div>
+            </div>
+          )}
           {messages.length === 0 ? (
             <div className="welcome-screen">
               <div className="welcome-icon"></div>
@@ -5254,6 +5479,41 @@ ${conversationText}
                 {appConfig.welcomeHints.map(h => (
                   <div key={h} className="hint-chip" onClick={() => { setInput(h); inputRef.current?.focus(); }}>{h}</div>
                 ))}
+              </div>
+              {/* 役割設定UI */}
+              <div className="role-editor-section">
+                {!showRoleEditor && !chatRole && (
+                  <button className="role-editor-toggle" onClick={() => setShowRoleEditor(true)}>
+                    🎭 LLMに役割を与える（任意）
+                  </button>
+                )}
+                {!showRoleEditor && chatRole && (
+                  <div className="role-display" onClick={() => setShowRoleEditor(true)} title="クリックして編集">
+                    <span className="role-badge">🎭 役割設定済み</span>
+                    <div className="role-preview">{chatRole.length > 100 ? chatRole.slice(0, 100) + '…' : chatRole}</div>
+                  </div>
+                )}
+                {showRoleEditor && (
+                  <div className="role-editor">
+                    <div className="role-editor-label">
+                      🎭 LLMの役割・指示（システムプロンプトに追加されます）
+                    </div>
+                    <textarea
+                      className="role-editor-textarea"
+                      value={chatRole}
+                      onChange={e => setChatRole(e.target.value)}
+                      placeholder="例:&#10;・あなたは熟練のPythonエンジニアです。コードレビューで具体的な改善案を提示してください。&#10;・あなたは小学生向けに優しく説明する先生です。専門用語は避けて例え話を使ってください。&#10;・回答は必ず3行以内、関西弁で。"
+                      rows={6}
+                    />
+                    <div className="role-editor-actions">
+                      <button className="role-btn-cancel" onClick={() => { setChatRole(''); setShowRoleEditor(false); }}>クリア</button>
+                      <button className="role-btn-save" onClick={() => setShowRoleEditor(false)}>確定</button>
+                    </div>
+                    <div className="role-editor-hint">
+                      💡 役割を与えると応答スタイルが大きく変わります。チャット中はヘッダー左の「役割」表示から再編集できます。
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           ) : (

@@ -1264,6 +1264,170 @@ const webSearchActive = appConfig.webSearch !== false && webSearchEnabled;
 
 ---
 
+## 🎭 LLMの役割設定（カスタムシステムプロンプト）
+
+LLMに役割や指示を与えるカスタムプロンプト機能。`config.json` の固定プロンプトとは別に、ユーザーが各チャットごとに任意のプロンプトを追加できます。
+
+### 設計思想
+
+LLMは指示への追従性が高く訓練されているため、**システムプロンプトでの役割指定** は応答品質を最も大きく変える要素のひとつです。例えば：
+
+| 役割 | 効果 |
+|:--|:--|
+| 「熟練のPythonエンジニア」 | コード品質UP、ベストプラクティス言及 |
+| 「小学生向けに説明する先生」 | 専門用語回避、平易な例え話 |
+| 「医療従事者向けの専門アドバイザー」 | 医学用語そのまま、根拠論文への言及 |
+| 「JSON形式で回答」 | 構造化出力 |
+| 「関西弁で答える」 | キャラクター付け |
+
+特に Qwen3.6/Gemma4 等の instruct モデルは指示追従性が訓練されており、効果が顕著です。
+
+### 状態管理
+
+```javascript
+const [chatRole, setChatRole] = useState('');           // 役割テキスト
+const [showRoleEditor, setShowRoleEditor] = useState(false);  // 編集UI表示状態
+```
+
+### システムプロンプトへの組み込み
+
+`agentSystem` の **最後** に追加することで最優先扱いに：
+
+```javascript
+// 構築順
+agentSystem = sp.base + sp.documents + sp.webSearch + sp.fileAccess + sp.python + sp.meta;
+
+// 最後にユーザー指定の役割を追加
+if (chatRole && chatRole.trim()) {
+  agentSystem += '\n\n【ユーザー指定の役割・指示】\n' + chatRole.trim();
+}
+```
+
+LLMはシステムプロンプトの末尾を最もよく覚える傾向があるため、最後に置くのが正解です。
+
+### UI設計の二段階
+
+**新規チャット時（メッセージなし）**: ウェルカム画面内にインライン展開UI
+
+```
+[ウェルカム画面]
+  タイトル
+  説明
+  ヒントチップ
+  ─────────────────
+  [🎭 LLMに役割を与える（任意）]  ← 折りたたみボタン
+```
+
+クリックで textarea 展開、確定すると設定済み表示に：
+
+```
+🎭 役割設定済み
+あなたは熟練のPythonエンジニアです。コードレビューでは…
+```
+
+**メッセージ送信後**: ヘッダー右側の🎭アイコン + モーダル
+
+```
+[ヘッダー]
+●Model | タイトル | 🎭
+
+[🎭クリック → モーダル表示]
+  ┌────────────────────┐
+  │ 🎭 LLMの役割・指示  × │
+  ├────────────────────┤
+  │ [textarea]            │
+  ├────────────────────┤
+  │ [クリア]   [確定]      │
+  └────────────────────┘
+```
+
+### モーダル背景の不透明化
+
+モーダル背景は通常 `rgba(0,0,0,0.5)` だと裏が透けて読みにくいため、`backdrop-filter: blur(4px)` でぼかしを加え、モーダル本体は `var(--bg)` で完全不透明に:
+
+```css
+.role-modal-overlay {
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+.role-modal {
+  background-color: var(--bg);
+  opacity: 1;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+```
+
+`opacity: 1` を明示するのは、親要素の opacity を継承しないため。`backdrop-filter` は Safari 対応のため `-webkit-backdrop-filter` も併記。
+
+### 永続化
+
+```javascript
+// 保存
+saveChat() で role: chatRole も含めてJSONに
+
+// 読み込み
+loadChat() で setChatRole(data.role || '')
+
+// クリア
+newChat() で setChatRole('') / setShowRoleEditor(false)
+
+// 継続チャット（RAG引き継ぎ）
+chatRoleはリセットせず維持（役割は継続が自然）
+```
+
+### 動作フロー
+
+```
+[ユーザー]
+  ↓ ウェルカム画面で「🎭 役割を与える」クリック
+[役割エディタ展開]
+  ↓ textareaに役割入力 → 確定
+[chatRole stateにセット]
+  ↓ メッセージ送信
+[agentSystem構築]
+  base + documents + webSearch + fileAccess + python + meta
+  + 【ユーザー指定の役割・指示】← 末尾に追加
+  ↓ LLMに送信
+[役割に従った応答]
+  ↓ saveChat() で role 含めて保存
+[loadChat時]
+  setChatRole(data.role) で復元
+```
+
+### 効果の例
+
+```
+[役割なし]
+ユーザー: Pythonで素数を計算するコードを書いて
+LLM: シンプルなエラトステネスの篩の実装...
+
+[役割: "あなたは熟練のPythonエンジニアです。型ヒント・docstring・テストも含めてプロダクションレベルのコードを提示してください"]
+ユーザー: Pythonで素数を計算するコードを書いて
+LLM: 
+```python
+from typing import Iterator
+
+def sieve_of_eratosthenes(limit: int) -> Iterator[int]:
+    """エラトステネスの篩により素数を生成する。
+    
+    Args:
+        limit: 上限値（含む）
+    
+    Yields:
+        limit以下の素数
+    """
+    ...
+```
+
+### 留意点
+
+- **chatRoleは長すぎないこと**: コンテキスト消費するため500文字以内推奨
+- **モデルによる効果の差**: Qwen3.6 > Gemma4 > Gemma3 > Qwen2.5 0.5B（小さいモデルは指示追従性が低い）
+- **継続チャットでの引き継ぎ**: RAGドキュメントとして要約された会話に加え、役割も維持されるため「過去の文脈+役割」を完全継続できる
+
+---
+
 ## 💬 継続チャット（過去会話のRAG化）
 
 長期的な対話を継続する仕組み。LLMのコンテキストウィンドウは有限ですが、過去会話を要約してRAGドキュメントとして保存することで、次のチャットから検索的に参照できます。
@@ -1646,6 +1810,12 @@ body, .app-layout, .chat-area {
 
 39. **ツール判断503は自動リトライ**
     アイドル復帰直後など、まだllama-serverが完全に起動しきっていないタイミングでツール判断リクエストが503で返ることがある。エラーをそのまま投げるとUIが止まるため、503の場合は5秒待機して最大3回までリトライする。これでロード時間のブレを吸収できる。
+
+40. **モーダルが透けて見える問題**
+    `rgba(0,0,0,0.5)` のオーバーレイ + `var(--bg)` のモーダルだけでは、ダークテーマで背景が透けて見えることがある。これは `--bg` 自体が完全な不透明な黒ではなく、CSSの仕様で親opacityを継承する場合があるため。対策は3点：(a) overlayの透明度を `0.7` に強める、(b) `backdrop-filter: blur(4px)` でぼかす（Safari対応で `-webkit-backdrop-filter` も）、(c) モーダル本体に `opacity: 1` と `background-color: var(--bg)` を明示。
+
+41. **カスタムシステムプロンプトは末尾に追加**
+    LLMに役割を与えるユーザー指定プロンプトは、システムプロンプトの **末尾** に追加するのが鉄則。Transformer系モデルは attention の関係でプロンプトの末尾を最もよく "覚える" ため、固定プロンプト（base/documents/python/meta等）の前に置くと無視されがち。`agentSystem += '\n\n【ユーザー指定の役割・指示】\n' + chatRole` のように末尾結合し、見出しで明確に区別する。
 
 ---
 
