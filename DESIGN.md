@@ -1264,6 +1264,96 @@ const webSearchActive = appConfig.webSearch !== false && webSearchEnabled;
 
 ---
 
+## 💬 継続チャット（過去会話のRAG化）
+
+長期的な対話を継続する仕組み。LLMのコンテキストウィンドウは有限ですが、過去会話を要約してRAGドキュメントとして保存することで、次のチャットから検索的に参照できます。
+
+### フロー
+
+```
+[現在のチャット]
+  ↓ ヘッダー「💬 継続チャット」クリック
+  ↓
+[LLMで詳細要約]
+  System: あなたは優秀なドキュメンテーションのプロです。
+  User:   会話履歴をmarkdownで詳細に要約（検索しやすく）
+  options: max_tokens=8192, temperature=0.3, thinking=false
+  ↓
+[markdown抽出]
+  ```markdown ... ``` で囲まれていれば中身を取り出す
+  ↓
+[ヘッダー付与]
+  # チャットタイトル
+  _作成日時: 2026/05/01 16:42_
+  _元チャットID: xyzabc_
+  ---
+  [本文]
+  ↓
+[ドキュメントとして自動アップロード]
+  ファイル名: {title}_{YYYYMMDD-HHMM}.md
+  既存ドキュメントは引き継がれる
+  ↓
+[新規チャット状態に切替]
+  チャットIDリセット、メッセージクリア
+  ドキュメントは前のものを保持＋新規追加
+```
+
+### 実装のポイント
+
+```javascript
+async function createRagDocument() {
+  // メッセージなしなら単純に新規チャット
+  if (userMsgs.length === 0 || assistantMsgs.length === 0) {
+    newChat();
+    return;
+  }
+
+  // 会話履歴を整形
+  const conversationText = messages
+    .filter(m => m.content && (m.role === 'user' || m.role === 'assistant'))
+    .map(m => `## ${m.role === 'user' ? 'ユーザー' : 'アシスタント'}\n\n${m.content.trim()}\n`)
+    .join('\n---\n\n');
+
+  // LLMに要約を依頼（thinking無効化で高速）
+  const res = await fetch('/v1/chat/completions', {
+    method: 'POST',
+    body: JSON.stringify({
+      model: chatModel,
+      messages: [{ role: 'system', content: 'ドキュメンテーションのプロ...' }, { role: 'user', content: prompt }],
+      stream: false,
+      max_tokens: 8192,
+      temperature: 0.3,
+      chat_template_kwargs: { enable_thinking: false },
+    }),
+  });
+  
+  const summaryMd = res.choices[0].message.content;
+  
+  // 新規チャット切替（既存ドキュメントは引き継ぐ）
+  const prevDocs = [...documents];
+  setMessages([]);
+  setDocuments(prevDocs);
+  
+  // 新ドキュメント追加
+  await addDocument(docName, fullMd);
+}
+```
+
+### 利点
+
+- LLMのコンテキスト超過を回避できる
+- 重要な情報を構造化したmarkdownとして保存
+- 検索可能なため、後から「○○について何と言ったか」を探せる
+- 複数のチャットを連結して長期プロジェクトを進められる
+
+### 留意点
+
+- 要約の品質は使用するモデルに依存（temperatureを0.3に下げて一貫性重視）
+- `<think>...</think>` が入らないよう `enable_thinking: false` 必須
+- 既存ドキュメントの引き継ぎロジックで `prevDocs = [...documents]` のスナップショットを忘れずに
+
+---
+
 ## 🎯 ドラッグ&ドロップ統合
 
 3つのドロップゾーンが用途で振り分け:
@@ -1541,3 +1631,165 @@ body, .app-layout, .chat-area {
 
 34. **`fakeFileList` でiteratorエラー**
     プレーンオブジェクト `{0: file, 1: file, length: 2}` を `for...of` で回すとTypeError。FileListはイテレーブルだが擬似オブジェクトには `[Symbol.iterator]` がない。`Array.from(files)` で配列化してから for...of するか、最初から配列を直接渡す。
+
+35. **CommonMarkのIntraword Emphasis制約で日本語太字が動かない**
+    `**強調**` は英語では正しく太字になるが、日本語では `気温は**24℃**程度` のように直接接続すると認識されない。これはCommonMark仕様で「単語境界」がアスタリスクの前後に必要なため。日本語/中国語/韓国語の文字に隣接する `**` の前後にゼロ幅空白 `\u200B` を挿入すると解決する。`\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}` の正規表現で対応。
+
+36. **write_file は明示的キーワード時のみtools提供**
+    Qwen3.6やGemma系は「Pythonで〜を作って」のような単純なコード作成依頼で write_file を誤呼び出しすることがある。さらに引数 `path` を空のまま送ってきて 400 Bad Request → 詰まる。これはツール定義からの除外で根本対策する：「保存」「書き込み」「サーバーに」など明示的キーワードがある時のみ `write_file` を tools 配列に push する動的提供方式が確実。
+
+37. **matplotlib のキャッシュ先（MPLCONFIGDIR）**
+    systemd の `ProtectHome=read-only` 設定下では `/home/$USER/.config/matplotlib` が書けず警告が出る（動作はする）。`Environment=MPLCONFIGDIR=/tmp/matplotlib` をsystemdユニットに、または `spawn(python, { env: { MPLCONFIGDIR: ... } })` で渡す。venv環境でも同じ環境変数が継承されるので追加対応不要。
+
+38. **モデル状態の3つのフラグを正しく区別する**
+    `modelStarting`(実際にllama-server起動中) / `autoUnloadedName`(アイドル状態で次回ロード予定) / `firstLoadPending`(起動後初回ロード待ち) は別の意味を持つ。`autoUnloadedName` だけで「ロード中」と判定すると、ブラウザを開きっぱなしの間ずっと「再ロード中」トーストが出てしまう。実際にロード処理が走っている `modelStarting=true` の時のみトーストを出すこと。
+
+39. **ツール判断503は自動リトライ**
+    アイドル復帰直後など、まだllama-serverが完全に起動しきっていないタイミングでツール判断リクエストが503で返ることがある。エラーをそのまま投げるとUIが止まるため、503の場合は5秒待機して最大3回までリトライする。これでロード時間のブレを吸収できる。
+
+---
+
+## 🌐 GPUクラスタ化（複数PC接続）
+
+llama.cppの **RPCモード** で複数PCのGPUを連結できます。OpenGeekLLMChat側は特別な改修不要、`extraArgs`で `--rpc` を渡すだけで対応します。
+
+### アーキテクチャ
+
+```
+[Master PC: llama-server]
+   │ TCP/IP (gRPC over TCP)
+   ├── [Worker 1: rpc-server] → ROCm0, ROCm1
+   ├── [Worker 2: rpc-server] → ROCm0, ROCm1
+   └── [Worker 3: rpc-server] → ROCm0, ROCm1
+```
+
+Master側がモデルロードのコーディネーターとなり、Worker側はGPU計算リソースを提供する分散構成。テンソル並列で各レイヤーを複数PC間で分散計算します。
+
+### Worker起動スクリプト例
+
+```bash
+#!/bin/bash
+# /usr/local/bin/llama-rpc-worker.sh
+
+llama-server \
+  --rpc-server \
+  --host 0.0.0.0 \
+  --port 50052 \
+  --device ROCm0,ROCm1 \
+  -ngl 99 \
+  --log-disable
+```
+
+Worker用の systemd ユニット例:
+
+```ini
+[Unit]
+Description=llama-server RPC worker
+After=network.target
+
+[Service]
+Type=simple
+User=wizapply-ai
+ExecStart=/usr/local/bin/llama-rpc-worker.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Master側 config.json
+
+```json
+"chatModels": [
+  {
+    "name": "Qwen3.6 235B (4ノードクラスタ)",
+    "path": "/path/to/Qwen3-235B-Q4_K_M.gguf",
+    "ctx": 32768,
+    "ngl": 99,
+    "extraArgs": [
+      "--rpc", "192.168.100.11:50052,192.168.100.12:50052,192.168.100.13:50052",
+      "--tensor-split", "0.25,0.25,0.25,0.25"
+    ]
+  }
+]
+```
+
+`--tensor-split` の値は (Master, Worker1, Worker2, Worker3) の順で各ノードへの分配比率。合計1.0になるよう調整。
+
+### ネットワーク要件
+
+LLM推論時、各レイヤーで GPU 間の Allreduce 通信が発生します。トークン生成は逐次的なので、通信レイテンシが推論速度に直結します。
+
+| 接続 | 帯域 | レイテンシ | 推論への影響 |
+|:--|:--|:--|:--|
+| 1GbE | 0.125 GB/s | 0.1ms | ❌ 致命的に遅い |
+| 10GbE | 1.25 GB/s | 0.05ms | ⚠️ 単機の半分以下 |
+| 25GbE | 3.1 GB/s | 0.02ms | △ 何とか実用 |
+| 100GbE (ConnectX-5) | 12.5 GB/s | 0.005ms | ◯ 実用的 |
+| 200GbE (ConnectX-6) | 25 GB/s | 0.003ms | ◎ 快適 |
+| 400GbE (ConnectX-7) | 50 GB/s | 0.002ms | ◎◎ PCIe同等 |
+| InfiniBand HDR | 25 GB/s + RDMA | 0.001ms | ★ 最速 |
+
+**結論**: 100GbE以上必須。ConnectXシリーズなら理想的。
+
+### スケーリング特性
+
+```
+70Bモデル(Q4) tokens/sec の目安:
+
+R9700×2 単機       : 30〜40 tok/s   (基準)
+R9700×4 (RPC, 100G): 50〜60 tok/s   (1.5x)
+R9700×8 (RPC, 200G): 80〜100 tok/s  (2.5x)
+```
+
+完全な線形スケールはしません（通信オーバーヘッドのため）。が:
+
+```
+405Bモデル(Q4, 約220GB):
+  単機R9700×2: 動かない（CPUオフロード必須、超低速）
+  RPC×4ノード: 動く（240GB > 220GB）、10〜20 tok/s
+```
+
+**「動かないモデルが動く」** = ∞倍効果。クラスタ化の真価はここ。
+
+### 実装上の注意点
+
+1. **モデルファイルの配置**: Master側のみで OK。初回ロード時にネットワーク経由で各Workerに転送される（70BモデルでもConnectX-6なら30秒程度）。
+
+2. **同時起動の同期**: 全Workerが起動してからMasterを起動する。Workerが落ちると即座にMaster側で503が発生する。
+
+3. **異種GPU構成**: 各ノードのGPU性能が違う場合、`--tensor-split` で配分を調整（速いノードに多く割り当てる）。
+
+4. **NICのオフロード機能**: ConnectXのRDMA/RoCEはllama.cppのRPCがネイティブ対応していないため、現時点ではTCPで使う。それでも100GbE Ethernetなら十分速い。
+
+5. **バッチサイズ**: `-b 1`（チャット）なら通信量最小。並行リクエスト時は通信量増加するので帯域に余裕を持たせる。
+
+6. **故障耐性**: 現状は冗長性なし。Worker 1台でも落ちると全体が止まる。本番運用では監視と自動復旧の仕組みが必要。
+
+### 切り分け用コマンド
+
+```bash
+# Worker側でlistenしているか
+ss -tlnp | grep 50052
+
+# Master側からの疎通
+nc -zv 192.168.100.11 50052
+
+# 帯域実測
+# Worker: iperf3 -s
+# Master: iperf3 -c 192.168.100.11 -t 10
+
+# 各WorkerのGPU状態
+for w in 192.168.100.11 192.168.100.12; do
+  ssh $w "rocm-smi --showmemuse"
+done
+```
+
+### 将来の改善（公開済みPRや予定）
+
+- **RDMA直接対応**: 現在はTCP経由のみ。ConnectXのRDMA/RoCEv2をネイティブ利用すればさらに高速化
+- **Pipeline並列**: 現在はテンソル並列のみ。レイヤー単位で分割するパイプライン並列が実装されればより大型のモデルが動く
+- **動的Worker追加**: 起動時に固定。実行中のWorker追加/削除は未対応
+
+---

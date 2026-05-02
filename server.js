@@ -506,7 +506,14 @@ except ImportError:
       log(ip, `PYTHON RUN (${msg.code.length} chars) using ${pythonCmd} in ${pyCwd}`);
 
       proc = spawn(pythonCmd, ['-u', tmpFile], {
-        env: { ...process.env, PYTHONUNBUFFERED: '1' },
+        env: {
+          ...process.env,
+          PYTHONUNBUFFERED: '1',
+          // matplotlib のキャッシュ先（~/.config が書けない環境向け）
+          MPLCONFIGDIR: process.env.MPLCONFIGDIR || '/tmp/matplotlib',
+          // 各種ライブラリの一時ディレクトリも /tmp に
+          HOME: process.env.HOME || '/tmp',
+        },
         cwd: pyCwd,
         stdio: ['pipe', 'pipe', 'pipe'],
       });

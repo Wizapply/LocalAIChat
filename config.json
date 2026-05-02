@@ -3,67 +3,89 @@
   "logoMain": "OpenGeek",
   "logoSub": "LLM Chat",
   "welcomeMessage": "ローカルLLM(llama.cpp)を使ったプライベートなAIアシスタントです。ドキュメントをアップロードしてRAG質問応答を行うか、自由にチャットを開始できます。",
-  "welcomeHints": ["このコードを解説して", "今日のニュースを教えて", "Pythonで〇〇するスクリプトを書いて"],
+  "welcomeHints": [
+    "このコードを解説して",
+    "今日のニュースを教えて",
+    "Pythonで〇〇するスクリプトを書いて"
+  ],
   "accentColor": "#34d399",
   "defaultModel": "",
   "password": "e10adc3949ba59abbe56e057f20f883e",
-  "pythonPath": "python3",
+  "pythonPath": "/home/wizapply-ai/opengeek-llm-chat/venv/bin/python",
   "logLevel": "quiet",
-
   "transcribe": {
     "enabled": false,
     "host": "127.0.0.1",
     "port": 11500
   },
-
   "llamaServer": {
     "binPath": "/usr/local/bin/llama-server",
     "chatHost": "127.0.0.1",
     "chatPort": 8080,
     "embeddingHost": "127.0.0.1",
     "embeddingPort": 8081,
-    "commonArgs": ["-fa", "on", "--device", "ROCm0,ROCm1"],
+    "commonArgs": [
+      "-fa",
+      "on",
+      "--device",
+      "ROCm0,ROCm1"
+    ],
     "readyTimeoutMs": 120000,
     "idleUnloadMs": 600000
   },
-
   "chatModels": [
     {
-      "name": "Qwen2.5 0.5B",
-      "path": "/home/wizapply-ai/opengeek-llm-chat/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
+      "name": "Qwen2.5 0.5B (軽量・高速)",
+      "path": "/home/[user]/opengeek-llm-chat/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
       "ctx": 8192,
       "ngl": 99,
       "extraArgs": []
     },
     {
-      "name": "Gemma4 31B",
-      "path": "/home/wizapply-ai/opengeek-llm-chat/models/gemma-4-31B-it-UD-Q4_K_XL.gguf",
-      "ctx": 32768,
+      "name": "Gemma3 12B Q4 (Vision対応)",
+      "path": "/home/[user]/opengeek-llm-chat/models/gemma-3-12b-it-Q4_K_M.gguf",
+      "ctx": 8192,
       "ngl": 99,
-      "extraArgs": ["--mmproj", "/home/wizapply-ai/opengeek-llm-chat/models/mmproj-gemma-4-31B-it-BF16.gguf"]
+      "extraArgs": [
+        "--mmproj",
+        "/home/[user]/opengeek-llm-chat/models/mmproj-google_gemma-3-12b-it-bf16.gguf"
+      ]
     },
     {
-      "name": "Qwen3.6 35B-A3B MOE",
-      "path": "/home/wizapply-ai/opengeek-llm-chat/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+      "name": "Gemma4 31B (最新・最高品質)",
+      "path": "/home/[user]/opengeek-llm-chat/models/gemma-4-31B-it-UD-Q4_K_XL.gguf",
       "ctx": 32768,
       "ngl": 99,
-      "extraArgs": ["--mmproj", "/home/wizapply-ai/opengeek-llm-chat/models/mmproj-Qwen3.6-35B-A3B-F16.gguf"]
+      "extraArgs": [
+        "--mmproj",
+        "/home/[user]/opengeek-llm-chat/models/mmproj-gemma-4-31B-it-BF16.gguf"
+      ]
+    },
+    {
+      "name": "Qwen3.6 35B-A3B (MoE Vision)",
+      "path": "/home/[user]/opengeek-llm-chat/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+      "ctx": 32768,
+      "ngl": 99,
+      "extraArgs": [
+        "--mmproj",
+        "/home/[user]/opengeek-llm-chat/models/mmproj-Qwen3.6-35B-A3B-F16.gguf"
+      ]
     }
   ],
-
   "embeddingModel": {
-    "path": "/home/wizapply-ai/opengeek-llm-chat/models/mxbai-embed-large-v1-f16.gguf",
+    "path": "/home/[user]/opengeek-llm-chat/models/mxbai-embed-large-v1-f16.gguf",
     "ctx": 512,
     "ngl": 99,
     "poolingType": "mean",
-    "extraArgs": ["--device", "ROCm0"]
+    "extraArgs": [
+      "--device",
+      "ROCm0"
+    ]
   },
-
   "webSearch": true,
   "fileAccess": true,
   "ragTopK": 30,
   "ragMode": "agentic",
-
   "systemPrompts": {
     "base": "あなたは親切で知識豊富なAIアシスタントです。日本語で簡潔に回答してください。今日の日付は{date}です。\n\n重要な指示:\n- 思考は手短に済ませ、ユーザーへの回答を必ず出力してください。\n- ツールから取得した情報は信頼し、そのまま使ってください（妥当性を過度に疑わないこと）。\n- 日付に関する自己矛盾を感じても、与えられた{date}を真として処理してください。過去の学習データとの整合性を気にする必要はありません。\n- 天気・ニュース・株価など現在情報は、ツールの結果をそのまま引用してください。",
     "documents": "【参照可能なドキュメント】(チャットに添付されたファイル): {docList}\nユーザーの質問が「ドキュメントについて」「資料を見て」「添付ファイル」などを示唆する場合、必ず最初に search_documents ツールを使ってください。\nこれらは添付ドキュメントであり、サーバーファイル（uploads配下）とは別物です。",
@@ -73,14 +95,12 @@
     "meta": "重要な指示:\n- 内部的な推論・検索戦略・計画・メタ的な説明は一切出力しないでください。\n- \"I need to...\", \"The user wants...\", \"I should...\" のような独り言を書かないでください。\n- ツールを呼び出すと決めたら、即座にツールを呼び出してください。テキスト応答と併用しないでください。\n- 検索結果が得られなかった場合は、その旨を簡潔に伝え、自分の知識で回答してください。",
     "judge": "以下のツールを必要に応じて呼び出してください。\n{toolList}\n\n【重要・必ず守ること】\n- 「最新」「今日」「現在」「現時点」「今の」「今週」「最近」などの語があれば、それは現在情報の要求 → 必ず web_search を使う\n- 株価/天気/ニュース/価格/為替/順位/結果/スコア → 必ず web_search を使う\n- 「リアルタイムデータは取得できません」「私は最新の情報にアクセスできません」のような断りの応答は禁止。ツールを使えば取得できる\n- 自分の知識で答えるべきか、検索すべきか迷ったら web_search を選ぶ\n\n【絶対に守ること - write_fileを使わない場合】\n- 「Pythonで〜を作って」「コードを書いて」「プログラムを書いて」→ ツール不要、コードブロックのみで応答\n- write_file は「保存して」「ファイルに書き込んで」と明示的に依頼された場合のみ使う\n- 単なるコード作成依頼で write_file を呼ぶのは禁止\n\n注意: チャット添付ドキュメントとサーバーuploadsファイルは別物。ドキュメント関連は search_documents、サーバーファイル関連は list_files/read_file/write_file。\nグラフ・計算・データ処理はツール不要。```python ... ``` コードブロックを応答に含めれば自動実行されます（matplotlibで画像表示、DuckDBで高速SQL処理可能）。\n内部推論は書かず、ツールを呼ぶか直接短く応答するかのみ。"
   },
-
   "agentContext": {
     "smallPredict": 1024,
     "largePredict": 8192,
     "judgeHistoryCount": 3,
     "largeGenKeywords": null
   },
-
   "tokenAvgWindow": 3000,
   "recentMessageCount": 6,
   "topK": 40,

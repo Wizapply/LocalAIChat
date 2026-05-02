@@ -19,6 +19,8 @@ RestartSec=10
 # 環境変数（必要に応じて）
 Environment=NODE_ENV=production
 Environment=PORT=3000
+# matplotlibのキャッシュ先（ProtectHomeで~/.config が書けないため /tmp に）
+Environment=MPLCONFIGDIR=/tmp/matplotlib
 
 # AMD ROCm環境では HSA_OVERRIDE_GFX_VERSION 等が必要な場合あり
 # Environment=HSA_OVERRIDE_GFX_VERSION=12.0.1
