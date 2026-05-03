@@ -70,6 +70,33 @@
     border-bottom: 1px solid var(--border);
   }
 
+  /* サイドバーを閉じる×ボタン（モバイル時のみ表示） */
+  .sidebar-close-btn {
+    display: none;  /* デフォルトはPC幅では非表示 */
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    font-size: 22px;
+    line-height: 1;
+    cursor: pointer;
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: all 0.2s;
+  }
+  .sidebar-close-btn:hover {
+    background: var(--bg-hover);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
   .logo {
     display: flex;
     align-items: center;
@@ -456,7 +483,7 @@
     margin-top: 2px;
   }
 
-  .chat-history-item-delete {
+  .chat-history-item-delete, .chat-history-item-copy {
     background: none;
     border: none;
     color: var(--text-muted);
@@ -469,8 +496,10 @@
     flex-shrink: 0;
   }
 
-  .chat-history-item:hover .chat-history-item-delete { opacity: 1; }
+  .chat-history-item:hover .chat-history-item-delete,
+  .chat-history-item:hover .chat-history-item-copy { opacity: 1; }
   .chat-history-item-delete:hover { color: var(--red); background: var(--red-dim); }
+  .chat-history-item-copy:hover { color: var(--accent); background: var(--accent-dim); }
 
   .chat-history-empty {
     font-size: 11px;
@@ -2219,6 +2248,15 @@
       animation: fadeIn 0.25s ease;
     }
 
+    /* モバイル時のみ☓ボタン表示 */
+    .sidebar-close-btn {
+      display: flex;
+    }
+    /* logoの左にスペース確保（×ボタンとの被り防止） */
+    .sidebar-header {
+      padding-right: 56px;
+    }
+
     /* ── ヘッダー: 2行レイアウト（上: タイトル系 / 下: アクション） ── */
     .chat-header {
       padding: 8px 10px;
@@ -2875,7 +2913,15 @@ function App() {
   const [rightPanelTab, setRightPanelTab] = useState('gpu'); // 'gpu' | 'files'
   const [tokenSpeed, setTokenSpeed] = useState(null); // { tokPerSec, totalTokens }
   const tokenHistoryRef = useRef([]); // [{ tokens, durationNs }]
-  const [chatId, setChatId] = useState(() => Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+  // URLパスからチャットIDを取得（例: /chat/abc123 → "abc123"）
+  function getChatIdFromUrl() {
+    const m = window.location.pathname.match(/^\/chat\/([a-z0-9]+)$/i);
+    return m ? m[1] : null;
+  }
+  const [chatId, setChatId] = useState(() => {
+    const urlId = getChatIdFromUrl();
+    return urlId || (Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+  });
   const [chatList, setChatList] = useState([]);
   const [fileList, setFileList] = useState([]);
   const [chatTitle, setChatTitle] = useState('');
@@ -4767,7 +4813,7 @@ function App() {
     setChatLoading(true);
     try {
       const res = await fetch(`/chats/${id}`);
-      if (!res.ok) return;
+      if (!res.ok) throw new Error(`Chat not found: ${id}`);
       const data = await res.json();
       setChatId(id);
       setChatTitle(data.title || '');
@@ -4775,7 +4821,7 @@ function App() {
       setShowRoleEditor(false);
       setMessages(data.messages || []);
       setDocuments(data.documents || []);
-    } catch {} finally {
+    } finally {
       setChatLoading(false);
     }
   }
@@ -5003,6 +5049,14 @@ ${conversationText}
     if (!authenticated) return;
     loadChatList();
     loadFileList();
+    // URLに chat ID があればそのチャットを読み込み（失敗したら新規チャットに）
+    const urlId = getChatIdFromUrl();
+    if (urlId) {
+      loadChat(urlId).catch(() => {
+        setError('指定されたチャットが見つかりません。新規チャットを開始します。');
+        window.history.replaceState(null, '', '/');
+      });
+    }
     (async () => {
       try {
         const [cfgRes, setRes] = await Promise.all([fetch('/config'), fetch('/settings')]);
@@ -5020,6 +5074,37 @@ ${conversationText}
       setTimeout(() => { settingsLoadedRef.current = true; }, 1000);
     })();
   }, [authenticated]);
+
+  // chatId変更時にURLを更新（pushState）
+  // - 新規/既存チャット切替で /chat/<id> に書き換え
+  // - ブラウザの戻る・進むに対応するため popstate も監視
+  useEffect(() => {
+    if (!authenticated) return;
+    const desiredPath = `/chat/${chatId}`;
+    if (window.location.pathname !== desiredPath) {
+      window.history.pushState({ chatId }, '', desiredPath);
+    }
+  }, [chatId, authenticated]);
+
+  // ブラウザの戻る・進むボタン対応
+  useEffect(() => {
+    if (!authenticated) return;
+    const onPopState = () => {
+      const urlId = getChatIdFromUrl();
+      if (urlId && urlId !== chatId) {
+        loadChat(urlId).catch(() => {
+          // ロード失敗（存在しないIDなど）→ 新規チャットへ
+          newChat();
+          window.history.replaceState(null, '', '/');
+        });
+      } else if (!urlId) {
+        // URLが / になったら新規チャット
+        newChat();
+      }
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [authenticated, chatId]);
 
   // グローバル設定の自動保存（変更時、設定読み込み完了後のみ）
   useEffect(() => {
@@ -5225,6 +5310,7 @@ ${conversationText}
 
       {/* ── Sidebar ── */}
       <div className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
+        <button className="sidebar-close-btn" onClick={() => setSidebarOpen(false)} title="サイドバーを閉じる">×</button>
         <div className="sidebar-header">
           <div className="logo">
             <div className="logo-icon"></div>
@@ -5260,7 +5346,7 @@ ${conversationText}
         <div className="chat-history-panel">
           <div className="chat-history-header">
             <span className="chat-history-title">チャット履歴</span>
-            <button className="new-chat-btn" onClick={newChat}>+ 新規</button>
+            <button className="new-chat-btn" onClick={() => { newChat(); if (window.innerWidth <= 768) setSidebarOpen(false); }}>+ 新規</button>
           </div>
           <div className="chat-history-list">
             {chatList.length === 0 ? (
@@ -5270,7 +5356,7 @@ ${conversationText}
                 <div
                   key={c.id}
                   className={`chat-history-item ${c.id === chatId ? 'active' : ''}`}
-                  onClick={() => loadChat(c.id)}
+                  onClick={() => { loadChat(c.id); if (window.innerWidth <= 768) setSidebarOpen(false); }}
                 >
                   <div className="chat-history-item-info">
                     <div className="chat-history-item-title">{c.title}</div>
@@ -5278,6 +5364,22 @@ ${conversationText}
                       {c.messageCount}件{c.docCount > 0 ? ` · ${c.docCount}文書` : ''} · {c.updatedAt ? new Date(c.updatedAt).toLocaleDateString('ja-JP') : ''}
                     </div>
                   </div>
+                  <button
+                    className="chat-history-item-copy"
+                    onClick={async e => {
+                      e.stopPropagation();
+                      const url = `${window.location.origin}/chat/${c.id}`;
+                      try {
+                        await navigator.clipboard.writeText(url);
+                        setError('');
+                        setLoadingMessage(`✓ URLをコピーしました: ${url}`);
+                        setTimeout(() => setLoadingMessage(''), 2000);
+                      } catch {
+                        setError(`URL: ${url}`);
+                      }
+                    }}
+                    title="このチャットのURLをコピー"
+                  >🔗</button>
                   <button
                     className="chat-history-item-delete"
                     onClick={e => { e.stopPropagation(); deleteChat(c.id); }}

@@ -1428,6 +1428,175 @@ def sieve_of_eratosthenes(limit: int) -> Iterator[int]:
 
 ---
 
+## 🔗 共有可能なURL（チャットID反映）
+
+各チャットセッションを `/chat/<id>` のURLで直接アクセスできるようにする機能。SPAのHistory APIを使ったルーティング実装。
+
+### URL構造
+
+```
+https://example.com:3000/             ← 通常アクセス（新規チャット）
+https://example.com:3000/chat/abc123  ← 特定チャットに直接アクセス
+```
+
+### 設計のポイント
+
+#### 1. サーバー側はフォールバックのみ
+
+```javascript
+// server.js: 既存の SPA フォールバックがそのまま機能
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+```
+
+`/chat/abc123` のようなパスでもindex.htmlが返るため、特別な改修不要。
+
+#### 2. クライアント側でURLパース
+
+```javascript
+function getChatIdFromUrl() {
+  const m = window.location.pathname.match(/^\/chat\/([a-z0-9]+)$/i);
+  return m ? m[1] : null;
+}
+
+const [chatId, setChatId] = useState(() => {
+  const urlId = getChatIdFromUrl();
+  return urlId || generateNewId();
+});
+```
+
+#### 3. chatId変更時にURL更新（pushState）
+
+```javascript
+useEffect(() => {
+  if (!authenticated) return;
+  const desiredPath = `/chat/${chatId}`;
+  if (window.location.pathname !== desiredPath) {
+    window.history.pushState({ chatId }, '', desiredPath);
+  }
+}, [chatId, authenticated]);
+```
+
+`pushState` を使うことで履歴に追加され、ブラウザの戻る/進むが効く。
+
+#### 4. popstate イベントで戻る/進む対応
+
+```javascript
+useEffect(() => {
+  const onPopState = () => {
+    const urlId = getChatIdFromUrl();
+    if (urlId && urlId !== chatId) {
+      loadChat(urlId).catch(() => {
+        newChat();
+        window.history.replaceState(null, '', '/');
+      });
+    } else if (!urlId) {
+      newChat();
+    }
+  };
+  window.addEventListener('popstate', onPopState);
+  return () => window.removeEventListener('popstate', onPopState);
+}, [authenticated, chatId]);
+```
+
+#### 5. URLコピーボタン
+
+履歴アイテムにホバーすると🔗ボタン表示、`navigator.clipboard.writeText` でコピー:
+
+```javascript
+const url = `${window.location.origin}/chat/${c.id}`;
+await navigator.clipboard.writeText(url);
+setLoadingMessage(`✓ URLをコピーしました: ${url}`);
+```
+
+`navigator.clipboard` は **HTTPS必須**（HTTPでは `setError` でURL表示にフォールバック）。
+
+### エッジケース対応
+
+| ケース | 動作 |
+|:--|:--|
+| 存在しないIDでアクセス | 「指定されたチャットが見つかりません」表示後、新規チャット |
+| ロード失敗（DB破損等） | エラーをthrow → catchで新規チャットへフォールバック |
+| 現在開いているチャットを削除 | `newChat()` でID再生成、URLも自動更新 |
+| 認証前のアクセス | ログイン画面表示後、認証成功で目的のチャットがロード |
+
+### 利点
+
+- **ブックマーク可能**: 重要なチャットをブックマーク登録して即座に復帰
+- **共有可能**: チームメンバーにURLを送って同じ会話文脈を共有
+- **戻る/進む**: ブラウザのネイティブUIでチャット切替
+- **複数タブ**: 異なるチャットを別タブで同時に開ける
+
+### 留意点
+
+- `navigator.clipboard` はHTTPS環境必須（HTTPだとフォールバックでテキスト表示のみ）
+- 認証セッションは共有されないため、URLを共有しても相手はログインが必要
+- 削除されたチャットIDのURLは無効になる（自動的に新規チャットへ）
+
+---
+
+## 📱 モバイルサイドバー閉じる機能
+
+スマホサイズ(≤768px)では、サイドバーを開いた状態で操作するとチャット画面が隠れて操作しづらいため、明示的な閉じる機能を実装。
+
+### 設計
+
+#### 1. ×ボタン（モバイル時のみ表示）
+
+```css
+.sidebar-close-btn {
+  display: none;  /* PC幅では非表示 */
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  /* ... */
+}
+@media (max-width: 768px) {
+  .sidebar-close-btn {
+    display: flex;
+  }
+  .sidebar-header {
+    padding-right: 56px;  /* ロゴと×ボタンの被り防止 */
+  }
+}
+```
+
+#### 2. チャット選択時の自動閉じ
+
+```javascript
+// 履歴アイテム
+onClick={() => {
+  loadChat(c.id);
+  if (window.innerWidth <= 768) setSidebarOpen(false);
+}}
+
+// 新規チャット
+onClick={() => {
+  newChat();
+  if (window.innerWidth <= 768) setSidebarOpen(false);
+}}
+```
+
+`window.innerWidth <= 768` でモバイル幅判定。PCではサイドバーを開いたまま維持。
+
+### 動作フロー
+
+```
+[モバイル: 幅 ≤ 768px]
+☰タップ → サイドバー開く
+   ├─ チャット選択 → loadChat + サイドバー自動で閉じる ✓
+   ├─ + 新規 → newChat + サイドバー自動で閉じる ✓
+   ├─ ×ボタン → サイドバー閉じる ✓
+   └─ オーバーレイタップ → サイドバー閉じる（既存）
+
+[PC: 幅 > 768px]
+× ボタンは非表示
+チャット選択しても閉じない（PCではエリア固定）
+```
+
+---
+
 ## 💬 継続チャット（過去会話のRAG化）
 
 長期的な対話を継続する仕組み。LLMのコンテキストウィンドウは有限ですが、過去会話を要約してRAGドキュメントとして保存することで、次のチャットから検索的に参照できます。
@@ -1816,6 +1985,20 @@ body, .app-layout, .chat-area {
 
 41. **カスタムシステムプロンプトは末尾に追加**
     LLMに役割を与えるユーザー指定プロンプトは、システムプロンプトの **末尾** に追加するのが鉄則。Transformer系モデルは attention の関係でプロンプトの末尾を最もよく "覚える" ため、固定プロンプト（base/documents/python/meta等）の前に置くと無視されがち。`agentSystem += '\n\n【ユーザー指定の役割・指示】\n' + chatRole` のように末尾結合し、見出しで明確に区別する。
+
+42. **SPAルーティングはサーバー側のフォールバックが必須**
+    `/chat/<id>` のようなURLでアクセスされた時、index.htmlが返らないと404になる。`app.get('*', (req, res) => res.sendFile('public/index.html'))` のフォールバックが必要。ただしこれを `app.use(express.static())` の **前に** 置くと、CSSや画像も index.html を返してしまう。順序は: 個別ルート → 静的配信 → `app.get('*')` フォールバック。
+
+43. **navigator.clipboardはHTTPS必須**
+    `navigator.clipboard.writeText()` は HTTPS（または localhost）でのみ動作する。HTTP環境ではpermission deniedで失敗する。フォールバックとして:
+    ```javascript
+    try { await navigator.clipboard.writeText(url); }
+    catch { setError(`URL: ${url}`); }  // 失敗時はテキスト表示でユーザーが手動コピー
+    ```
+    本番運用ではHTTPS化を強く推奨。
+
+44. **pushStateとpopstateの依存関係**
+    `useEffect([chatId])` で pushState 更新、`useEffect([])` で popstate 監視を実装する場合、popstate の useEffect が古い chatId を closure で掴むため正しく比較できない。`useEffect([chatId])` で popstate も監視し、毎回 listener を再登録する必要がある。`return () => removeEventListener` でクリーンアップ忘れずに。
 
 ---
 
