@@ -2889,8 +2889,14 @@ function renderLatex(text) {
   // 日本語/中国語/韓国語に隣接する **...** の周囲にゼロ幅空白を挿入してMarkdownの太字を有効化
   // CommonMark仕様の "Intraword Emphasis" 制約への対策
   // 例: 気温は**24℃**程度  →  気温は​**24℃**​程度
-  text = text.replace(/([\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}])\*\*(?=\S)/gu, '$1\u200B**');
-  text = text.replace(/(?<=\S)\*\*([\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}])/gu, '**\u200B$1');
+  // 例: **「Matrix Core」**と呼ばれる  →  **​「Matrix Core」​**​と呼ばれる
+  // 対象: 漢字/ひらがな/カタカナ/ハングル + CJK記号・句読点（「」『』、。…など）+ 全角英数記号
+  // \uFF00-\uFFEF: 半角・全角形（全角英数、句読点）
+  // \u3000-\u303F: CJK記号・句読点（、。「」『』〈〉…）
+  // \u30FB: ・ (中黒)
+  const CJK_CHAR = '[\\p{Script=Han}\\p{Script=Hiragana}\\p{Script=Katakana}\\p{Script=Hangul}\\u3000-\\u303F\\u30FB\\uFF00-\\uFFEF]';
+  text = text.replace(new RegExp(`(${CJK_CHAR})\\*\\*(?=\\S)`, 'gu'), '$1\u200B**');
+  text = text.replace(new RegExp(`(?<=\\S)\\*\\*(${CJK_CHAR})`, 'gu'), '**\u200B$1');
 
   // Markdown変換
   let html;
