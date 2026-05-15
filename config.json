@@ -11,7 +11,7 @@
   "accentColor": "#34d399",
   "defaultModel": "",
   "password": "e10adc3949ba59abbe56e057f20f883e",
-  "pythonPath": "/home/wizapply-ai/opengeek-llm-chat/venv/bin/python",
+  "pythonPath": "/home/[user]/opengeek-llm-chat/venv/bin/python",
   "logLevel": "quiet",
   "transcribe": {
     "enabled": false,
@@ -36,44 +36,44 @@
   "chatModels": [
     {
       "name": "Qwen2.5 0.5B (軽量・高速)",
-      "path": "/home/[user]/opengeek-llm-chat/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
-      "ctx": 8192,
+      "path": "/home/wizapply-ai/opengeek-llm-chat/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
+      "ctx": 32768,
       "ngl": 99,
       "extraArgs": []
     },
     {
       "name": "Gemma3 12B Q4 (Vision対応)",
-      "path": "/home/[user]/opengeek-llm-chat/models/gemma-3-12b-it-Q4_K_M.gguf",
+      "path": "/home/wizapply-ai/opengeek-llm-chat/models/gemma-3-12b-it-Q4_K_M.gguf",
       "ctx": 8192,
       "ngl": 99,
       "extraArgs": [
         "--mmproj",
-        "/home/[user]/opengeek-llm-chat/models/mmproj-google_gemma-3-12b-it-bf16.gguf"
+        "/home/wizapply-ai/opengeek-llm-chat/models/mmproj-google_gemma-3-12b-it-bf16.gguf"
       ]
     },
     {
       "name": "Gemma4 31B (最新・最高品質)",
-      "path": "/home/[user]/opengeek-llm-chat/models/gemma-4-31B-it-UD-Q4_K_XL.gguf",
-      "ctx": 32768,
+      "path": "/home/wizapply-ai/opengeek-llm-chat/models/gemma-4-31B-it-UD-Q4_K_XL.gguf",
+      "ctx": 8192,
       "ngl": 99,
       "extraArgs": [
         "--mmproj",
-        "/home/[user]/opengeek-llm-chat/models/mmproj-gemma-4-31B-it-BF16.gguf"
+        "/home/wizapply-ai/opengeek-llm-chat/models/mmproj-gemma-4-31B-it-BF16.gguf"
       ]
     },
     {
       "name": "Qwen3.6 35B-A3B (MoE Vision)",
-      "path": "/home/[user]/opengeek-llm-chat/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
-      "ctx": 32768,
+      "path": "/home/wizapply-ai/opengeek-llm-chat/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+      "ctx": 16384,
       "ngl": 99,
       "extraArgs": [
         "--mmproj",
-        "/home/[user]/opengeek-llm-chat/models/mmproj-Qwen3.6-35B-A3B-F16.gguf"
+        "/home/wizapply-ai/opengeek-llm-chat/models/mmproj-Qwen3.6-35B-A3B-F16.gguf"
       ]
     }
   ],
   "embeddingModel": {
-    "path": "/home/[user]/opengeek-llm-chat/models/mxbai-embed-large-v1-f16.gguf",
+    "path": "/home/wizapply-ai/opengeek-llm-chat/models/mxbai-embed-large-v1-f16.gguf",
     "ctx": 512,
     "ngl": 99,
     "poolingType": "mean",
@@ -105,5 +105,5 @@
   "recentMessageCount": 6,
   "topK": 40,
   "topP": 0.9,
-  "temperature": 0.7
+  "temperature": 0.9
 }

@@ -1428,6 +1428,179 @@ def sieve_of_eratosthenes(limit: int) -> Iterator[int]:
 
 ---
 
+## 🌐 外部APIサーバー公開（OpenAI互換）
+
+OpenGeekLLMChat本体（Node.js）から、選択したモデルを **独立した llama-server プロセス** として外部公開する機能。
+
+### アーキテクチャ
+
+```
+┌─ Node.js (OpenGeekLLMChat) ─────────────────┐
+│                                              │
+│ ┌─── 内部 llama-server (UI専用) ────────┐  │
+│ │ 127.0.0.1:8080  (Chat)               │  │
+│ │ 127.0.0.1:8081  (Embedding)          │  │
+│ │ → アイドルアンロード対応              │  │
+│ └────────────────────────────────────────┘  │
+│                                              │
+│ ┌─── 外部APIサーバー（複数起動可能）────┐  │
+│ │ プロセス管理: Map<id, {proc, ...}>    │  │
+│ │ - server 1: 0.0.0.0:11434 (Chat A)   │  │
+│ │ - server 2: 0.0.0.0:11435 (Chat B)   │  │
+│ │ → APIキー認証、HTTPS可、独立プロセス │  │
+│ └────────────────────────────────────────┘  │
+└──────────────────────────────────────────────┘
+     ↑              ↑
+   UI(3000)     外部クライアント (curl, SDK等)
+```
+
+内部用と外部公開用を **別プロセス・別ポート** にすることで:
+- UI側のチャットがアイドルアンロードしても外部APIは継続
+- 外部APIの設定（モデル/ポート/HTTPS）を自由に変えられる
+- 複数モデル同時公開可能
+
+### サーバー側実装
+
+#### プロセス管理データ構造
+
+```javascript
+const externalServers = new Map();  // id → { proc, modelName, host, port, apiKey, type, https, startedAt }
+let nextExternalServerId = 1;
+```
+
+#### llama-server起動の差分
+
+メイン用と違い、外部用は:
+1. ポートが指定可能（衝突チェックあり）
+2. `--api-key` 必須（自動生成 or 手動指定）
+3. `--ssl-cert-file` `--ssl-key-file` を HTTPS有効時に追加
+4. アイドルアンロード対象外
+
+```javascript
+const sslArgs = https && HTTPS_ENABLED
+  ? ['--ssl-cert-file', CERT_PATH, '--ssl-key-file', KEY_PATH]
+  : [];
+
+const args = [
+  '-m', model.path,
+  '-c', String(model.ctx),
+  '-ngl', String(model.ngl),
+  '--port', String(port),
+  '--host', host,
+  ...filterPairArgs(ls.commonArgs || [], ['--port', '--host']),
+  ...(apiKey ? ['--api-key', apiKey] : []),
+  ...sslArgs,
+  ...(model.extraArgs || []),
+];
+```
+
+#### waitForReady の HTTPS対応
+
+llama-serverのHTTPSモードで起動した場合、ヘルスチェックも HTTPS で行う必要があります:
+
+```javascript
+function waitForReady(host, port, timeoutMs, useHttps) {
+  const mod = useHttps ? require('https') : http;
+  const req = mod.request({
+    hostname: host, port, path: '/health', method: 'GET',
+    rejectUnauthorized: false,  // 自己署名証明書も受け入れる
+  }, ...);
+}
+```
+
+### REST API
+
+| メソッド | パス | 説明 |
+|:--|:--|:--|
+| GET | `/external-servers` | 起動中サーバー一覧 |
+| POST | `/external-servers` | 起動 (modelName, host, port, apiKey, type, https) |
+| DELETE | `/external-servers/:id` | 停止 |
+| GET | `/external-servers/https-available` | HTTPS利用可否（cert.pemの存在チェック） |
+
+### UI設計
+
+右パネルに第3タブ「🌐 API」を追加（GPU・ファイル と同列）。
+
+```
+┌─────────────────────────────┐
+│ [GPU] [📁 ファイル(1)] [🌐 API] │
+├─────────────────────────────┤
+│ 外部APIサーバー起動           │
+├─────────────────────────────┤
+│ モデル: [Qwen3.6 35B-A3B ▼]  │
+│ 公開範囲: [外部公開 0.0.0.0 ▼]│
+│ ポート: 11434                 │
+│ APIキー: [空欄で自動生成]      │
+│ ☑ HTTPS で起動する           │
+│ [🚀 起動]                    │
+├─────────────────────────────┤
+│ 起動中のサーバー (1)          │
+├─────────────────────────────┤
+│ ● 稼働中                  ✕   │
+│ Qwen3.6 35B-A3B               │
+│ URL: https://example.com:...  │
+│      📋 [コピー]              │
+│ Local: https://127.0.0.1:...  │
+│ Key:  sk-xxxxxx...            │
+│ 例: curl ...                  │
+└─────────────────────────────┘
+```
+
+### URL表示のスマート化
+
+`host=0.0.0.0` で起動した場合、サーバーは全インターフェースで待ち受けるため「どのIPで接続するか」をクライアントが選ぶ必要があります。UIでは **現在ブラウザがアクセスしているhostname** を表示することで、コピペでそのまま接続できるようにしました:
+
+```javascript
+const displayHost = (s.host === '0.0.0.0' || s.host === '::')
+  ? window.location.hostname  // ブラウザでアクセス中のドメイン名
+  : s.host;
+const proto = s.https ? 'https' : 'http';
+const externalUrl = `${proto}://${displayHost}:${s.port}/v1`;
+```
+
+ブラウザで `https://llm.wizapply.com:3000` にアクセス中なら、外部API URLは `https://llm.wizapply.com:11434/v1` と表示されます。
+
+### HTTPSデフォルト値
+
+ページがHTTPSアクセス中なら、HTTPSチェックボックスのデフォルトをONに:
+
+```javascript
+const [apiFormHttps, setApiFormHttps] = useState(
+  typeof window !== 'undefined' && window.location.protocol === 'https:'
+);
+```
+
+OpenGeekLLMChat全体をHTTPSで運用しているなら、外部APIも同じ証明書でHTTPS化するのが自然。
+
+### ポート設計
+
+- デフォルト: `11434`（Ollamaの標準ポート、既存ツールがそのまま使える）
+- 衝突チェック: 内部用ポート（8080, 8081）、外部用ポート間
+- 推奨: `11434`, `9000-9999` 等のユーザーレベルポート
+
+### 永続化
+
+`external-servers.json` に状態をディスク保存。ただし **プロセス自体は復元しません**（再起動後は手動で再起動）。実装簡単化のため、ファイルは現状ほぼログ的な役割。
+
+### Embedding公開
+
+サーバー側は Embedding にも対応していますが、UIでは Chat のみに絞っています（理由: Embeddingは普通内部用で十分、外部公開ニーズが低い、UI複雑化を避ける）。必要なら REST API 直叩きで `type=embedding` を渡せます。
+
+### セキュリティ考慮
+
+- **APIキー必須**: llama-server レベルで認証強制
+- **自己署名証明書のリスク**: クライアント側で検証スキップ必要 → 正規証明書（Let's Encrypt）推奨
+- **ファイアウォール**: ポート開放は OS 側で制御。`ufw allow 11434/tcp` 等
+- **同時セッション**: llama-server自体が並行リクエスト処理可（`-np`, `--cont-batching`）
+
+### 留意点
+
+- 外部APIサーバーには **アイドルアンロード機能なし**: 起動したら手動で停止するまでVRAMを保持
+- メインUI用 llama-server とは **独立プロセス**: 同じモデルでも別途VRAM消費
+- 起動状態の **自動復元なし**: プロセス再起動後は再度UIで起動が必要
+
+---
+
 ## 🔗 共有可能なURL（チャットID反映）
 
 各チャットセッションを `/chat/<id>` のURLで直接アクセスできるようにする機能。SPAのHistory APIを使ったルーティング実装。
@@ -1999,6 +2172,18 @@ body, .app-layout, .chat-area {
 
 44. **pushStateとpopstateの依存関係**
     `useEffect([chatId])` で pushState 更新、`useEffect([])` で popstate 監視を実装する場合、popstate の useEffect が古い chatId を closure で掴むため正しく比較できない。`useEffect([chatId])` で popstate も監視し、毎回 listener を再登録する必要がある。`return () => removeEventListener` でクリーンアップ忘れずに。
+
+45. **CSS の相対パスは SPA で深い階層に対応しない**
+    `url("aiicon.jpg")` のような相対パスは、ブラウザが **現在のページURLを基準** に解決する。`/chat/abc123` のような階層に直接アクセスすると、`/chat/aiicon.jpg` を要求して404になる。対策は CSS / HTML すべてのリソースを **絶対パス（`/aiicon.jpg`）** で記述すること。`<base href="/">` を使う方法もあるが、SPAでルーティング設計が複雑になる場合があるので絶対パスのほうが安全。SPAルーティング導入時に発覚しがちな盲点。
+
+46. **CJK記号類も日本語太字対応に含める**
+    日本語の `**強調**` 対策でゼロ幅空白を挿入する際、最初は漢字・ひらがな・カタカナだけ対象にしていたが、`**「文字列」**` のように **CJK記号（「」『』、。等）に隣接** すると太字にならない。CommonMarkは「単語境界」として記号を扱わないため。対象に `\u3000-\u303F`（CJK記号・句読点）と `\uFF00-\uFFEF`（全角形）を追加する。
+
+47. **llama-server の HTTPSヘルスチェック**
+    llama-serverを `--ssl-cert-file --ssl-key-file` でHTTPS起動した場合、`/health` エンドポイントもHTTPSになる。Node.js側でヘルスチェックする `waitForReady` は通常 `http` モジュールだが、HTTPS時は `https` モジュールに切替必須。自己署名証明書を考慮して `rejectUnauthorized: false` も忘れずに。これを忘れるとサーバーは起動しているのに「タイムアウト」エラーになる。
+
+48. **window.location.replace() vs history.replaceState()**
+    URL を変えるだけなら `history.replaceState` で十分だが、React state を完全リセットしたい場合は `window.location.replace()` を使う。前者はSPAのまま、後者はページ全体を再読み込み（履歴には残らない）。削除済みチャットIDのURLに更新でアクセスしたケースで、`replaceState` だけだと state が中途半端な状態で残るため、完全リロードで初期化したほうが安全。
 
 ---
 

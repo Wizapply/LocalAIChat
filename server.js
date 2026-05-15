@@ -132,17 +132,29 @@ let embedProc = null;         // Embeddingプロセス
 let embedProcStarting = false; // Embedding起動中フラグ
 let embedLastUsed = 0;        // Embedding最終使用時刻（idleUnload用）
 
+// ─── 外部API公開サーバー管理 ───
+// 外部公開用の OpenAI 互換 llama-server を独立プロセスで起動・管理する。
+// メインのチャット/Embedding用とは別ポート・別プロセス。
+// 構造: Map<serverId, { proc, modelName, host, port, apiKey, type, startedAt }>
+const externalServers = new Map();
+let nextExternalServerId = 1;
+const EXTERNAL_SERVERS_STATE_FILE = path.join(__dirname, 'external-servers.json');
+
 function findModelByName(name) {
   return chatModels.find(m => m.name === name);
 }
 
 // llama-serverのreadyを待つ（/health か /v1/models をポーリング）
-function waitForReady(host, port, timeoutMs) {
+function waitForReady(host, port, timeoutMs, useHttps) {
   return new Promise((resolve) => {
     const start = Date.now();
+    const httpsMod = require('https');
+    const mod = useHttps ? httpsMod : http;
     const check = () => {
-      const req = http.request({
-        hostname: host, port, path: '/health', method: 'GET', timeout: 2000
+      const req = mod.request({
+        hostname: host, port, path: '/health', method: 'GET', timeout: 2000,
+        // 自己署名証明書の場合も受け入れる
+        rejectUnauthorized: false,
       }, (res) => {
         let body = '';
         res.on('data', d => body += d);
@@ -184,6 +196,165 @@ function spawnLlamaServer(args, label) {
   }
   proc.on('exit', (code) => log('-', `[${label}] exited with code ${code}`));
   return proc;
+}
+
+// ─── 外部API公開サーバー: 起動・停止・状態管理 ───
+
+function generateApiKey() {
+  return 'sk-' + crypto.randomBytes(24).toString('hex');
+}
+
+// 外部APIサーバー一覧（メタ情報のみ、プロセスは含まない）
+function listExternalServers() {
+  const list = [];
+  for (const [id, s] of externalServers) {
+    list.push({
+      id,
+      modelName: s.modelName,
+      host: s.host,
+      port: s.port,
+      apiKey: s.apiKey,
+      type: s.type,
+      https: !!s.https,
+      running: !!(s.proc && !s.proc.killed),
+      startedAt: s.startedAt,
+    });
+  }
+  return list.sort((a, b) => a.id - b.id);
+}
+
+// 外部APIサーバーの状態をディスクに保存
+function saveExternalServersState() {
+  try {
+    const data = listExternalServers().map(s => ({
+      id: s.id, modelName: s.modelName, host: s.host, port: s.port,
+      apiKey: s.apiKey, type: s.type,
+    }));
+    fs.writeFileSync(EXTERNAL_SERVERS_STATE_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    log('-', `[外部API] 状態保存失敗: ${e.message}`);
+  }
+}
+
+// 外部APIサーバーを起動
+async function startExternalServer({ modelName, host, port, apiKey, type, https }) {
+  // 同じポートが既に使われていないかチェック
+  for (const [, s] of externalServers) {
+    if (s.port === port && s.proc && !s.proc.killed) {
+      throw new Error(`ポート ${port} は既に外部APIサーバーで使用中です`);
+    }
+  }
+  // メインのポートと衝突しないか
+  const ls = appConfig.llamaServer;
+  if (port === ls.chatPort || port === ls.embeddingPort) {
+    throw new Error(`ポート ${port} は内部llama-serverで使用中です`);
+  }
+
+  // HTTPS指定だが証明書がない場合はエラー
+  if (https && !HTTPS_ENABLED) {
+    throw new Error('HTTPSで起動するには cert.pem と key.pem が必要です（OpenGeekLLMChat本体と同じものを使用）');
+  }
+  // llama-serverのHTTPSオプション
+  const sslArgs = https && HTTPS_ENABLED
+    ? ['--ssl-cert-file', CERT_PATH, '--ssl-key-file', KEY_PATH]
+    : [];
+
+  let args;
+  if (type === 'embedding') {
+    const em = appConfig.embeddingModel;
+    if (!em || !em.path) throw new Error('Embeddingモデルが設定されていません');
+    if (!fs.existsSync(em.path)) throw new Error(`Embeddingモデルファイルが存在しません: ${em.path}`);
+    args = [
+      '-m', em.path,
+      '-c', String(em.ctx),
+      '-ngl', String(em.ngl),
+      '--port', String(port),
+      '--host', host,
+      '--embedding',
+      ...(em.poolingType ? ['--pooling', em.poolingType] : []),
+      ...(apiKey ? ['--api-key', apiKey] : []),
+      ...sslArgs,
+      ...(em.extraArgs || []),
+    ];
+  } else {
+    const model = findModelByName(modelName);
+    if (!model) throw new Error(`モデルが見つかりません: ${modelName}`);
+    if (!fs.existsSync(model.path)) throw new Error(`モデルファイルが存在しません: ${model.path}`);
+    const filterPairArgs = (arr, exclude) => {
+      const out = [];
+      for (let i = 0; i < arr.length; i++) {
+        if (exclude.includes(arr[i])) { i++; continue; }
+        out.push(arr[i]);
+      }
+      return out;
+    };
+    args = [
+      '-m', model.path,
+      '-c', String(model.ctx),
+      '-ngl', String(model.ngl),
+      '--port', String(port),
+      '--host', host,
+      ...filterPairArgs(ls.commonArgs || [], ['--port', '--host']),
+      ...(model.chatTemplate ? ['--chat-template', model.chatTemplate] : []),
+      ...(apiKey ? ['--api-key', apiKey] : []),
+      ...sslArgs,
+      ...(model.extraArgs || []),
+    ];
+  }
+
+  const id = nextExternalServerId++;
+  const label = `ext:${id}:${modelName}`;
+  const proc = spawnLlamaServer(args, label);
+
+  const serverInfo = {
+    proc, modelName, host, port, apiKey, type, https: !!https,
+    startedAt: Date.now(),
+  };
+  externalServers.set(id, serverInfo);
+
+  proc.on('exit', (code) => {
+    log('-', `[外部API ${id}] 終了 (code=${code})`);
+    serverInfo.proc = null;
+  });
+
+  // 起動完了を待つ（host=0.0.0.0の場合は127.0.0.1で確認）
+  const checkHost = host === '0.0.0.0' ? '127.0.0.1' : host;
+  const ready = await waitForReady(checkHost, port, ls.readyTimeoutMs, https);
+  if (!ready) {
+    try { proc.kill('SIGTERM'); } catch {}
+    externalServers.delete(id);
+    throw new Error(`外部APIサーバー起動タイムアウト: ${modelName} on ${host}:${port}`);
+  }
+
+  log('-', `[外部API ${id}] 起動完了: ${modelName} @ ${host}:${port}`);
+  saveExternalServersState();
+  return id;
+}
+
+// 外部APIサーバーを停止
+function stopExternalServer(id) {
+  const s = externalServers.get(id);
+  if (!s) return false;
+  if (s.proc && !s.proc.killed) {
+    try { s.proc.kill('SIGTERM'); } catch {}
+    // 強制終了タイムアウト
+    setTimeout(() => {
+      if (s.proc && !s.proc.killed) {
+        try { s.proc.kill('SIGKILL'); } catch {}
+      }
+    }, 5000);
+  }
+  externalServers.delete(id);
+  saveExternalServersState();
+  log('-', `[外部API ${id}] 停止: ${s.modelName}`);
+  return true;
+}
+
+// 全外部APIサーバーを停止（プロセス終了時のクリーンアップ用）
+function stopAllExternalServers() {
+  for (const [id] of externalServers) {
+    stopExternalServer(id);
+  }
 }
 
 async function startChatModel(modelName) {
@@ -369,6 +540,12 @@ function stopEmbeddingModel() {
 function cleanup() {
   if (chatProc) try { chatProc.kill('SIGTERM'); } catch {}
   if (embedProc) try { embedProc.kill('SIGTERM'); } catch {}
+  // 外部APIサーバーも全停止
+  for (const [, s] of externalServers) {
+    if (s.proc && !s.proc.killed) {
+      try { s.proc.kill('SIGTERM'); } catch {}
+    }
+  }
 }
 process.on('SIGINT', () => { cleanup(); process.exit(0); });
 process.on('SIGTERM', () => { cleanup(); process.exit(0); });
@@ -987,6 +1164,60 @@ app.post('/models/unload', requireAuth, async (req, res) => {
   const ip = getIP(req);
   log(ip, `MODEL UNLOAD ${chatProcModel}`);
   await stopChatModel();
+  res.json({ ok: true });
+});
+
+// ─── 外部API公開サーバー ───
+
+app.get('/external-servers', requireAuth, (req, res) => {
+  res.json({ servers: listExternalServers() });
+});
+
+app.post('/external-servers', requireAuth, jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  try {
+    const { modelName, host, port, apiKey, type, https } = req.body || {};
+    if (!port || typeof port !== 'number' || port < 1 || port > 65535) {
+      return res.status(400).json({ error: 'portは1-65535の数値で指定してください' });
+    }
+    const targetHost = (typeof host === 'string' && host) ? host : '0.0.0.0';
+    const targetType = type === 'embedding' ? 'embedding' : 'chat';
+    if (targetType === 'chat' && !modelName) {
+      return res.status(400).json({ error: 'modelName を指定してください' });
+    }
+    // APIキー: 指定がなければ自動生成
+    const finalApiKey = (typeof apiKey === 'string' && apiKey.trim())
+      ? apiKey.trim()
+      : generateApiKey();
+
+    log(ip, `EXTERNAL API START: ${modelName || 'embedding'} @ ${targetHost}:${port} (https=${!!https})`);
+    const id = await startExternalServer({
+      modelName: modelName || appConfig.embeddingModel?.path?.split('/').pop() || 'embedding',
+      host: targetHost,
+      port,
+      apiKey: finalApiKey,
+      type: targetType,
+      https: !!https,
+    });
+    res.json({ ok: true, id, apiKey: finalApiKey });
+  } catch (e) {
+    log(ip, `EXTERNAL API ERROR: ${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// HTTPS有効化されているか（フロント側で表示制御するため）
+app.get('/external-servers/https-available', requireAuth, (req, res) => {
+  res.json({ available: HTTPS_ENABLED });
+});
+
+app.delete('/external-servers/:id', requireAuth, (req, res) => {
+  const ip = getIP(req);
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
+  log(ip, `EXTERNAL API STOP: ${id}`);
+  const ok = stopExternalServer(id);
+  if (!ok) return res.status(404).json({ error: 'Not found' });
   res.json({ ok: true });
 });
 

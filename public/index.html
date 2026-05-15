@@ -573,7 +573,7 @@
   .right-sidebar {
     position: fixed;
     top: 0; right: 0; bottom: 0;
-    width: 300px;
+    width: 414px;
     background: var(--bg-secondary);
     border-left: 1px solid var(--border);
     z-index: 100;
@@ -652,6 +652,11 @@
     align-items: center;
     justify-content: center;
     gap: 6px;
+  }
+
+  /* ファイルタブだけ少し広めに */
+  .right-panel-tab.wide {
+    flex: 1.5;
   }
 
   .right-panel-tab:hover { color: var(--text-primary); }
@@ -744,6 +749,203 @@
   .server-file-delete:hover { color: var(--red); background: var(--red-dim); }
 
   .files-empty {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
+    padding: 24px 8px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+  }
+
+  /* ── 外部APIサーバー管理 ── */
+  .api-panel-body {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding: 4px 0;
+  }
+  .api-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .api-section-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .api-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .api-form-label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+  .api-form-input, .api-form-select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 8px;
+    color: var(--text);
+    font-size: 12px;
+    font-family: inherit;
+  }
+  .api-form-input:focus, .api-form-select:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .api-form-hint {
+    font-size: 10px;
+    color: var(--text-muted);
+    line-height: 1.4;
+    margin-top: 2px;
+  }
+  .api-form-hint code {
+    background: var(--bg);
+    padding: 1px 4px;
+    border-radius: 2px;
+    font-size: 10px;
+  }
+  .api-form-checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text);
+    cursor: pointer;
+    margin-top: 4px;
+  }
+  .api-form-checkbox-label input[type="checkbox"] {
+    cursor: pointer;
+    accent-color: var(--accent);
+  }
+  .api-form-checkbox-label input[type="checkbox"]:disabled {
+    cursor: not-allowed;
+  }
+  .api-form-submit {
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    margin-top: 4px;
+    transition: opacity 0.15s;
+  }
+  .api-form-submit:hover { opacity: 0.9; }
+  .api-form-submit:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .api-server-item {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    margin-bottom: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .api-server-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .api-server-status {
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .api-server-status.running { color: var(--accent); }
+  .api-server-status.stopped { color: var(--text-muted); }
+  .api-server-type {
+    font-size: 10px;
+    padding: 2px 6px;
+    background: var(--accent-dim);
+    color: var(--accent);
+    border-radius: 3px;
+  }
+  .api-server-stop {
+    margin-left: auto;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font-size: 14px;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+  .api-server-stop:hover { color: var(--red); background: var(--red-dim); }
+  .api-server-model {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text);
+  }
+  .api-server-endpoint {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11px;
+  }
+  .api-server-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .api-server-label {
+    color: var(--text-muted);
+    flex-shrink: 0;
+    min-width: 32px;
+  }
+  .api-server-value {
+    flex: 1;
+    background: var(--bg);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-family: var(--font-mono);
+    color: var(--text);
+    word-break: break-all;
+  }
+  .api-server-copy {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 4px;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+  .api-server-copy:hover { background: var(--bg-hover); }
+  .api-server-usage {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: 4px;
+    line-height: 1.4;
+    word-break: break-all;
+  }
+  .api-server-usage code {
+    background: var(--bg);
+    padding: 2px 4px;
+    border-radius: 3px;
+    font-size: 10px;
+  }
+  .api-empty {
     font-size: 12px;
     color: var(--text-muted);
     text-align: center;
@@ -3008,7 +3210,17 @@ function App() {
   const [embeddingJobs, setEmbeddingJobs] = useState([]); // { name, current, total }
   const [gpuData, setGpuData] = useState([]);
   const [gpuPanelOpen, setGpuPanelOpen] = useState(false);
-  const [rightPanelTab, setRightPanelTab] = useState('gpu'); // 'gpu' | 'files'
+  const [rightPanelTab, setRightPanelTab] = useState('gpu'); // 'gpu' | 'files' | 'api'
+  // 外部APIサーバー管理（Chat Completionsのみ対応）
+  const [externalServers, setExternalServers] = useState([]);
+  const [apiFormModel, setApiFormModel] = useState('');
+  const [apiFormHost, setApiFormHost] = useState('0.0.0.0');
+  const [apiFormPort, setApiFormPort] = useState(11434);
+  const [apiFormKey, setApiFormKey] = useState('');
+  // HTTPSデフォルト: 現在ブラウザでHTTPSアクセス中ならtrue（同じ証明書を使う想定）
+  const [apiFormHttps, setApiFormHttps] = useState(typeof window !== 'undefined' && window.location.protocol === 'https:');
+  const [apiHttpsAvailable, setApiHttpsAvailable] = useState(false);
+  const [apiBusy, setApiBusy] = useState(false);
   const [tokenSpeed, setTokenSpeed] = useState(null); // { tokPerSec, totalTokens }
   const tokenHistoryRef = useRef([]); // [{ tokens, durationNs }]
   // URLパスからチャットIDを取得（例: /chat/abc123 → "abc123"）
@@ -4477,6 +4689,75 @@ function App() {
     } catch {}
   }
 
+  // ─── 外部APIサーバー管理 ───
+  async function loadExternalServers() {
+    try {
+      const [r1, r2] = await Promise.all([
+        fetch('/external-servers'),
+        fetch('/external-servers/https-available'),
+      ]);
+      if (r1.ok) {
+        const data = await r1.json();
+        setExternalServers(data.servers || []);
+      }
+      if (r2.ok) {
+        const data = await r2.json();
+        setApiHttpsAvailable(!!data.available);
+      }
+    } catch {}
+  }
+
+  async function startApiServer() {
+    if (apiBusy) return;
+    setError('');
+    if (!apiFormModel) {
+      setError('モデルを選択してください');
+      return;
+    }
+    if (!apiFormPort || apiFormPort < 1 || apiFormPort > 65535) {
+      setError('ポートは1-65535で指定してください');
+      return;
+    }
+    setApiBusy(true);
+    setLoadingMessage(`外部APIサーバーを起動中... (${apiFormHost}:${apiFormPort})`);
+    try {
+      const res = await fetch('/external-servers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          modelName: apiFormModel,
+          host: apiFormHost,
+          port: apiFormPort,
+          apiKey: apiFormKey || undefined,
+          type: 'chat',
+          https: apiFormHttps,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      setApiFormKey(''); // 入力フォームのAPIキーをクリア（自動生成されたものは一覧に表示される）
+      await loadExternalServers();
+    } catch (e) {
+      setError(`外部APIサーバー起動失敗: ${e.message}`);
+    } finally {
+      setApiBusy(false);
+      setLoadingMessage('');
+    }
+  }
+
+  async function stopApiServer(id) {
+    if (!confirm('この外部APIサーバーを停止しますか？')) return;
+    setApiBusy(true);
+    try {
+      await fetch(`/external-servers/${id}`, { method: 'DELETE' });
+      await loadExternalServers();
+    } catch (e) {
+      setError(`停止失敗: ${e.message}`);
+    } finally {
+      setApiBusy(false);
+    }
+  }
+
   async function deleteServerFile(path) {
     if (!confirm(`ファイル「${path}」を削除しますか？`)) return;
     try {
@@ -5149,9 +5430,10 @@ ${conversationText}
   const settingsLoadedRef = useRef(false);
   useEffect(() => {
     if (!authenticated) return;
-    // 並行: チャット履歴・ファイル一覧・設定
+    // 並行: チャット履歴・ファイル一覧・外部APIサーバー一覧・設定
     loadChatList();
     loadFileList();
+    loadExternalServers();
     // URLに chat ID があればそのチャットを読み込み（失敗したらルートへリダイレクト）
     const urlId = getChatIdFromUrl();
     if (urlId) {
@@ -5970,9 +6252,9 @@ ${conversationText}
       <div className={`right-sidebar ${gpuPanelOpen ? 'open' : ''}`}>
         <div className="right-sidebar-header">
           <div className="gpu-panel-title" style={{ margin: 0 }}>
-            {rightPanelTab === 'gpu'
-              ? <>{gpuData.some(g => g.gpus?.length > 0) && <span className="gpu-live-dot" />} GPU モニター</>
-              : <>📁 サーバーファイル</>}
+            {rightPanelTab === 'gpu' && <>{gpuData.some(g => g.gpus?.length > 0) && <span className="gpu-live-dot" />} GPU モニター</>}
+            {rightPanelTab === 'files' && <>📁 サーバーファイル</>}
+            {rightPanelTab === 'api' && <>🌐 外部APIサーバー</>}
           </div>
           <button className="clear-btn" onClick={() => setGpuPanelOpen(false)}>✕</button>
         </div>
@@ -5982,8 +6264,11 @@ ${conversationText}
               {gpuData.some(g => g.gpus?.length > 0) && <span className="gpu-header-dot" />}
               GPU
             </button>
-            <button className={`right-panel-tab ${rightPanelTab === 'files' ? 'active' : ''}`} onClick={() => { setRightPanelTab('files'); loadFileList(); }}>
+            <button className={`right-panel-tab wide ${rightPanelTab === 'files' ? 'active' : ''}`} onClick={() => { setRightPanelTab('files'); loadFileList(); }}>
               📁 ファイル{fileList.length > 0 && ` (${fileList.length})`}
+            </button>
+            <button className={`right-panel-tab ${rightPanelTab === 'api' ? 'active' : ''}`} onClick={() => { setRightPanelTab('api'); loadExternalServers(); }}>
+              🌐 API{externalServers.length > 0 && ` (${externalServers.length})`}
             </button>
           </div>
 
@@ -6105,6 +6390,136 @@ ${conversationText}
                   </div>
                 ))
               )}
+            </div>
+          )}
+
+          {rightPanelTab === 'api' && (
+            <div className="api-panel-body">
+              <div className="api-section">
+                <div className="api-section-title">外部APIサーバー起動</div>
+                <div className="api-form">
+                  <label className="api-form-label">
+                    <span>モデル</span>
+                    <select className="api-form-select" value={apiFormModel} onChange={e => setApiFormModel(e.target.value)}>
+                      <option value="">選択してください</option>
+                      {appConfig.chatModels?.map(m => (
+                        <option key={m.name} value={m.name}>{m.name}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="api-form-label">
+                    <span>公開範囲（リッスンするインターフェース）</span>
+                    <select className="api-form-select" value={apiFormHost} onChange={e => setApiFormHost(e.target.value)}>
+                      <option value="0.0.0.0">外部公開（0.0.0.0 - 全インターフェース）</option>
+                      <option value="127.0.0.1">ローカルのみ（127.0.0.1）</option>
+                    </select>
+                    <span className="api-form-hint">
+                      ※ 外部公開を選ぶと、サーバーのドメイン/IPからアクセス可能（DNSが解決すれば <code>llm.example.com</code> でもOK）。<br />
+                      ファイアウォール・ポート開放も必要。
+                    </span>
+                  </label>
+                  <label className="api-form-label">
+                    <span>ポート</span>
+                    <input className="api-form-input" type="number" min="1" max="65535" value={apiFormPort} onChange={e => setApiFormPort(parseInt(e.target.value) || 0)} placeholder="11434" />
+                    <span className="api-form-hint">デフォルトは <code>11434</code>（Ollama互換のため）。既存のポート（3000, 8080, 8081）と被らないように。</span>
+                  </label>
+                  <label className="api-form-label">
+                    <span>APIキー (空欄で自動生成)</span>
+                    <input className="api-form-input" type="text" value={apiFormKey} onChange={e => setApiFormKey(e.target.value)} placeholder="sk-..." />
+                  </label>
+                  <label className="api-form-checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={apiFormHttps}
+                      onChange={e => setApiFormHttps(e.target.checked)}
+                      disabled={!apiHttpsAvailable}
+                    />
+                    <span>HTTPS で起動する</span>
+                  </label>
+                  <span className="api-form-hint" style={{ marginTop: -4 }}>
+                    {apiHttpsAvailable
+                      ? 'OpenGeekLLMChat本体と同じ cert.pem/key.pem を使用します。'
+                      : '⚠️ cert.pem / key.pem が見つからないためHTTPSは利用できません。`./generate-cert.sh` で生成するか、正規証明書を配置してください。'}
+                  </span>
+                  <button className="api-form-submit" onClick={startApiServer} disabled={apiBusy}>
+                    {apiBusy ? '処理中...' : '🚀 起動'}
+                  </button>
+                </div>
+              </div>
+
+              <div className="api-section">
+                <div className="api-section-title">起動中のサーバー ({externalServers.length})</div>
+                {externalServers.length === 0 ? (
+                  <div className="api-empty">
+                    <div className="docs-empty-icon">🌐</div>
+                    <div>起動中のサーバーはありません</div>
+                    <div className="docs-empty-sub">上のフォームから起動できます</div>
+                  </div>
+                ) : (
+                  externalServers.map(s => (
+                    <div key={s.id} className="api-server-item">
+                      <div className="api-server-header">
+                        <span className={`api-server-status ${s.running ? 'running' : 'stopped'}`}>
+                          {s.running ? '● 稼働中' : '○ 停止'}
+                        </span>
+                        <button className="api-server-stop" onClick={() => stopApiServer(s.id)} title="停止">✕</button>
+                      </div>
+                      <div className="api-server-model">{s.modelName}</div>
+                      {(() => {
+                        // 表示用URL: host=0.0.0.0 ならブラウザのhostnameを使う、そうでなければそのまま
+                        const displayHost = (s.host === '0.0.0.0' || s.host === '::')
+                          ? window.location.hostname
+                          : s.host;
+                        const proto = s.https ? 'https' : 'http';
+                        const externalUrl = `${proto}://${displayHost}:${s.port}/v1`;
+                        const localUrl = `${proto}://127.0.0.1:${s.port}/v1`;
+                        return (
+                          <div className="api-server-endpoint">
+                            <div className="api-server-row">
+                              <span className="api-server-label">URL:</span>
+                              <code className="api-server-value">{externalUrl}</code>
+                              <button className="api-server-copy" onClick={async () => {
+                                try {
+                                  await navigator.clipboard.writeText(externalUrl);
+                                  setLoadingMessage('✓ URLをコピーしました');
+                                  setTimeout(() => setLoadingMessage(''), 1500);
+                                } catch {}
+                              }}>📋</button>
+                            </div>
+                            {(s.host === '0.0.0.0' || s.host === '::') && (
+                              <div className="api-server-row">
+                                <span className="api-server-label">Local:</span>
+                                <code className="api-server-value">{localUrl}</code>
+                                <button className="api-server-copy" onClick={async () => {
+                                  try {
+                                    await navigator.clipboard.writeText(localUrl);
+                                    setLoadingMessage('✓ ローカルURLをコピーしました');
+                                    setTimeout(() => setLoadingMessage(''), 1500);
+                                  } catch {}
+                                }}>📋</button>
+                              </div>
+                            )}
+                            <div className="api-server-row">
+                              <span className="api-server-label">Key:</span>
+                              <code className="api-server-value" style={{ wordBreak: 'break-all' }}>{s.apiKey}</code>
+                              <button className="api-server-copy" onClick={async () => {
+                                try {
+                                  await navigator.clipboard.writeText(s.apiKey);
+                                  setLoadingMessage('✓ APIキーをコピーしました');
+                                  setTimeout(() => setLoadingMessage(''), 1500);
+                                } catch {}
+                              }}>📋</button>
+                            </div>
+                            <div className="api-server-usage">
+                              例: <code>curl {externalUrl}/chat/completions -H "Authorization: Bearer {s.apiKey.slice(0, 12)}..." -H "Content-Type: application/json" -d '{`{"model":"x","messages":[{"role":"user","content":"hi"}]}`}'</code>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  ))
+                )}
+              </div>
             </div>
           )}
         </div>
