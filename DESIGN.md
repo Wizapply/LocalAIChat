@@ -1598,6 +1598,8 @@ OpenGeekLLMChat全体をHTTPSで運用しているなら、外部APIも同じ証
 - 外部APIサーバーには **アイドルアンロード機能なし**: 起動したら手動で停止するまでVRAMを保持
 - メインUI用 llama-server とは **独立プロセス**: 同じモデルでも別途VRAM消費
 - 起動状態の **自動復元なし**: プロセス再起動後は再度UIで起動が必要
+- **HTTPS起動には llama.cpp の SSL対応ビルドが必須** (`-DLLAMA_SERVER_SSL=ON`)。非対応ビルドだと llama-server は起動せず stderr に `the server is built without SSL support` を出力する。 Node.js 側の `waitForReady` は HTTPS でヘルスチェックしようとするためタイムアウトする
+- **HTTPS/HTTPバッジ表示**: 起動済みサーバーのカードに `🔒 HTTPS` または `🔓 HTTP` のバッジを表示することで、UI上で実プロトコルが一目で分かるようにしている（フォームのチェック状態と起動済みサーバーの状態の混同を防ぐ）
 
 ---
 
@@ -1767,6 +1769,100 @@ onClick={() => {
 × ボタンは非表示
 チャット選択しても閉じない（PCではエリア固定）
 ```
+
+---
+
+## ⚙️ 大きなリクエスト・並列制御・HTTP設定
+
+外部API公開で大きな tools 配列（19KB+）を受け取る、画像Base64を含む大きなボディを送る、長いLLM応答を待つ等の本番運用要件に応えるため、HTTPサーバーと llama-server の細かな設定を config 化しました。
+
+### Express bodyparserの上限
+
+```javascript
+// server.js
+const MAX_REQUEST_SIZE = appConfig.maxRequestSize || '50mb';
+const jsonParser = express.json({ limit: MAX_REQUEST_SIZE });
+```
+
+config:
+```json
+"maxRequestSize": "100mb"   // "10mb" / "500mb" / "1gb" 等
+```
+
+Express の `body-parser` がデフォルト 100KB なので、画像付きメッセージなどでは必ず必要になります。
+
+### ファイルアップロード上限
+
+```javascript
+const MAX_FILE_SIZE = (appConfig.maxFileSize || 50) * 1024 * 1024;
+```
+
+config:
+```json
+"maxFileSize": 50   // MB単位、数値
+```
+
+### Node.js HTTPサーバーの設定
+
+```javascript
+const SERVER_OPTS = {
+  maxHeaderSize: appConfig.maxHeaderSize || 64 * 1024,  // 64KB
+};
+const server = http.createServer(SERVER_OPTS, app);
+
+server.requestTimeout = (appConfig.requestTimeoutSec || 600) * 1000;
+server.headersTimeout = (appConfig.headersTimeoutSec || 120) * 1000;
+server.keepAliveTimeout = (appConfig.keepAliveTimeoutSec || 60) * 1000;
+server.timeout = 0;  // ソケットタイムアウト無効化
+```
+
+| 設定 | デフォルト | 用途 |
+|:--|:--|:--|
+| `maxHeaderSize` | 64KB | Authorization + 大量toolsで膨らむヘッダー対策 |
+| `requestTimeoutSec` | 600 | リクエスト全体タイムアウト（LLM応答は長い） |
+| `headersTimeoutSec` | 120 | ヘッダー受信のみのタイムアウト |
+| `keepAliveTimeoutSec` | 60 | Keep-Alive接続維持 |
+
+### llama-server `-np` (並列スロット数) 制御
+
+`-np N` は llama-server の **並列スロット数**。`ctx ÷ np` が1スロットあたりの実効コンテキストになるため、自動値（多くの場合4）だと長文・大きい tools 配列で詰まります。
+
+```javascript
+'-np', String(model.nParallel ?? appConfig.llamaServer.nParallel ?? 1),
+```
+
+優先順位:
+1. モデル個別の `nParallel`
+2. グローバル `llamaServer.nParallel`
+3. デフォルト `1`
+
+```json
+"llamaServer": {
+  ...,
+  "nParallel": 1
+},
+"chatModels": [
+  { "name": "Qwen3.6 35B", "ctx": 32768, "nParallel": 1, ... },
+  { "name": "Qwen2.5 0.5B", "ctx": 8192, "nParallel": 4, ... }
+]
+```
+
+| `nParallel` | 用途 | スロットあたりctx (ctx=32768時) |
+|:--|:--|:--|
+| 1 | 単一ユーザー、エージェント用途 | 32768（フル） |
+| 2 | 少人数チーム | 16384 |
+| 4 | 公開API | 8192 |
+| 8 | スループット重視 | 4096 |
+
+### CVE-2025-46728 対策（cpp-httplib）
+
+llama.cpp が内部で使う cpp-httplib < 0.43.3 では、`Transfer-Encoding: chunked` の大きなリクエストでサーバー側がRSTで切断する問題があります（llama.cpp **b9030以降** で対応済み）。
+
+それでも切られる場合の対処は3段階:
+
+1. **クライアント側で `Content-Length` 明示** （多くのHTTPライブラリは自動で付ける）
+2. **llama.cpp b9030 以降** に更新
+3. **Nginx前段でリバースプロキシ**（`proxy_request_buffering on` で chunked → Content-Length 変換）
 
 ---
 
@@ -2184,6 +2280,27 @@ body, .app-layout, .chat-area {
 
 48. **window.location.replace() vs history.replaceState()**
     URL を変えるだけなら `history.replaceState` で十分だが、React state を完全リセットしたい場合は `window.location.replace()` を使う。前者はSPAのまま、後者はページ全体を再読み込み（履歴には残らない）。削除済みチャットIDのURLに更新でアクセスしたケースで、`replaceState` だけだと state が中途半端な状態で残るため、完全リロードで初期化したほうが安全。
+
+49. **llama.cpp は `-DLLAMA_SERVER_SSL=ON` ビルド必須（HTTPS化時）**
+    llama-server を `--ssl-cert-file --ssl-key-file` でHTTPS起動するには、CMake時に `-DLLAMA_SERVER_SSL=ON` (古い名前: `-DLLAMA_SERVER_ENABLE_SSL=ON`) と `libssl-dev` が必要。これが入っていないと起動時に stderr に `the server is built without SSL support` `failed to initialize HTTP server` と出てプロセスは即座に終了する。確認方法は `llama-server --help | grep -i ssl` で `--ssl-cert-file` が表示されるかどうか。
+
+50. **cpp-httplib の chunked transfer + 大きいリクエストの問題（CVE-2025-46728）**
+    cpp-httplib < 0.43.3 では `Transfer-Encoding: chunked` で `Content-Length` なしのリクエストでサイズ制限処理が正しく機能せず、超過時に接続を即座に終了する挙動がある。llama.cpp **b9030 以降** で 0.43.3 に更新されているが、それでも特定クライアント（chunked transferを多用するVSCode拡張やhttp-client）で 19KB+ のリクエストが切られることがある。対処は3段階: (1) クライアント側で `Content-Length` 明示、(2) llama.cpp 最新化、(3) Nginx前段で `proxy_request_buffering on` により chunked → Content-Length 変換。
+
+51. **`-np` (parallel) で ctx が分割される**
+    llama-server は `-np N` を指定すると（または自動で N=4 になると） KV キャッシュを N個のスロットに分割するため、**1スロットあたりの実効 ctx = ctx_size ÷ N** になる。`ctx=32768 -np 4` だと実質 8192 トークンしか1リクエストで使えない。エージェント用途や長文プロンプト・大きい tools 配列を扱う場合は `nParallel: 1` にしてフル ctx を使えるようにする。逆に多人数で並列アクセスするなら 2〜8 に増やしてスループットを稼ぐ。
+
+52. **Express bodyparserのデフォルト上限はとても小さい**
+    Express の `express.json()` のデフォルト上限は **100KB**。画像をBase64で含めるとあっという間に超える（4MB画像→約5.4MB Base64）。`{ limit: '100mb' }` のような明示が必須。`/v1/*` プロキシは body をストリーム転送するので bodyparser を通さないが、`/chats/:id` のJSONボディ保存などは通すため必要。
+
+53. **Node.js の `maxHeaderSize` デフォルト16KB**
+    Node.js HTTPサーバーの `maxHeaderSize` のデフォルトは 16KB。`Authorization: Bearer sk-...` に加えて `tools` 配列をボディじゃなくクエリ・ヘッダーに乗せるクライアントや、Cookieが大量に積まれているケースで 16KB を超えるとリクエストが弾かれる（接続切断）。`http.createServer({ maxHeaderSize: 64 * 1024 }, app)` で拡大可能。Node.jsコマンドラインオプション `--max-http-header-size=65536` でも変更可。
+
+54. **HTTPSフォームのチェック状態 ≠ 起動済みサーバーのプロトコル**
+    外部APIサーバーUIで「HTTPS で起動する」チェックボックスはあくまで「次に起動するときの設定」。既に起動済みのサーバーは前回起動時の状態を保持している。これが原因で「チェックON なのに URL が `http://` で表示される」混乱が起きる。対策として起動済みサーバーカードに `🔒 HTTPS` / `🔓 HTTP` バッジを表示し、実際のプロトコルが一目でわかるようにする。
+
+55. **DNS解決とブラウザ・curl・Pythonの違い（hostsの罠）**
+    Windowsの hosts ファイルは編集しても効かないことがある（DnsCacheサービスの挙動、行頭スペース、エンコーディング、行末コード CRLF/LF の差異）。ブラウザだけ動いて curl/Python が失敗する場合、`ipconfig /flushdns` + `net stop/start dnscache` を試す。SPA + 同一LAN内のサーバー運用では、クライアントから **直接IPアドレスを使ってテスト** することで切り分けが早い (`nslookup`/`ping`の結果を信用する)。
 
 ---
 

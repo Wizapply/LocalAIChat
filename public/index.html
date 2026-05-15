@@ -873,6 +873,20 @@
   }
   .api-server-status.running { color: var(--accent); }
   .api-server-status.stopped { color: var(--text-muted); }
+  .api-server-proto {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+  }
+  .api-server-proto.https {
+    background: var(--accent-dim);
+    color: var(--accent);
+  }
+  .api-server-proto.http {
+    background: rgba(255, 165, 0, 0.15);
+    color: orange;
+  }
   .api-server-type {
     font-size: 10px;
     padding: 2px 6px;
@@ -6461,6 +6475,9 @@ ${conversationText}
                       <div className="api-server-header">
                         <span className={`api-server-status ${s.running ? 'running' : 'stopped'}`}>
                           {s.running ? '● 稼働中' : '○ 停止'}
+                        </span>
+                        <span className={`api-server-proto ${s.https ? 'https' : 'http'}`}>
+                          {s.https ? '🔒 HTTPS' : '🔓 HTTP'}
                         </span>
                         <button className="api-server-stop" onClick={() => stopApiServer(s.id)} title="停止">✕</button>
                       </div>

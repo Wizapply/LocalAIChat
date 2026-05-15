@@ -185,12 +185,14 @@ function spawnLlamaServer(args, label) {
   const ls = appConfig.llamaServer;
   log('-', `[${label}] spawn: ${ls.binPath} ${args.join(' ')}`);
   const isQuiet = appConfig.logLevel === 'quiet';
+  // 外部APIサーバー(label='ext:...')は強制的にログを出す（デバッグ用）
+  const isExternal = label.startsWith('ext:');
+  const captureOutput = !isQuiet || isExternal;
   const proc = spawn(ls.binPath, args, {
-    // quietモードではstdout/stderrを完全に捨てる
-    stdio: isQuiet ? ['ignore', 'ignore', 'ignore'] : ['ignore', 'pipe', 'pipe'],
+    stdio: captureOutput ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'ignore', 'ignore'],
     env: { ...process.env },
   });
-  if (!isQuiet) {
+  if (captureOutput) {
     proc.stdout.on('data', (d) => process.stdout.write(`[${label}] ${d}`));
     proc.stderr.on('data', (d) => process.stderr.write(`[${label}] ${d}`));
   }
@@ -292,6 +294,7 @@ async function startExternalServer({ modelName, host, port, apiKey, type, https 
       '-m', model.path,
       '-c', String(model.ctx),
       '-ngl', String(model.ngl),
+      '-np', String(model.nParallel ?? appConfig.llamaServer.nParallel ?? 1),
       '--port', String(port),
       '--host', host,
       ...filterPairArgs(ls.commonArgs || [], ['--port', '--host']),
@@ -384,6 +387,7 @@ async function startChatModel(modelName) {
       '-m', model.path,
       '-c', String(model.ctx),
       '-ngl', String(model.ngl),
+      '-np', String(model.nParallel ?? appConfig.llamaServer.nParallel ?? 1),
       '--port', String(ls.chatPort),
       '--host', ls.chatHost,
       ...filterPairArgs(ls.commonArgs || [], ['--port', '--host']),
@@ -575,7 +579,11 @@ app.set('trust proxy', 'loopback'); // リバースプロキシからのX-Forwar
 
 // ─── 共通JSONパーサー（必要なエンドポイントのみで個別適用） ───
 // /v1/* (LLMプロキシ) 等では使わない。bodyを再ストリームする必要があるため。
-const jsonParser = express.json({ limit: '10mb' });
+// 画像付きメッセージ、長いドキュメント、コードブロック等のため上限を大きめに設定
+// config.jsonの maxRequestSize で変更可能（デフォルト 50mb）
+const MAX_REQUEST_SIZE = appConfig.maxRequestSize || '50mb';
+const jsonParser = express.json({ limit: MAX_REQUEST_SIZE });
+log('-', `[起動] JSONリクエスト上限: ${MAX_REQUEST_SIZE}`);
 
 // ─── HTTP/HTTPS サーバー初期化 ───
 // cert.pem と key.pem がカレントディレクトリにあればHTTPS、なければHTTP
@@ -583,19 +591,39 @@ const jsonParser = express.json({ limit: '10mb' });
 const CERT_PATH = path.join(__dirname, 'cert.pem');
 const KEY_PATH = path.join(__dirname, 'key.pem');
 const HTTPS_ENABLED = fs.existsSync(CERT_PATH) && fs.existsSync(KEY_PATH);
+// ─── HTTPサーバーオプション ───
+// maxHeaderSize: HTTPヘッダー上限（デフォルト16KB → 64KB に拡大）
+//   tools配列が大きい場合のRST切断対策。Authorization, tools, system prompt が大きいケース。
+// requestTimeout: リクエストタイムアウト（デフォルト5分 → 10分）
+//   長いLLM応答に対応
+// headersTimeout: ヘッダー受信タイムアウト（デフォルト1分 → 2分）
+// keepAliveTimeout: Keep-Alive（デフォルト5秒 → 60秒）
+//   接続再利用を効率化
+const SERVER_OPTS = {
+  maxHeaderSize: appConfig.maxHeaderSize || 64 * 1024,  // 64KB
+};
+
 let server;
 if (HTTPS_ENABLED) {
   const https = require('https');
   const sslOptions = {
     cert: fs.readFileSync(CERT_PATH),
     key: fs.readFileSync(KEY_PATH),
+    ...SERVER_OPTS,
   };
   const passphrase = process.env.SSL_PASSPHRASE || appConfig.sslPassphrase;
   if (passphrase) sslOptions.passphrase = passphrase;
   server = https.createServer(sslOptions, app);
 } else {
-  server = http.createServer(app);
+  server = http.createServer(SERVER_OPTS, app);
 }
+
+// サーバーインスタンスのタイムアウト設定
+server.requestTimeout = (appConfig.requestTimeoutSec || 600) * 1000;     // 10分
+server.headersTimeout = (appConfig.headersTimeoutSec || 120) * 1000;     // 2分
+server.keepAliveTimeout = (appConfig.keepAliveTimeoutSec || 60) * 1000;  // 60秒
+server.timeout = 0;  // ソケットタイムアウト無効化（長いLLM応答に対応）
+log('-', `[起動] HTTPサーバー設定: maxHeaderSize=${SERVER_OPTS.maxHeaderSize}, requestTimeout=${server.requestTimeout}ms, headersTimeout=${server.headersTimeout}ms`);
 
 // ─── WebSocket: 対話的Python実行 ───
 const wss = new WebSocketServer({ server, path: '/ws/python' });
@@ -1498,7 +1526,8 @@ app.post('/auth', jsonParser, (req, res) => {
 
 // ─── ユーザーファイルストレージ (public/uploads) ───
 const UPLOADS_DIR = path.join(__dirname, 'public', 'uploads');
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+// アップロードファイル1個あたりの上限（config.jsonの maxFileSize で変更可能、デフォルト 50MB）
+const MAX_FILE_SIZE = (appConfig.maxFileSize || 50) * 1024 * 1024;
 
 // uploadsディレクトリ作成
 try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch {}
