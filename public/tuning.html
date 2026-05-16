@@ -528,7 +528,7 @@ function TrainingView({ samples, currentJobId, onStarted, showToast }) {
           placeholder="例: Qwen/Qwen2.5-7B-Instruct" />
         <span className="field-hint">
           初回実行時にHuggingFaceからダウンロードされます（数GB〜数十GB）。
-          gated model（Llama等）は事前に <code>huggingface-cli login</code> が必要
+          gated model（Llama等）は事前に <code>hf auth login</code>（旧 <code>huggingface-cli login</code>）が必要
         </span>
       </div>
 

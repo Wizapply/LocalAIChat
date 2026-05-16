@@ -67,6 +67,7 @@ const DEFAULT_CONFIG = {
   },
   webSearch: true,
   fileAccess: true,
+  imageGen: false,           // 画像生成（stable-diffusion.cpp連携）。imageModels[]を定義して有効化
   ragTopK: 10,
   ragMode: 'agentic',
   systemPrompts: {
@@ -402,6 +403,108 @@ function stopAllExternalServers() {
     stopExternalServer(id);
   }
 }
+
+// ════════════════════════════════════════════════
+// 画像生成 (stable-diffusion.cpp の sd-server を管理)
+// ════════════════════════════════════════════════
+// アーキテクチャ:
+//   - sd-server (stable-diffusion.cpp の HTTPサーバー) を子プロセスで起動
+//   - LLMが generate_image ツールを呼ぶ → /image-gen エンドポイント → sd-serverに転送
+//   - 生成画像は public/uploads/ に PNG で保存し、Markdownでチャット欄に表示
+//   - アイドルアンロード機能あり（チャットモデルと同じパターン）
+
+let sdProc = null;            // 現在のsd-serverプロセス
+let sdCurrentModel = null;    // 現在ロード中の画像生成モデル名
+let sdProcStarting = false;
+let sdLastActivity = Date.now();
+
+function findImageModelByName(name) {
+  if (!appConfig.imageModels || !Array.isArray(appConfig.imageModels)) return null;
+  return appConfig.imageModels.find(m => m.name === name);
+}
+
+async function startImageModel(modelName) {
+  if (sdProcStarting) throw new Error('既に画像生成モデル起動処理中です');
+  const model = findImageModelByName(modelName);
+  if (!model) throw new Error(`画像生成モデルが見つかりません: ${modelName}`);
+  if (!fs.existsSync(model.path)) throw new Error(`モデルファイルが存在しません: ${model.path}`);
+
+  sdProcStarting = true;
+  try {
+    await stopImageModel();
+    const sdConfig = appConfig.stableDiffusion || {};
+    const binPath = sdConfig.binPath || 'sd-server';
+    const port = sdConfig.port || 7860;
+
+    const args = [
+      '--model', model.path,
+      '--listen-port', String(port),
+      '--listen-ip', '127.0.0.1',
+      ...(model.vae ? ['--vae', model.vae] : []),
+      ...(model.taesd ? ['--taesd', model.taesd] : []),
+      ...(model.controlNet ? ['--control-net', model.controlNet] : []),
+      ...(model.extraArgs || []),
+    ];
+
+    log('-', `[sd-server] 起動: ${binPath} ${args.join(' ')}`);
+    sdProc = spawn(binPath, args, {
+      cwd: __dirname,
+      env: { ...process.env, ...(sdConfig.env || {}) },
+    });
+
+    sdProc.stdout.on('data', (d) => {
+      if (appConfig.logLevel !== 'quiet') process.stdout.write(`[sd-server] ${d}`);
+    });
+    sdProc.stderr.on('data', (d) => {
+      if (appConfig.logLevel !== 'quiet') process.stderr.write(`[sd-server] ${d}`);
+    });
+    sdProc.on('exit', (code) => {
+      log('-', `[sd-server] 終了 (code=${code})`);
+      if (sdProc && sdProc.pid === sdProc?.pid) sdProc = null;
+    });
+
+    // 起動完了を待つ
+    const ready = await waitForReady('127.0.0.1', port, sdConfig.readyTimeoutMs || 60000, false);
+    if (!ready) throw new Error(`sd-server が ${sdConfig.readyTimeoutMs || 60000}ms 以内に起動しませんでした`);
+
+    sdCurrentModel = modelName;
+    sdLastActivity = Date.now();
+    log('-', `[sd-server] Ready (model=${modelName}, port=${port})`);
+  } finally {
+    sdProcStarting = false;
+  }
+}
+
+async function stopImageModel() {
+  if (!sdProc || sdProc.killed) {
+    sdCurrentModel = null;
+    return;
+  }
+  try { sdProc.kill('SIGTERM'); } catch {}
+  await new Promise(resolve => {
+    const timer = setTimeout(() => {
+      if (sdProc && !sdProc.killed) {
+        try { sdProc.kill('SIGKILL'); } catch {}
+      }
+      resolve();
+    }, 5000);
+    sdProc.once('exit', () => { clearTimeout(timer); resolve(); });
+  });
+  sdProc = null;
+  sdCurrentModel = null;
+}
+
+// アイドルアンロード（チャットモデルと同じパターン）
+function checkSdIdle() {
+  const idleMs = appConfig.stableDiffusion?.idleUnloadMs;
+  if (!idleMs || !sdProc || sdProcStarting) return;
+  const elapsed = Date.now() - sdLastActivity;
+  if (elapsed >= idleMs) {
+    log('-', `[sd-server] アイドル ${Math.round(elapsed / 1000)}s → アンロード`);
+    stopImageModel();
+  }
+}
+setInterval(checkSdIdle, 30000);
 
 async function startChatModel(modelName) {
   if (chatProcStarting) throw new Error('既にモデル起動処理中です');
@@ -1315,6 +1418,145 @@ app.post('/external-servers/:id/start', requireAuth, async (req, res) => {
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
+});
+
+// ════════════════════════════════════════════════
+// 画像生成 API (/image-gen)
+// ════════════════════════════════════════════════
+// LLMの generate_image ツールから呼ばれる。
+// - sd-server が未起動なら自動起動（オンデマンドロード）
+// - 生成画像は public/uploads/ に PNG 保存し、URLを返す
+// - チャットUIは Markdown ![](...) で表示するだけ
+
+app.get('/image-gen/info', requireAuth, (req, res) => {
+  const sdConfig = appConfig.stableDiffusion || {};
+  res.json({
+    available: !!(appConfig.imageModels && appConfig.imageModels.length > 0),
+    currentModel: sdCurrentModel,
+    starting: sdProcStarting,
+    running: !!(sdProc && !sdProc.killed),
+    models: (appConfig.imageModels || []).map(m => ({ name: m.name, desc: m.desc })),
+    defaultModel: sdConfig.defaultModel || appConfig.imageModels?.[0]?.name || null,
+  });
+});
+
+app.post('/image-gen', requireAuth, jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const {
+    prompt,
+    negativePrompt = '',
+    model = null,             // 省略時は defaultModel または現在ロード中
+    width = 1024,
+    height = 1024,
+    steps = 20,
+    cfgScale = 7.0,
+    sampler = 'euler_a',      // sd-server のサンプラー名
+    seed = -1,                // -1 = ランダム
+    batchCount = 1,           // 同じ設定で何枚生成するか
+  } = req.body || {};
+
+  if (!prompt || typeof prompt !== 'string') {
+    return res.status(400).json({ error: 'prompt が必要です' });
+  }
+  if (!appConfig.imageModels || appConfig.imageModels.length === 0) {
+    return res.status(400).json({
+      error: '画像生成モデルが設定されていません。config.json の imageModels に追加してください。',
+    });
+  }
+
+  // モデル決定
+  const sdConfig = appConfig.stableDiffusion || {};
+  const targetModel = model || sdCurrentModel || sdConfig.defaultModel || appConfig.imageModels[0].name;
+
+  // 既に別モデルがロードされていれば切り替え
+  if (sdCurrentModel && sdCurrentModel !== targetModel) {
+    log(ip, `[IMAGE-GEN] モデル切替: ${sdCurrentModel} → ${targetModel}`);
+    await stopImageModel();
+  }
+
+  // モデルが起動していなければ起動（オンデマンド）
+  if (!sdProc || sdProc.killed) {
+    try {
+      log(ip, `[IMAGE-GEN] sd-server を起動: ${targetModel}`);
+      await startImageModel(targetModel);
+    } catch (e) {
+      return res.status(500).json({ error: `sd-server起動失敗: ${e.message}` });
+    }
+  }
+
+  sdLastActivity = Date.now();
+  const port = sdConfig.port || 7860;
+
+  // 一括生成 (batchCount 回ループ)
+  const generatedUrls = [];
+  const startTime = Date.now();
+  for (let i = 0; i < Math.min(batchCount, 4); i++) {
+    try {
+      // sd-server の HTTP API に転送
+      const sdResp = await fetch(`http://127.0.0.1:${port}/sdapi/v1/txt2img`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt,
+          negative_prompt: negativePrompt,
+          width: Math.min(Math.max(width, 64), 2048),
+          height: Math.min(Math.max(height, 64), 2048),
+          steps: Math.min(Math.max(steps, 1), 100),
+          cfg_scale: cfgScale,
+          sampler_name: sampler,
+          seed: seed === -1 ? Math.floor(Math.random() * 2**31) : seed,
+          batch_size: 1,
+          n_iter: 1,
+        }),
+      });
+      if (!sdResp.ok) {
+        const errText = await sdResp.text().catch(() => '');
+        throw new Error(`sd-server エラー ${sdResp.status}: ${errText.slice(0, 200)}`);
+      }
+      const sdData = await sdResp.json();
+      if (!sdData.images || sdData.images.length === 0) {
+        throw new Error('sd-serverから画像が返されませんでした');
+      }
+
+      // base64 PNG をデコードして保存
+      const ts = Date.now();
+      const rand = Math.random().toString(36).slice(2, 8);
+      const fileName = `sd_${ts}_${rand}_${i}.png`;
+      const uploadsDir = path.join(__dirname, 'public', 'uploads');
+      if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+      const filePath = path.join(uploadsDir, fileName);
+      fs.writeFileSync(filePath, Buffer.from(sdData.images[0], 'base64'));
+      generatedUrls.push(`/uploads/${fileName}`);
+    } catch (e) {
+      // 部分的に成功している場合もあるので、エラーでも続行
+      log(ip, `[IMAGE-GEN] error: ${e.message}`);
+      if (generatedUrls.length === 0) {
+        return res.status(500).json({ error: e.message });
+      }
+      break;
+    }
+  }
+
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  log(ip, `[IMAGE-GEN] 完了: ${generatedUrls.length}枚, ${elapsed}秒, prompt="${prompt.slice(0, 60)}"`);
+
+  res.json({
+    ok: true,
+    images: generatedUrls,
+    model: targetModel,
+    prompt,
+    negativePrompt,
+    parameters: { width, height, steps, cfgScale, sampler },
+    elapsed: Number(elapsed),
+  });
+});
+
+// 手動でモデル停止
+app.post('/image-gen/unload', requireAuth, async (req, res) => {
+  const ip = getIP(req);
+  log(ip, '[IMAGE-GEN] 手動アンロード');
+  await stopImageModel();
+  res.json({ ok: true });
 });
 
 // ════════════════════════════════════════════════

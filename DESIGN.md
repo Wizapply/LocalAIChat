@@ -2350,6 +2350,24 @@ body, .app-layout, .chat-area {
 71. **未定義のCSS変数を使うと無効値ではなくブラウザデフォルト色になる罠（再発防止）**
     罠65 と同じだが、editconfig.html のような新規 HTML ファイルでも同じバグが起きやすい。新しいページを作る時は、既存の `styles.css` の `:root` 変数定義をコピーするか、独自定義する。`var(--text)` のような未定義変数を使うと CSS 全体が無効化されるわけではなく、その1プロパティだけブラウザの「初期値」になる（通常は黒）。ダーク背景上では「黒い文字 = ほぼ見えない」状態になるので発見が遅れやすい。
 
+72. **stable-diffusion.cpp のPIEビルドエラー**
+    ROCm ビルド時に `relocation R_X86_64_32 ... can not be used when making a PIE object` エラー。Ubuntu 24.04 の gcc がデフォルトでPIE有効、しかし `libggml-hip.a` 等の依存ライブラリがPIE非対応でコンパイルされているため衝突する。対処: `cmake -DCMAKE_POSITION_INDEPENDENT_CODE=OFF -DCMAKE_EXE_LINKER_FLAGS="-no-pie" -DCMAKE_C_FLAGS="-fno-pie" -DCMAKE_CXX_FLAGS="-fno-pie"` の全てを指定。llama.cpp の ROCm ビルドでも同じ問題が起きる。
+
+73. **sd-server のオプション名は `--listen-port` / `--listen-ip`**
+    stable-diffusion.cpp の `sd-server` は llama-server と異なり、`--port` / `--host` ではなく `--listen-port` / `--listen-ip` を使う。`-p` は `--prompt` の短縮形なので、`--port` と書くとパラメータ解析でエラーになる。Usage を読まずに llama-server と同じだろうと推測すると詰まる。
+
+74. **sd-server の `--type` は重み型（f16/q4_0等）であり、モデルタイプではない**
+    `--type sdxl` のように書きたくなるが、これは f32/f16/q4_0/q5_0/q8_0 等の **量子化フォーマット** を指定するオプション。SDXLかFluxかはモデルファイルから自動推測される。`--type sdxl` を渡すと「invalid argument」で起動失敗。指定しないか、量子化型を入れる（例: `--type f16`）のが正しい。
+
+75. **sd-server は AUTOMATIC1111互換のAPI（`/sdapi/v1/txt2img`）を提供**
+    名前は「sd-server」だが、独自APIではなく **AUTOMATIC1111 (a1111) 互換** の API を実装している。リクエストJSONは `{prompt, negative_prompt, width, height, steps, cfg_scale, sampler_name, seed, batch_size, n_iter}` のa1111フォーマット、レスポンスは `{images: [base64...]}`。ComfyUI互換ではないので注意。
+
+76. **VRAM共有: チャットモデルと画像生成モデルの併存問題**
+    35B-A3B MoE モデル（Q4_K_XL で約22GB）+ SDXL（約8GB）を 32GB のR9700一枚で同時稼働するとVRAMギリギリ。対処: (a) `idleUnloadMs` で画像生成モデルを自動アンロード、(b) `HIP_VISIBLE_DEVICES=0/1` で別GPUに分離、(c) `--offload-to-cpu` でモデルをRAMに退避。実体験では (a) と (b) の併用が最もスムーズ。
+
+77. **LLMに画像URL付きの応答をさせる場合のMarkdown改変リスク**
+    画像生成結果を `![alt](url)` のMarkdown形式でLLMに渡すと、LLMが「読みやすくしよう」として `![生成された美しい猫](url)` のようにalt textを書き換える程度ならまだ良いが、稀にURLパスを「相対パス化」して `./uploads/sd_xxx.png` に変えたりパスを「修正」したりする事故が起きる。対処: カスタムマーカー `[[gen_image:URL|prompt]]` を使い、ツール返信時に「このマーカーは画像表示用なので改変せずそのまま含めてください」と明示指示。React側でこのマーカーを検出して専用コンポーネントに置き換える。Markdownを通さないのでLLMの「親切な改変」を防げる。
+
 ---
 
 ## 🎮 GPU監視バックエンドの設計
@@ -2600,6 +2618,197 @@ UX的に「設定」へのアクセスは目立ちすぎず・隠しすぎず難
 - **入力検証**: JSON構文 + 必須キー + パストラバーサル対策
 - **`password` ハッシュも表示される**: editconfig.html を見る = 実質admin。複数人運用時は別ロール検討
 - **再起動権限の集中**: 設定編集者 = サーバー再起動権限を持つ。これは意図的なシンプル設計
+
+---
+
+## 🎨 画像生成機能の設計
+
+LLMが `generate_image` ツールを呼ぶことで、チャット欄に画像を生成・表示する。stable-diffusion.cpp の `sd-server` を子プロセスとして管理し、内部HTTPで通信する。
+
+### アーキテクチャ
+
+```
+[ブラウザ: チャット入力 "猫の絵を描いて"]
+       │
+       ▼
+[LLM (llama-server)]
+       │  tool_calls: [{ name: "generate_image", args: {...} }]
+       ▼
+[クライアント React]
+       │  POST /image-gen
+       ▼
+[Express server]
+       │  startImageModel() ── オンデマンドで sd-server を spawn
+       │                       │
+       │                       ▼
+       │  POST http://127.0.0.1:7860/sdapi/v1/txt2img
+       │                       │
+       │  [sd-server プロセス] ◀┘ (stable-diffusion.cpp)
+       │       │
+       │       ▼
+       │  ROCm/CUDA GPU で推論
+       │       │
+       │       ▼
+       │  Base64 PNG をレスポンス
+       ▼
+[Express]
+       │  Base64 デコード → public/uploads/sd_<ts>_<rand>.png に保存
+       │  URLリストを返却
+       ▼
+[クライアント]
+       │  apiMessages に tool結果として「[[gen_image:URL|prompt]]」マーカー入りで追加
+       ▼
+[LLM 最終応答ストリーミング]
+       │  「ご依頼通り猫の絵を生成しました。[[gen_image:...]]」
+       ▼
+[MarkdownContent] → 正規表現でマーカーを検出 → <GeneratedImage> コンポーネントで描画
+```
+
+### なぜ Markdown `![]()` ではなくカスタムマーカー `[[gen_image:URL|prompt]]` か
+
+ツール結果に画像URLを `![生成画像](/uploads/xxx.png)` のような Markdown 画像構文で渡すと、LLMが応答生成時に**親切に書き換えてしまう**ことがある:
+
+- alt textを「美しい猫の絵」のように書き換え (まだ無害)
+- URLを「正規化」して `./uploads/xxx.png` のような相対パスに変更 → 表示崩れ
+- そもそも画像構文を文章中に混ぜず、別途リンクとして提示
+- LLMの「修正癖」で `(uploads/xxx.png)` のように `/` を削る
+
+これを防ぐため、**LLMにとって明らかに「触ってはいけない」形式**であるカスタムマーカーで返す:
+
+```
+[[gen_image:/uploads/sd_1234_abc_0.png|encoded_prompt]]
+```
+
+ツール返信に「このマーカーは画像表示用なので改変せずそのまま含めてください」と明示指示することで、LLMはマーカーをそのままコピペする。クライアント側の `MarkdownContent` は、Markdown レンダリング前に正規表現でマーカーを検出して、その部分だけ専用Reactコンポーネント `<GeneratedImage>` に置き換える。
+
+### なぜオンデマンドロード + アイドルアンロード設計か
+
+VRAM が限られる環境（特にチャット用 llama-server と GPU 共有する場合）では、画像生成モデル（SDXL: 約8GB）を常駐させると競合する。
+
+設計判断:
+- **オンデマンドロード**: 最初の `generate_image` 呼び出し時にのみ `sd-server` を起動。起動コストは ~10秒だが、使わない時は VRAM 0
+- **アイドルアンロード** (`idleUnloadMs`): 一定時間（デフォルト10分）使われなければプロセス終了して VRAM 解放
+- **モデル切替**: 別モデルが指定されたら現プロセスを kill して新モデルで再起動
+
+llama-server の同じパターン (`chatProc`, `chatLastActivity`, `checkIdle`) を再利用。
+
+### sd-server プロセス管理
+
+```javascript
+let sdProc = null;
+let sdCurrentModel = null;
+let sdProcStarting = false;
+let sdLastActivity = Date.now();
+
+async function startImageModel(modelName) {
+  if (sdProcStarting) throw new Error('既に起動処理中');
+  await stopImageModel();
+  sdProc = spawn(sdConfig.binPath, args, { env: { ...process.env, ...sdConfig.env } });
+  await waitForReady('127.0.0.1', port, readyTimeoutMs, false);  // 起動確認
+  sdCurrentModel = modelName;
+}
+```
+
+llama-server との違い:
+- llama-server: `/health` エンドポイントで起動確認
+- sd-server: TCPソケット接続できるかで起動確認（HTTP API応答前にポートはOpen）
+
+### sd-server のオプションと罠
+
+stable-diffusion.cpp の `sd-server` は llama-server とコマンドライン体系が違う:
+
+| 用途 | llama-server | sd-server |
+|:--|:--|:--|
+| ホスト | `--host` | `--listen-ip` |
+| ポート | `--port` | `--listen-port` |
+| モデル | `-m` / `--model` | 同じ |
+| API | OpenAI互換 `/v1/...` | AUTOMATIC1111互換 `/sdapi/v1/...` |
+
+特に `--port` は sd-server では `--prompt` の短縮形 `-p` と衝突するので、明示的に `--listen-port` を使う必要がある。
+
+### AUTOMATIC1111 互換 API
+
+`sd-server` は ComfyUI互換ではなく、AUTOMATIC1111互換 API を実装している:
+
+```javascript
+POST http://127.0.0.1:7860/sdapi/v1/txt2img
+Content-Type: application/json
+{
+  "prompt": "a cute cat",
+  "negative_prompt": "low quality",
+  "width": 1024,
+  "height": 1024,
+  "steps": 20,
+  "cfg_scale": 7.0,
+  "sampler_name": "euler_a",
+  "seed": -1,
+  "batch_size": 1,
+  "n_iter": 1
+}
+
+レスポンス:
+{
+  "images": ["<base64 PNG>"],
+  "parameters": {...},
+  "info": "..."
+}
+```
+
+レスポンスの `images[0]` は Base64 エンコードされたPNG。`Buffer.from(b64, 'base64')` でデコードして `fs.writeFileSync()` で保存する。
+
+### GeneratedImage コンポーネントの設計
+
+```
+┌───────────────────────────────┐
+│ ┌─────────────────────────┐   │ ← サムネイル (256x256)
+│ │   <img loading="lazy">  │   │   クリックでライトボックス
+│ │   object-fit: contain   │   │
+│ └─────────────────────────┘   │
+│ 📝 a cute orange cat...        │ ← プロンプト (2行省略)
+│ [🔍 拡大] [💾 保存] [📋 プロンプト] │
+└───────────────────────────────┘
+```
+
+実装ポイント:
+- **`loading="lazy"`**: 画面外の画像は遅延読み込み。長い会話で複数枚生成しても初期表示が軽い
+- **ライトボックス**: `position: fixed; inset: 0` でビューポート全体を覆う。クリックで閉じる
+- **ダウンロード**: `<a download>` 属性 + DOM挿入クリックで強制ダウンロード（同一オリジンなのでCORSなし）
+- **プロンプトコピー**: `navigator.clipboard.writeText()` で1.5秒「✓ コピー済」表示
+
+### 設定例 (config.json)
+
+```json
+"imageGen": true,
+"stableDiffusion": {
+  "binPath": "/usr/local/bin/sd-server",
+  "port": 7860,
+  "readyTimeoutMs": 90000,
+  "idleUnloadMs": 600000,
+  "defaultModel": "SDXL Base 1.0",
+  "env": {
+    "HSA_OVERRIDE_GFX_VERSION": "12.0.1",
+    "HIP_VISIBLE_DEVICES": "0"
+  }
+},
+"imageModels": [
+  {
+    "name": "SDXL Base 1.0",
+    "path": "/.../sd_xl_base_1.0.safetensors",
+    "vae": "/.../sdxl_vae.safetensors",
+    "extraArgs": []
+  }
+]
+```
+
+`HIP_VISIBLE_DEVICES=0` で 1枚目の R9700 だけを画像生成に使う設定。残りは llama-server に渡せる。
+
+### セキュリティ・運用考慮
+
+- **認証必須**: `/image-gen` 系は全て `requireAuth`
+- **batch_count制限**: 1回のリクエストで最大4枚まで（DoS防止）
+- **タイムアウト**: 3分（大きいモデルでも対応、それ以上はクラッシュとみなす）
+- **生成画像の置き場**: `public/uploads/` （既存のファイル操作と共通、UIから一覧・削除可能）
+- **ファイル名**: `sd_<timestamp>_<random>_<index>.png` でほぼ衝突しない
 
 ---
 

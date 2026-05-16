@@ -461,15 +461,129 @@ function renderLatex(text) {
 function MarkdownContent({ content }) {
   const ref = useRef(null);
 
-  const html = React.useMemo(() => {
-    if (!content) return '';
-    return renderLatex(content);
+  // [[gen_image:URL|encodedPrompt]] マーカーをパースしてセグメントに分割
+  // text / gen_image / text / gen_image / ... の配列にする
+  const segments = React.useMemo(() => {
+    if (!content) return [];
+    const result = [];
+    const regex = /\[\[gen_image:([^|\]]+)(?:\|([^\]]*))?\]\]/g;
+    let lastIndex = 0;
+    let match;
+    while ((match = regex.exec(content)) !== null) {
+      // マーカー前のテキスト
+      if (match.index > lastIndex) {
+        result.push({ type: 'text', value: content.slice(lastIndex, match.index) });
+      }
+      // 画像マーカー
+      let promptText = '';
+      try { promptText = decodeURIComponent(match[2] || ''); } catch { promptText = match[2] || ''; }
+      result.push({ type: 'gen_image', url: match[1], prompt: promptText });
+      lastIndex = regex.lastIndex;
+    }
+    // 末尾の残り
+    if (lastIndex < content.length) {
+      result.push({ type: 'text', value: content.slice(lastIndex) });
+    }
+    return result;
   }, [content]);
 
-  return React.createElement('div', {
-    ref,
-    dangerouslySetInnerHTML: { __html: html },
-  });
+  // セグメントがなく単純なテキストならそのまま
+  if (segments.length <= 1 && (!segments[0] || segments[0].type === 'text')) {
+    const html = renderLatex(content || '');
+    return React.createElement('div', {
+      ref,
+      dangerouslySetInnerHTML: { __html: html },
+    });
+  }
+
+  // マーカーがある場合はセグメント毎に React で描画
+  return (
+    <div ref={ref}>
+      {segments.map((seg, i) => {
+        if (seg.type === 'text') {
+          if (!seg.value.trim()) return null;
+          const html = renderLatex(seg.value);
+          return <div key={i} dangerouslySetInnerHTML={{ __html: html }} />;
+        }
+        if (seg.type === 'gen_image') {
+          return <GeneratedImage key={i} url={seg.url} prompt={seg.prompt} />;
+        }
+        return null;
+      })}
+    </div>
+  );
+}
+
+// ─── 生成画像コンポーネント ───
+// チャット欄に小さなサムネイルで表示し、クリックでフルサイズプレビュー、
+// ダウンロードボタンとプロンプトコピーボタンを提供する
+function GeneratedImage({ url, prompt }) {
+  const [showLightbox, setShowLightbox] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  async function copyPrompt() {
+    try {
+      await navigator.clipboard.writeText(prompt || '');
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {}
+  }
+
+  function downloadImage() {
+    // Blob経由でダウンロード（同一オリジンなのでCORSなし）
+    const a = document.createElement('a');
+    a.href = url;
+    // ファイル名は URL のbasename or デフォルト
+    const filename = url.split('/').pop() || `generated_${Date.now()}.png`;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  return (
+    <>
+      <div className="gen-image-card">
+        <img
+          src={url}
+          alt={prompt || '生成画像'}
+          className="gen-image-thumb"
+          onClick={() => setShowLightbox(true)}
+          loading="lazy"
+        />
+        <div className="gen-image-actions">
+          {prompt && (
+            <div className="gen-image-prompt" title={prompt}>
+              <span className="gen-image-prompt-label">📝</span>
+              <span className="gen-image-prompt-text">{prompt}</span>
+            </div>
+          )}
+          <div className="gen-image-buttons">
+            <button className="gen-image-btn" onClick={() => setShowLightbox(true)} title="拡大表示">
+              🔍 拡大
+            </button>
+            <button className="gen-image-btn" onClick={downloadImage} title="画像をダウンロード">
+              💾 保存
+            </button>
+            {prompt && (
+              <button className="gen-image-btn" onClick={copyPrompt} title="プロンプトをコピー">
+                {copied ? '✓ コピー済' : '📋 プロンプト'}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+      {showLightbox && (
+        <div className="gen-image-lightbox" onClick={() => setShowLightbox(false)}>
+          <img src={url} alt={prompt || '生成画像'} onClick={e => e.stopPropagation()} />
+          <button className="gen-image-lightbox-close" onClick={() => setShowLightbox(false)}>✕</button>
+          <button className="gen-image-lightbox-download" onClick={(e) => { e.stopPropagation(); downloadImage(); }}>
+            💾 ダウンロード
+          </button>
+        </div>
+      )}
+    </>
+  );
 }
 
 // ─── ThinkingBlock: 折りたたみ表示 ───
@@ -1080,6 +1194,36 @@ function App() {
           }
         }
 
+        // 画像生成ツール: imageGen が有効ならツール提供
+        // 「絵を描いて」「画像生成」「イラスト」等を検出して自動使用
+        if (appConfig.imageGen) {
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'generate_image',
+              description: '画像（イラスト、写真、絵）をAIで生成する。ユーザーが「描いて」「画像にして」「絵を作って」「イラストを生成」等を依頼した場合に使用する。プロンプトは英語が高品質。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  prompt: {
+                    type: 'string',
+                    description: '画像の内容を表す詳細なプロンプト。英語推奨。例: "a cute orange cat sitting on a windowsill, soft sunlight, photorealistic, high quality"'
+                  },
+                  negative_prompt: {
+                    type: 'string',
+                    description: '画像に含めたくない要素。例: "blurry, low quality, distorted, extra limbs"'
+                  },
+                  width: { type: 'number', description: '画像の幅 (px, デフォルト 1024、64-2048)' },
+                  height: { type: 'number', description: '画像の高さ (px, デフォルト 1024、64-2048)' },
+                  steps: { type: 'number', description: '生成ステップ数 (デフォルト 20、多いほど高品質だが遅い)' },
+                  count: { type: 'number', description: '生成枚数 (デフォルト 1、最大 4)' },
+                },
+                required: ['prompt']
+              }
+            }
+          });
+        }
+
         let agentSystem = systemPrompt;
         if (documents.length > 0 && sp.documents) {
           const docListText = documents.map(d => d.name).join(', ');
@@ -1489,6 +1633,72 @@ function App() {
               apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: resultText });
               // ファイル一覧を再読み込み
               loadFileList();
+            } else if (fnName === 'generate_image') {
+              const prompt = fnArgs.prompt || '';
+              const negativePrompt = fnArgs.negative_prompt || fnArgs.negativePrompt || '';
+              const width = Number(fnArgs.width) || 1024;
+              const height = Number(fnArgs.height) || 1024;
+              const steps = Number(fnArgs.steps) || 20;
+              const count = Math.min(Math.max(Number(fnArgs.count) || 1, 1), 4);
+
+              if (!prompt.trim()) {
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: 'プロンプトが指定されていません。' });
+                continue;
+              }
+
+              searchQueries.push({ query: `🎨 画像生成: ${prompt.slice(0, 50)}`, resultCount: null, type: 'image' });
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = {
+                  ...copy[copy.length - 1],
+                  agentStatus: `🎨 画像生成中: "${prompt.slice(0, 40)}..."（数十秒かかります）`,
+                  searchQueries: [...searchQueries],
+                };
+                return copy;
+              });
+
+              try {
+                // 画像生成は時間がかかるので長めのタイムアウト (3分)
+                const ctrl = new AbortController();
+                const timer = setTimeout(() => ctrl.abort(), 180000);
+                const res = await fetch('/image-gen', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    prompt, negativePrompt, width, height, steps, batchCount: count,
+                  }),
+                  signal: ctrl.signal,
+                });
+                clearTimeout(timer);
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || '生成失敗');
+
+                searchQueries[searchQueries.length - 1].resultCount = data.images.length;
+
+                // 生成画像はカスタムマーカー [[gen_image:URL|alt]] で返す。
+                // メッセージ表示側でこのマーカーを検出して <GeneratedImage> コンポーネントを描画。
+                // プロンプトも保持して、画像クリック時にコピーやプレビューに使う。
+                const imageMarkers = data.images.map((url) => {
+                  // パイプ区切りで url|prompt をエンコードして埋め込む
+                  const encoded = encodeURIComponent(prompt);
+                  return `[[gen_image:${url}|${encoded}]]`;
+                }).join('\n\n');
+                const summary = `🎨 画像を ${data.images.length} 枚生成しました（${data.elapsed}秒、モデル: ${data.model}）\n\n` +
+                                `${imageMarkers}\n\n` +
+                                `プロンプト: ${prompt}\n\n` +
+                                `重要: 上記の [[gen_image:...]] マーカーは画像表示用なので、そのまま改変せずに最終応答に含めてください。あなたは簡単なコメント（例: "ご依頼の通り、〇〇の画像を生成しました。" 等）を1〜2文添えるだけで十分です。`;
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: summary });
+              } catch (e) {
+                const errMsg = e.name === 'AbortError' ? 'タイムアウト（3分超過）' : e.message;
+                searchQueries[searchQueries.length - 1].resultCount = 0;
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: `画像生成失敗: ${errMsg}` });
+              } finally {
+                setMessages(prev => {
+                  const copy = [...prev];
+                  copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: null, searchQueries: [...searchQueries] };
+                  return copy;
+                });
+              }
             }
           }
           // ループ先頭に戻って次のツール判断を試みる
@@ -3417,7 +3627,7 @@ ${conversationText}
                       </div>
                       {msg.searchQueries?.map((sq, si) => (
                         <div key={si} className="agent-search-item">
-                          <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : sq.type === 'file' ? '📁' : '🔍'}</span>
+                          <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : sq.type === 'file' ? '📁' : sq.type === 'image' ? '🎨' : '🔍'}</span>
                           <span className="agent-search-query">{sq.query}</span>
                           {sq.resultCount != null && (
                             <span className="agent-search-result">{sq.resultCount}件</span>

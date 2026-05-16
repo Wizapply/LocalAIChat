@@ -55,8 +55,8 @@ pip install pillow librosa soundfile
 ### 4. HuggingFaceログイン（Gemmaモデルはライセンス承諾が必要）
 
 ```bash
-pip install huggingface_hub
-huggingface-cli login
+pip install "huggingface_hub[cli]"
+hf auth login  # 旧: huggingface-cli login (パッケージ更新で hf に統合)
 # https://huggingface.co/google/gemma-4-E2B-it でライセンス承諾が必要
 ```
 
