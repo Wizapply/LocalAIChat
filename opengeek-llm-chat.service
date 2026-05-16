@@ -13,8 +13,10 @@ WorkingDirectory=/home/wizapply-ai/opengeek-llm-chat
 ExecStart=/usr/bin/node /home/wizapply-ai/opengeek-llm-chat/server.js
 
 # 再起動設定
+# プロセスが終了したら自動的に再起動する。ブラウザUIの「再起動」ボタンや
+# クラッシュ時に systemd が自動復活させる。
 Restart=always
-RestartSec=10
+RestartSec=3
 
 # 環境変数（必要に応じて）
 Environment=NODE_ENV=production

@@ -2338,6 +2338,18 @@ body, .app-layout, .chat-area {
 67. **外部APIサーバーの「プロセス停止」と「設定削除」を分ける**
     一つの「停止」ボタンだけだと、ユーザーは「一時的に止めて後で再起動したい」のか「完全に削除したい」のか区別がつかない。設計として `● 稼働中 ⇄ ○ 停止中` トグルでプロセスのみ操作（設定は保持）、`✕` で設定ごと削除、と機能を明確に分けることでUXが向上する。サーバー側も `stopExternalServerProcess()`（設定保持）と `stopExternalServer()`（設定削除）を分離する。
 
+68. **`process.env.INVOCATION_ID` で systemd 起動を判定**
+    systemd は子プロセスに `INVOCATION_ID` という UUID 形式の環境変数を必ず付与する。これがあれば systemd 管理下、なければ直接実行（または別のプロセスマネージャ）と判定できる。`/restart` エンドポイントで `process.exit(0)` する前に、この判定で「自動復帰されるか」をクライアントに伝えることで、ユーザーが「終了したまま戻ってこない」事故を防げる。
+
+69. **再起動完了の検知はポーリングで「uptime が短い」を見る**
+    `POST /restart` でプロセスを終了させると、systemd が新プロセスを起動する。クライアントは古いプロセス・新プロセスを区別できないので、`GET /restart/info` の `uptime` フィールドを確認する。`uptime < 30秒` なら新プロセスと判定。さらに連続2回成功で確定とすることで、たまたまDB接続が回復した古いプロセスに当たる可能性を排除できる。最初の2秒はポーリングしない（プロセス終了を待つ）のもポイント。
+
+70. **`process.exit()` の前に少し待ってレスポンス返却**
+    `res.json({ok: true}); process.exit(0);` だとレスポンスが TCP バッファに乗る前にプロセスが消えて、クライアント側が `ERR_EMPTY_RESPONSE` を受け取る。`setTimeout(() => process.exit(0), 1500)` のように 1〜2秒待つことで、レスポンスが届いてからプロセス終了できる。また子プロセス（外部APIサーバー等）の SIGTERM ハンドリングのためにも待ち時間は必要。
+
+71. **未定義のCSS変数を使うと無効値ではなくブラウザデフォルト色になる罠（再発防止）**
+    罠65 と同じだが、editconfig.html のような新規 HTML ファイルでも同じバグが起きやすい。新しいページを作る時は、既存の `styles.css` の `:root` 変数定義をコピーするか、独自定義する。`var(--text)` のような未定義変数を使うと CSS 全体が無効化されるわけではなく、その1プロパティだけブラウザの「初期値」になる（通常は黒）。ダーク背景上では「黒い文字 = ほぼ見えない」状態になるので発見が遅れやすい。
+
 ---
 
 ## 🎮 GPU監視バックエンドの設計
@@ -2459,6 +2471,135 @@ gpu.power = amdVal(power.current_socket_power ?? power.socket_power ?? power.ave
 ### Express で配信する
 
 `server.js` には `app.use(express.static('public'))` があるため、`public/styles.css` は自動的に `/styles.css` で配信される。サーバー側のコード追加は不要。
+
+---
+
+## ⚙️ config.json 編集UI とブラウザ再起動の設計
+
+`editconfig.html` は config.json をブラウザから直接編集し、本体プロセスを再起動できる管理画面。SSH で直接 vim する代わりに、認証付きでブラウザ完結で設定を変更できる。
+
+### アーキテクチャ
+
+```
+[editconfig.html]
+   │  GET  /config/raw          ← config.json 生テキスト
+   │  POST /config/raw          ← 保存（バックアップ自動作成）
+   │  GET  /config/backups      ← バックアップ一覧
+   │  POST /config/restore      ← バックアップから復元
+   │  GET  /restart/info        ← systemd下か、PID、uptime
+   │  POST /restart             ← 本体プロセス終了
+   ▼
+[Express server]
+   │  ・JSON構文検証
+   │  ・必須キー検証 (chatModels, llamaServer)
+   │  ・自動バックアップ (最新10件保持)
+   │  ・パストラバーサル対策
+   │  ・1.5秒待ってから process.exit(0)
+   ▼
+[systemd]
+   │  ・Restart=always
+   │  ・RestartSec=3
+   ▼
+[新プロセス起動 → クライアントがポーリング検知]
+```
+
+### 設計判断
+
+#### なぜ raw text で扱うか（パースしたJSON ではなく）
+
+クライアントとサーバー間で JSON をパース→再シリアライズすると、コメントやキー順序・空白が失われる。`config.json` は人間が編集することを前提としたファイルなので、フォーマットを保全するために生テキストで扱う。サーバー側では構文チェックだけして書き込み、保存後は `JSON.stringify(parsed, null, 2)` で正規化する（これは UI 側の「整形」ボタンと同等動作）。
+
+#### なぜ JSON 構文チェックを2段階にするか
+
+- **クライアント側**: 編集中にリアルタイムでパースして赤バナー表示。操作感が良い
+- **サーバー側**: POST 時に再度パース・必須キー検証。クライアントを信用しないセキュリティの基本
+
+#### なぜ自動バックアップを10件保持するか
+
+設定ミスでサーバーが起動しなくなった時の「やり直し」が重要。1件だけだと続けて2回失敗すると元に戻せない。逆に無制限にすると徐々に肥大化するので、10件で打ち切り（最古から削除）。各バックアップは元のサイズと同程度（数KB〜10KB）なので、10件で100KB 程度に収まる。
+
+#### なぜ復元時にも現在のconfigをバックアップするか
+
+「やっぱり今のに戻したい」というケースに備える。復元実行時に `config.json.bak.<ts>-before-restore` の名前で現在を保存。これも10件保持に含まれるので最終的には消える。
+
+### 再起動の仕組み
+
+#### systemd 任せ方式の選択理由
+
+ブラウザから本体を再起動する方法は3つあった:
+
+| 方式 | 説明 | 採否 |
+|:--|:--|:--:|
+| A. `process.exit()` + systemd | systemd の `Restart=always` が自動復帰 | ✓ **採用** |
+| B. `sudo systemctl restart` | 子プロセスから systemctl 実行 | ✗ |
+| C. 子プロセスで自己再起動 | spawn で nodeを起動、親終了 | ✗ |
+
+**A を採用した理由**:
+- 追加権限不要（sudo 不要、sudoers 設定なし）
+- セキュリティ的にシンプル（外部コマンド実行なし）
+- 既存の systemd 管理下のままなのでログ・状態管理も従来通り
+- 監査ログがクリーン（journalctl で「restart requested」が見える）
+
+**B/C を不採用にした理由**:
+- B: `NOPASSWD: systemctl restart` を sudoers に書く必要があり、web経由で sudo は監査グレー
+- C: 親プロセスのファイルディスクリプタ・ポートを子に正しく渡すのが複雑、デタッチ失敗で2重起動の事故も起きやすい
+
+#### systemd 下かどうかの判定
+
+```javascript
+const isSystemd = !!process.env.INVOCATION_ID;
+```
+
+`INVOCATION_ID` は systemd が必ず子プロセスに付与する UUID 環境変数。これがあれば systemd 下と確実に判定できる。`SYSTEMD_EXEC_PID` や `MANAGERPID` でも判定可能だが、`INVOCATION_ID` が最も広範囲のバージョンで動作する。
+
+#### 再起動完了のクライアント検知
+
+```javascript
+async function pollUntilBack() {
+  await sleep(2000);                 // プロセス終了を待つ
+  let consecutiveOk = 0;
+  while (timeLeft) {
+    try {
+      const r = await fetch('/restart/info');
+      if (r.ok) {
+        const data = await r.json();
+        if (data.uptime < 30) {       // 新プロセスの目印
+          consecutiveOk++;
+          if (consecutiveOk >= 2) return done();  // 連続2回で確定
+        }
+      }
+    } catch {
+      consecutiveOk = 0;              // 接続エラー → まだ起動中
+    }
+    await sleep(1000);
+  }
+}
+```
+
+ポイント:
+- 最初の2秒は何もしない（古いプロセスがまだ生きているため）
+- 接続エラーは「再起動中」と解釈（カウンタをリセット）
+- `uptime < 30秒` を新プロセスの目印に使う（systemd で再起動された後の typical な値）
+- 連続2回成功で確定（一時的な復旧と確実な復活を区別）
+- 60秒タイムアウト（万一 systemd が起動失敗した場合のエラー通知）
+
+### サイドバー左下の設定アイコン
+
+UX的に「設定」へのアクセスは目立ちすぎず・隠しすぎず難しい。OpenGeekLLMChatでは:
+
+- **位置**: サイドバー左下（`margin-top: auto` で押し下げ）
+- **サイズ**: 11px、padding 8px 12px、グレー文字
+- **状態**: 通常時は薄く、ホバー時にアクセントカラー＋歯車アイコンがゆっくり回転
+- **アイコン**: SVG をインラインで埋め込み（Feather Icons の歯車）
+
+ホバー時の `animation: spin-slow 4s linear infinite;` で「クリック可能で何か起きそう」を視覚的に伝える。
+
+### セキュリティ考慮
+
+- **認証必須**: 全エンドポイント `requireAuth`、Cookie 共有
+- **入力検証**: JSON構文 + 必須キー + パストラバーサル対策
+- **`password` ハッシュも表示される**: editconfig.html を見る = 実質admin。複数人運用時は別ロール検討
+- **再起動権限の集中**: 設定編集者 = サーバー再起動権限を持つ。これは意図的なシンプル設計
 
 ---
 

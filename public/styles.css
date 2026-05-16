@@ -105,6 +105,41 @@
     overflow: hidden;
   }
 
+  /* サイドバー左下の設定ボタン（小さく、目立たず、しかし見つかる） */
+  .sidebar-settings-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 12px;
+    margin: 0 8px 8px;
+    margin-top: auto;  /* サイドバー内で一番下に押し下げる */
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 11px;
+    font-weight: 400;
+    border-radius: var(--radius-sm);
+    transition: all 0.15s;
+    flex-shrink: 0;
+    border: 1px solid transparent;
+  }
+  .sidebar-settings-btn:hover {
+    background: var(--bg-hover);
+    color: var(--accent);
+    border-color: var(--border);
+  }
+  .sidebar-settings-btn svg {
+    flex-shrink: 0;
+    opacity: 0.8;
+  }
+  .sidebar-settings-btn:hover svg {
+    opacity: 1;
+    animation: spin-slow 4s linear infinite;
+  }
+  @keyframes spin-slow {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+
   .sidebar-header {
     padding: 20px 20px 16px;
     border-bottom: 1px solid var(--border);

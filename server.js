@@ -2317,6 +2317,166 @@ app.get('/config', (req, res) => {
   res.json(safeConfig);
 });
 
+// ─── config.json 編集（認証必須・raw JSON） ───
+// editconfig.html から呼ばれる。生のJSONファイル内容を返す/保存する。
+// 注意:
+// - 保存前に必ずバックアップを作成（config.json.bak.<timestamp>）
+// - JSON構文チェックを行う
+// - 必須トップレベルキー（chatModels, llamaServer等）の存在確認
+// - 保存しても運用中の appConfig は再起動するまで反映されない（注意書きをUIに出す）
+
+app.get('/config/raw', requireAuth, (req, res) => {
+  try {
+    const raw = fs.readFileSync(CONFIG_FILE, 'utf-8');
+    res.type('application/json').send(raw);
+  } catch (e) {
+    res.status(500).json({ error: `読み込み失敗: ${e.message}` });
+  }
+});
+
+app.post('/config/raw', requireAuth, express.text({ type: '*/*', limit: '5mb' }), (req, res) => {
+  const ip = getIP(req);
+  const newContent = req.body;
+  if (!newContent || typeof newContent !== 'string') {
+    return res.status(400).json({ error: '本文がありません' });
+  }
+
+  // JSON構文チェック
+  let parsed;
+  try {
+    parsed = JSON.parse(newContent);
+  } catch (e) {
+    return res.status(400).json({ error: `JSON構文エラー: ${e.message}` });
+  }
+  if (typeof parsed !== 'object' || Array.isArray(parsed) || parsed === null) {
+    return res.status(400).json({ error: 'ルートはオブジェクトである必要があります' });
+  }
+
+  // 必須キーの簡易チェック（ある程度の暴発防止）
+  const required = ['chatModels', 'llamaServer'];
+  const missing = required.filter(k => !(k in parsed));
+  if (missing.length > 0) {
+    return res.status(400).json({ error: `必須キーが欠落しています: ${missing.join(', ')}` });
+  }
+
+  // バックアップ作成
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupPath = `${CONFIG_FILE}.bak.${ts}`;
+    if (fs.existsSync(CONFIG_FILE)) {
+      fs.copyFileSync(CONFIG_FILE, backupPath);
+    }
+    // 古いバックアップを掃除（最新10件のみ保持）
+    try {
+      const dir = path.dirname(CONFIG_FILE);
+      const base = path.basename(CONFIG_FILE);
+      const backups = fs.readdirSync(dir)
+        .filter(f => f.startsWith(`${base}.bak.`))
+        .map(f => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs }))
+        .sort((a, b) => b.t - a.t);
+      backups.slice(10).forEach(b => {
+        try { fs.unlinkSync(path.join(dir, b.f)); } catch {}
+      });
+    } catch {}
+    // pretty-print して保存
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(parsed, null, 2));
+    log(ip, `CONFIG SAVED: backup=${path.basename(backupPath)}`);
+    res.json({ ok: true, backup: path.basename(backupPath) });
+  } catch (e) {
+    res.status(500).json({ error: `保存失敗: ${e.message}` });
+  }
+});
+
+// バックアップ一覧
+app.get('/config/backups', requireAuth, (req, res) => {
+  try {
+    const dir = path.dirname(CONFIG_FILE);
+    const base = path.basename(CONFIG_FILE);
+    const backups = fs.readdirSync(dir)
+      .filter(f => f.startsWith(`${base}.bak.`))
+      .map(f => {
+        const st = fs.statSync(path.join(dir, f));
+        return { name: f, mtime: st.mtimeMs, size: st.size };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    res.json({ backups });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// バックアップから復元
+app.post('/config/restore', requireAuth, jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const { name } = req.body || {};
+  if (!name || typeof name !== 'string') return res.status(400).json({ error: 'name が必要です' });
+  // パストラバーサル対策: basename のみ受け付ける
+  const safeName = path.basename(name);
+  const base = path.basename(CONFIG_FILE);
+  if (!safeName.startsWith(`${base}.bak.`)) {
+    return res.status(400).json({ error: 'バックアップファイル名ではありません' });
+  }
+  const fullPath = path.join(path.dirname(CONFIG_FILE), safeName);
+  if (!fs.existsSync(fullPath)) return res.status(404).json({ error: 'バックアップが見つかりません' });
+
+  try {
+    // 現在のconfigを今のタイムスタンプでバックアップ
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    fs.copyFileSync(CONFIG_FILE, `${CONFIG_FILE}.bak.${ts}-before-restore`);
+    fs.copyFileSync(fullPath, CONFIG_FILE);
+    log(ip, `CONFIG RESTORED FROM ${safeName}`);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: `復元失敗: ${e.message}` });
+  }
+});
+
+// ─── サーバー再起動 ───
+// systemd の Restart=always (または on-failure) に依存して、プロセスを終了 → 自動復活する方式。
+// 起動方法に応じた挙動:
+//   - systemd 起動: 数秒後に自動復活 ✓
+//   - 直接 node server.js: 復活せず、手動で再起動が必要
+// クライアントには「再起動可能か」のヒントを返すため /restart/info も用意
+app.get('/restart/info', requireAuth, (req, res) => {
+  // INVOCATION_ID は systemd 起動時のみ付与される環境変数
+  const isSystemd = !!process.env.INVOCATION_ID;
+  res.json({
+    isSystemd,
+    pid: process.pid,
+    uptime: process.uptime(),
+    nodeVersion: process.version,
+  });
+});
+
+app.post('/restart', requireAuth, (req, res) => {
+  const ip = getIP(req);
+  const isSystemd = !!process.env.INVOCATION_ID;
+  log(ip, `RESTART requested (systemd=${isSystemd})`);
+
+  if (!isSystemd) {
+    // systemd で動いていないなら警告を返すが、ユーザーの意思を尊重して終了は実行する
+    // （nodemon や pm2 でも動く可能性があるため）
+    log(ip, 'RESTART warning: not running under systemd, may not auto-restart');
+  }
+
+  // レスポンスを先に返してから、少し待ってプロセス終了
+  res.json({
+    ok: true,
+    message: isSystemd
+      ? 'systemd経由で自動再起動します（数秒以内）'
+      : '警告: systemd下ではないため、自動再起動されない可能性があります',
+    isSystemd,
+  });
+
+  // 進行中のリクエストへの配慮で少し待つ
+  setTimeout(() => {
+    console.log('[RESTART] Exiting now for systemd to restart...');
+    // 外部APIサーバーも停止しておく（自動でやってくれるが念のため）
+    try { stopAllExternalServers(); } catch {}
+    process.exit(0);
+  }, 1500);
+});
+
 app.post('/auth', jsonParser, (req, res) => {
   const ip = getIP(req);
   if (!appConfig.password) {
