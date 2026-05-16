@@ -11,7 +11,14 @@
   "accentColor": "#34d399",
   "defaultModel": "",
   "password": "e10adc3949ba59abbe56e057f20f883e",
+  "pythonPath": "/home/[user]/opengeek-llm-chat/venv/bin/python",
   "logLevel": "quiet",
+  "llamaCppDir": "/home/[user]/llama.cpp",
+  "tuningEnv": {
+    "HSA_OVERRIDE_GFX_VERSION": "12.0.1",
+    "PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True",
+    "HIP_VISIBLE_DEVICES": "0"
+  },
   "transcribe": {
     "enabled": false,
     "host": "127.0.0.1",
@@ -70,6 +77,24 @@
     "extraArgs": [
       "--device",
       "ROCm0"
+    ]
+  },
+  "tuning": {
+    "pythonPath": "/home/[user]/opengeek-llm-chat/venv-tuning/bin/python",
+    "llamaCppDir": "/home/[user]/llama.cpp",
+    "env": {
+      "HSA_OVERRIDE_GFX_VERSION": "12.0.1",
+      "PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True",
+      "HIP_VISIBLE_DEVICES": "0"
+    },
+    "modelPresets": [
+      { "value": "Qwen/Qwen2.5-0.5B-Instruct", "size": "0.5B", "vramLora": "~4GB", "desc": "個人検証・実験用", "epochs": 5, "lr": 0.0002, "batch": 2, "accum": 4, "r": 8, "alpha": 16, "maxLen": 2048 },
+      { "value": "Qwen/Qwen2.5-1.5B-Instruct", "size": "1.5B", "vramLora": "~6GB", "desc": "軽量タスク",       "epochs": 5, "lr": 0.0002, "batch": 2, "accum": 4, "r": 16, "alpha": 32, "maxLen": 2048 },
+      { "value": "Qwen/Qwen2.5-3B-Instruct",   "size": "3B",   "vramLora": "~10GB", "desc": "実用エッジ",       "epochs": 3, "lr": 0.0002, "batch": 2, "accum": 8, "r": 16, "alpha": 32, "maxLen": 2048 },
+      { "value": "Qwen/Qwen2.5-7B-Instruct",   "size": "7B",   "vramLora": "~22GB", "desc": "本命・推奨",       "epochs": 3, "lr": 0.0002, "batch": 1, "accum": 16, "r": 32, "alpha": 64, "maxLen": 2048 },
+      { "value": "Qwen/Qwen2.5-14B-Instruct",  "size": "14B",  "vramLora": "~40GB", "desc": "高品質、要マルチGPU", "epochs": 2, "lr": 0.0001, "batch": 1, "accum": 32, "r": 64, "alpha": 128, "maxLen": 2048 },
+      { "value": "google/gemma-2-9b-it",       "size": "9B",   "vramLora": "~26GB", "desc": "Google Gemma 2",    "epochs": 3, "lr": 0.0002, "batch": 1, "accum": 16, "r": 32, "alpha": 64, "maxLen": 2048 },
+      { "value": "meta-llama/Llama-3.1-8B-Instruct", "size": "8B", "vramLora": "~24GB", "desc": "Llama 3.1 (要HF token)", "epochs": 3, "lr": 0.0002, "batch": 1, "accum": 16, "r": 32, "alpha": 64, "maxLen": 2048 }
     ]
   },
   "webSearch": true,

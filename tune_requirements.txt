@@ -1,0 +1,44 @@
+# OpenGeek Fine-Tuning 依存パッケージ
+#
+# === インストール手順 ===
+#
+# 1. venv作成（OpenGeekLLMChat と別venv 推奨）:
+#    cd ~/opengeek-llm-chat
+#    python3 -m venv venv-tuning
+#    source venv-tuning/bin/activate
+#
+# 2. PyTorch インストール（環境別）:
+#
+#    AMD ROCm (R9700/gfx1201):
+#      pip install --pre torch torchvision torchaudio \
+#        --index-url https://download.pytorch.org/whl/nightly/rocm7.0
+#
+#      環境変数も設定:
+#        export HSA_OVERRIDE_GFX_VERSION=12.0.1
+#        export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+#        export HIP_VISIBLE_DEVICES=0       # 単一GPUに限定
+#
+#    NVIDIA CUDA:
+#      pip install torch torchvision torchaudio \
+#        --index-url https://download.pytorch.org/whl/cu121
+#
+# 3. その他の依存:
+#    pip install -r tune_requirements.txt
+#
+# 4. config.json で venv パスを指定:
+#    "pythonPath": "/home/wizapply-ai/opengeek-llm-chat/venv-tuning/bin/python"
+
+transformers>=4.40.0
+peft>=0.10.0
+trl>=0.12.0           # SFTTrainer + SFTConfig 用
+datasets>=2.14.0
+accelerate>=0.27.0
+sentencepiece>=0.1.99
+protobuf>=4.21.0
+einops>=0.7.0
+
+# QLoRA を使う場合（AMD ROCm では制限あり、LoRA推奨）
+# bitsandbytes>=0.43.0
+
+# GGUF変換用（llama.cpp 側の venv で使う）
+# gguf

@@ -193,6 +193,29 @@
     cursor: not-allowed;
   }
 
+  .tuning-link {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 7px 10px;
+    margin-top: 6px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-size: 11.5px;
+    font-weight: 500;
+    text-decoration: none;
+    transition: all 0.15s;
+    cursor: pointer;
+  }
+  .tuning-link:hover {
+    background: var(--accent-dim);
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+
   .setting-readonly {
     background: var(--bg-tertiary);
     border: 1px solid var(--border);
@@ -2487,10 +2510,12 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    max-width: calc(100vw - 32px);
   }
 
   .loading-toast::before {
     content: '';
+    flex-shrink: 0;
     width: 12px;
     height: 12px;
     border: 2px solid #fb923c;
@@ -3253,6 +3278,10 @@ function App() {
   const [showRoleEditor, setShowRoleEditor] = useState(false);  // 役割エディタの表示状態
   const [chatLoading, setChatLoading] = useState(false);
   const saveTimerRef = useRef(null);
+  // チャット内でユーザー操作（メッセージ送信・ドキュメント追加等）があったかを追跡
+  // 単に履歴を「開いた」だけでは true にならない。これにより updatedAt が無駄に更新されて
+  // 順序が変わってしまうのを防ぐ
+  const messagesDirtyRef = useRef(false);
 
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
@@ -3416,6 +3445,7 @@ function App() {
         setEmbeddingJobs(prev => prev.map(j => j.id === jobId ? { ...j, current: i + 1 } : j));
       }
       setDocuments(prev => [...prev, { name, text, chunks, embeddings }]);
+      messagesDirtyRef.current = true;
     } catch (e) {
       setError(`ドキュメント「${name}」のEmbedding生成に失敗: ${e.message}`);
     } finally {
@@ -3551,6 +3581,7 @@ function App() {
       images: hasImages ? pendingImages.map(img => ({ name: img.name, base64: img.base64, preview: img.preview })) : undefined,
     };
     setMessages(prev => [...prev, userMsg]);
+    messagesDirtyRef.current = true;  // ユーザー送信があったので並び替え対象
     setInput('');
     setChatImages([]);
     // textareaの高さを初期サイズにリセット（onInputで広がったままにならないように）
@@ -5218,6 +5249,7 @@ function App() {
       setShowRoleEditor(false);
       setMessages(data.messages || []);
       setDocuments(data.documents || []);
+      messagesDirtyRef.current = false;  // ロードしただけでは dirty にしない
     } finally {
       setChatLoading(false);
     }
@@ -5232,6 +5264,7 @@ function App() {
     setShowRoleEditor(false);
     setMessages([]);
     setDocuments([]);
+    messagesDirtyRef.current = false;  // 新規チャット時もクリア
   }
 
   // ─── RAG作成: 現在のチャットをLLMで要約してmdドキュメントとしてアップロード→新規チャット ───
@@ -5617,12 +5650,16 @@ ${conversationText}
   }, [messages, isLoading, chatTitle]);
 
   // メッセージ・ドキュメント変更時に自動保存（1.5秒デバウンス）
+  // ただし「履歴を開いただけ」では保存しない（並び順を維持するため）
+  // messagesDirtyRef が true のときだけ保存する
   useEffect(() => {
     if (messages.length === 0 && documents.length === 0) return;
     if (isLoading) return;
+    if (!messagesDirtyRef.current) return;  // dirty でなければ保存しない
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
       saveChat(chatId, messages, chatTitle);
+      messagesDirtyRef.current = false;  // 保存したらクリア
     }, 1500);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
   }, [messages, documents, isLoading]);
@@ -5740,6 +5777,9 @@ ${conversationText}
                 })}
               </select>
             </div>
+            <a className="tuning-link" href="/tuning.html" title="ファインチューニング管理画面を開く">
+              🧠 ファインチューニング
+            </a>
           </div>
         </div>
 
@@ -5871,7 +5911,7 @@ ${conversationText}
                     <div className="doc-stats">{doc.chunks.length}チャンク · {(doc.text.length / 1000).toFixed(1)}K文字</div>
                   </div>
                 </div>
-                <button className="doc-remove" onClick={() => setDocuments(prev => prev.filter((_, j) => j !== i))}>×</button>
+                <button className="doc-remove" onClick={() => { setDocuments(prev => prev.filter((_, j) => j !== i)); messagesDirtyRef.current = true; }}>×</button>
               </div>
             ))}
           </div>

@@ -1249,6 +1249,565 @@ app.delete('/external-servers/:id', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ════════════════════════════════════════════════
+// ファインチューニング機能
+// ════════════════════════════════════════════════
+
+const TUNING_DIR = path.join(__dirname, 'tuning');
+const TUNING_DATA_DIR = path.join(TUNING_DIR, 'datasets');
+const TUNING_RUNS_DIR = path.join(TUNING_DIR, 'runs');
+const TUNING_SAMPLES_FILE = path.join(TUNING_DIR, 'samples.jsonl');
+const TUNING_JOBS_FILE = path.join(TUNING_DIR, 'jobs.json');
+
+// ディレクトリ作成
+for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR]) {
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+}
+
+let currentTuningJob = null;  // 実行中ジョブ { id, proc, ... }
+
+// ─── 学習サンプル管理 ───
+// JSONLファイルで管理。1行 = 1サンプル
+// {id, instruction, response, system?, createdAt, tags?}
+
+function loadAllSamples() {
+  if (!fs.existsSync(TUNING_SAMPLES_FILE)) return [];
+  try {
+    return fs.readFileSync(TUNING_SAMPLES_FILE, 'utf-8')
+      .split('\n')
+      .filter(line => line.trim())
+      .map(line => JSON.parse(line));
+  } catch (e) {
+    log('-', `[tuning] サンプル読み込みエラー: ${e.message}`);
+    return [];
+  }
+}
+
+function saveAllSamples(samples) {
+  const data = samples.map(s => JSON.stringify(s)).join('\n') + (samples.length > 0 ? '\n' : '');
+  fs.writeFileSync(TUNING_SAMPLES_FILE, data);
+}
+
+function generateSampleId() {
+  return 's_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+// 学習用のプリセット情報を返す（config.json の tuning.modelPresets から）
+app.get('/tuning/presets', requireAuth, (req, res) => {
+  const presets = appConfig.tuning?.modelPresets || [];
+  res.json({ presets });
+});
+
+// 全サンプル取得
+app.get('/tuning/samples', requireAuth, (req, res) => {
+  const samples = loadAllSamples();
+  res.json({ samples, count: samples.length });
+});
+
+// サンプル追加（1件）
+app.post('/tuning/samples', requireAuth, jsonParser, (req, res) => {
+  const { instruction, response, system, tags } = req.body || {};
+  if (!instruction || !response) {
+    return res.status(400).json({ error: 'instruction と response は必須です' });
+  }
+  const samples = loadAllSamples();
+  const newSample = {
+    id: generateSampleId(),
+    instruction: String(instruction),
+    response: String(response),
+    system: system ? String(system) : '',
+    tags: Array.isArray(tags) ? tags : [],
+    createdAt: Date.now(),
+  };
+  samples.push(newSample);
+  saveAllSamples(samples);
+  res.json({ ok: true, sample: newSample, total: samples.length });
+});
+
+// サンプル更新
+app.put('/tuning/samples/:id', requireAuth, jsonParser, (req, res) => {
+  const samples = loadAllSamples();
+  const idx = samples.findIndex(s => s.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Not found' });
+  const { instruction, response, system, tags } = req.body || {};
+  if (instruction !== undefined) samples[idx].instruction = String(instruction);
+  if (response !== undefined) samples[idx].response = String(response);
+  if (system !== undefined) samples[idx].system = String(system);
+  if (tags !== undefined) samples[idx].tags = Array.isArray(tags) ? tags : [];
+  samples[idx].updatedAt = Date.now();
+  saveAllSamples(samples);
+  res.json({ ok: true, sample: samples[idx] });
+});
+
+// サンプル削除
+app.delete('/tuning/samples/:id', requireAuth, (req, res) => {
+  const samples = loadAllSamples();
+  const idx = samples.findIndex(s => s.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Not found' });
+  const removed = samples.splice(idx, 1)[0];
+  saveAllSamples(samples);
+  res.json({ ok: true, removed });
+});
+
+// 全サンプル削除
+app.delete('/tuning/samples', requireAuth, (req, res) => {
+  saveAllSamples([]);
+  res.json({ ok: true });
+});
+
+// CSV/JSONLインポート
+app.post('/tuning/samples/import', requireAuth, jsonParser, (req, res) => {
+  const { format, content } = req.body || {};
+  if (!content) return res.status(400).json({ error: 'content が必要です' });
+  const samples = loadAllSamples();
+  let added = 0;
+  try {
+    if (format === 'jsonl') {
+      const lines = content.split('\n').filter(l => l.trim());
+      for (const line of lines) {
+        const obj = JSON.parse(line);
+        if (!obj.instruction || !obj.response) continue;
+        samples.push({
+          id: generateSampleId(),
+          instruction: String(obj.instruction),
+          response: String(obj.response),
+          system: obj.system ? String(obj.system) : '',
+          tags: Array.isArray(obj.tags) ? obj.tags : [],
+          createdAt: Date.now(),
+        });
+        added++;
+      }
+    } else if (format === 'csv') {
+      // 簡易CSVパーサー: 1行目をヘッダーとして使う
+      const lines = content.split('\n').filter(l => l.trim());
+      if (lines.length < 2) return res.status(400).json({ error: 'CSVが空です' });
+      const headers = parseCsvLine(lines[0]).map(h => h.trim().toLowerCase());
+      const instructionIdx = headers.indexOf('instruction');
+      const responseIdx = headers.indexOf('response');
+      const systemIdx = headers.indexOf('system');
+      if (instructionIdx < 0 || responseIdx < 0) {
+        return res.status(400).json({ error: 'CSVに instruction と response カラムが必要です' });
+      }
+      for (let i = 1; i < lines.length; i++) {
+        const cols = parseCsvLine(lines[i]);
+        if (cols.length <= Math.max(instructionIdx, responseIdx)) continue;
+        const instruction = (cols[instructionIdx] || '').trim();
+        const response = (cols[responseIdx] || '').trim();
+        if (!instruction || !response) continue;
+        samples.push({
+          id: generateSampleId(),
+          instruction,
+          response,
+          system: systemIdx >= 0 ? (cols[systemIdx] || '').trim() : '',
+          tags: [],
+          createdAt: Date.now(),
+        });
+        added++;
+      }
+    } else {
+      return res.status(400).json({ error: 'format は "csv" または "jsonl"' });
+    }
+    saveAllSamples(samples);
+    res.json({ ok: true, added, total: samples.length });
+  } catch (e) {
+    res.status(400).json({ error: `パースエラー: ${e.message}` });
+  }
+});
+
+// シンプルなCSV行パーサー（クォート対応）
+function parseCsvLine(line) {
+  const result = [];
+  let cur = '';
+  let inQuote = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuote) {
+      if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+      else if (c === '"') { inQuote = false; }
+      else { cur += c; }
+    } else {
+      if (c === '"') inQuote = true;
+      else if (c === ',') { result.push(cur); cur = ''; }
+      else cur += c;
+    }
+  }
+  result.push(cur);
+  return result;
+}
+
+// エクスポート (JSONL形式でダウンロード)
+app.get('/tuning/samples/export', requireAuth, (req, res) => {
+  const samples = loadAllSamples();
+  const jsonl = samples.map(s => JSON.stringify({
+    instruction: s.instruction,
+    response: s.response,
+    system: s.system || undefined,
+    tags: s.tags && s.tags.length > 0 ? s.tags : undefined,
+  })).join('\n');
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  res.setHeader('Content-Disposition', 'attachment; filename="training_samples.jsonl"');
+  res.send(jsonl);
+});
+
+// ─── ジョブ管理 ───
+
+function loadJobs() {
+  if (!fs.existsSync(TUNING_JOBS_FILE)) return [];
+  try {
+    return JSON.parse(fs.readFileSync(TUNING_JOBS_FILE, 'utf-8'));
+  } catch { return []; }
+}
+
+function saveJobs(jobs) {
+  fs.writeFileSync(TUNING_JOBS_FILE, JSON.stringify(jobs, null, 2));
+}
+
+function generateJobId() {
+  return 'j_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+// ジョブ一覧
+app.get('/tuning/jobs', requireAuth, (req, res) => {
+  const jobs = loadJobs();
+  res.json({ jobs, current: currentTuningJob ? currentTuningJob.id : null });
+});
+
+// ジョブ開始
+app.post('/tuning/jobs', requireAuth, jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  if (currentTuningJob) {
+    return res.status(409).json({ error: '既にジョブが実行中です' });
+  }
+  const samples = loadAllSamples();
+  if (samples.length === 0) {
+    return res.status(400).json({ error: '学習サンプルがありません' });
+  }
+  const {
+    baseModel,           // HuggingFace model ID (例: "Qwen/Qwen2.5-7B-Instruct")
+    outputName,          // 出力モデル名 (任意)
+    method = 'lora',     // 'lora' | 'qlora' | 'full'
+    epochs = 3,
+    learningRate = 0.0002,
+    batchSize = 2,
+    gradAccumSteps = 4,
+    loraR = 16,
+    loraAlpha = 32,
+    loraDropout = 0.05,
+    maxSeqLength = 2048,
+    systemPrompt = '',   // 全サンプルに適用するデフォルトsystem
+  } = req.body || {};
+
+  if (!baseModel) return res.status(400).json({ error: 'baseModel を指定してください' });
+
+  const jobId = generateJobId();
+  const jobDir = path.join(TUNING_RUNS_DIR, jobId);
+  fs.mkdirSync(jobDir, { recursive: true });
+
+  // 学習データを JSONL で保存
+  const dataPath = path.join(jobDir, 'train.jsonl');
+  fs.writeFileSync(dataPath, samples.map(s => JSON.stringify({
+    instruction: s.instruction,
+    response: s.response,
+    system: s.system || '',
+  })).join('\n'));
+
+  // 設定保存
+  const config = {
+    jobId,
+    baseModel,
+    outputName: outputName || `tuned-${jobId}`,
+    method, epochs, learningRate, batchSize, gradAccumSteps,
+    loraR, loraAlpha, loraDropout, maxSeqLength,
+    systemPrompt,
+    sampleCount: samples.length,
+    startedAt: Date.now(),
+  };
+  fs.writeFileSync(path.join(jobDir, 'config.json'), JSON.stringify(config, null, 2));
+
+  // Python実行
+  const pythonPath = appConfig.tuning?.pythonPath || appConfig.pythonPath || 'python3';
+  const tuneScript = path.join(__dirname, 'tune_runner.py');
+  if (!fs.existsSync(tuneScript)) {
+    return res.status(500).json({ error: `tune_runner.py が見つかりません: ${tuneScript}` });
+  }
+
+  log(ip, `TUNING START: ${jobId} baseModel=${baseModel} samples=${samples.length}`);
+  const logPath = path.join(jobDir, 'training.log');
+  const logStream = fs.createWriteStream(logPath);
+  // 環境変数: AMD Radeon AI PRO R9700 (gfx1201) 安定化対策
+  // config.json の tuning.env で上書き可能（旧 tuningEnv も互換維持）
+  const tuningEnv = {
+    HSA_OVERRIDE_GFX_VERSION: '12.0.1',
+    PYTORCH_HIP_ALLOC_CONF: 'expandable_segments:True',
+    HIP_VISIBLE_DEVICES: '0',  // 単一GPU限定（マルチGPU環境での暴走防止）
+    ...(appConfig.tuning?.env || appConfig.tuningEnv || {}),
+  };
+  const proc = spawn(pythonPath, [tuneScript, jobDir], {
+    cwd: __dirname,
+    env: { ...process.env, ...tuningEnv, JOB_DIR: jobDir },
+  });
+  proc.stdout.on('data', d => logStream.write(d));
+  proc.stderr.on('data', d => logStream.write(d));
+  proc.on('exit', (code) => {
+    logStream.end();
+    const jobs = loadJobs();
+    const j = jobs.find(j => j.id === jobId);
+    if (j) {
+      j.status = code === 0 ? 'completed' : 'failed';
+      j.exitCode = code;
+      j.endedAt = Date.now();
+      saveJobs(jobs);
+    }
+    log('-', `[tuning ${jobId}] 終了 code=${code}`);
+    currentTuningJob = null;
+  });
+
+  // ジョブ記録に追加
+  const jobs = loadJobs();
+  jobs.unshift({
+    id: jobId, ...config,
+    status: 'running',
+    pid: proc.pid,
+  });
+  saveJobs(jobs);
+  currentTuningJob = { id: jobId, proc, dir: jobDir };
+
+  res.json({ ok: true, jobId });
+});
+
+// ジョブログ取得
+app.get('/tuning/jobs/:id/log', requireAuth, (req, res) => {
+  const jobId = req.params.id;
+  const logPath = path.join(TUNING_RUNS_DIR, jobId, 'training.log');
+  if (!fs.existsSync(logPath)) return res.status(404).json({ error: 'ログがありません' });
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  fs.createReadStream(logPath).pipe(res);
+});
+
+// ジョブ中断
+app.post('/tuning/jobs/:id/stop', requireAuth, (req, res) => {
+  if (!currentTuningJob || currentTuningJob.id !== req.params.id) {
+    return res.status(404).json({ error: '実行中ジョブではありません' });
+  }
+  try { currentTuningJob.proc.kill('SIGTERM'); } catch {}
+  setTimeout(() => {
+    if (currentTuningJob && currentTuningJob.proc) {
+      try { currentTuningJob.proc.kill('SIGKILL'); } catch {}
+    }
+  }, 5000);
+  const jobs = loadJobs();
+  const j = jobs.find(j => j.id === req.params.id);
+  if (j) { j.status = 'cancelled'; j.endedAt = Date.now(); saveJobs(jobs); }
+  res.json({ ok: true });
+});
+
+// ジョブ削除（履歴とアーティファクトを消す）
+app.delete('/tuning/jobs/:id', requireAuth, (req, res) => {
+  const jobId = req.params.id;
+  if (currentTuningJob && currentTuningJob.id === jobId) {
+    return res.status(409).json({ error: '実行中ジョブは削除できません。先に停止してください' });
+  }
+  const jobs = loadJobs();
+  const idx = jobs.findIndex(j => j.id === jobId);
+  if (idx < 0) return res.status(404).json({ error: 'Not found' });
+  jobs.splice(idx, 1);
+  saveJobs(jobs);
+  // ディレクトリ削除
+  const jobDir = path.join(TUNING_RUNS_DIR, jobId);
+  if (fs.existsSync(jobDir)) {
+    try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch {}
+  }
+  res.json({ ok: true });
+});
+
+// ─── 後工程: マージ + GGUF + 量子化 ───
+// 学習完了後にアダプタをベースモデルにマージし、GGUF化、必要なら量子化する
+//
+// POST /tuning/jobs/:id/postprocess
+// body: { quantize?: "Q4_K_M" | "Q5_K_M" | "Q8_0" | "f16" | null }
+//
+// 内部的に下記を順次実行（バックグラウンド）:
+//   1. python merge_adapter.py <job_dir>             → <job_dir>/merged/
+//   2. python convert_hf_to_gguf.py merged --outfile <out>.gguf --outtype f16
+//   3. llama-quantize <out>.gguf <out>-Q4_K_M.gguf Q4_K_M  (任意)
+
+let currentPostprocess = null;  // { jobId, proc, step }
+
+app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => {
+  const ip = getIP(req);
+  if (currentPostprocess) {
+    return res.status(409).json({ error: '別の後処理が実行中です' });
+  }
+  const jobId = req.params.id;
+  const jobDir = path.join(TUNING_RUNS_DIR, jobId);
+  if (!fs.existsSync(jobDir)) return res.status(404).json({ error: 'ジョブが見つかりません' });
+
+  const adapterDir = path.join(jobDir, 'adapter');
+  if (!fs.existsSync(adapterDir)) {
+    return res.status(400).json({ error: '学習が完了していません（adapterがありません）' });
+  }
+
+  const { quantize = null, llamaCppDir = null } = req.body || {};
+  const validQuants = ['Q2_K', 'Q3_K_M', 'Q4_K_S', 'Q4_K_M', 'Q5_K_M', 'Q6_K', 'Q8_0', 'f16', 'bf16', null];
+  if (quantize !== null && !validQuants.includes(quantize)) {
+    return res.status(400).json({ error: `quantize は次のいずれか: ${validQuants.join(', ')}` });
+  }
+
+  const jobConfig = JSON.parse(fs.readFileSync(path.join(jobDir, 'config.json'), 'utf-8'));
+  const outputName = jobConfig.outputName || `tuned-${jobId}`;
+
+  // llama.cpp ディレクトリ
+  const llamaDir = llamaCppDir || appConfig.tuning?.llamaCppDir || appConfig.llamaCppDir || path.join(process.env.HOME || '', 'llama.cpp');
+  if (!fs.existsSync(llamaDir)) {
+    return res.status(400).json({
+      error: `llama.cpp ディレクトリが見つかりません: ${llamaDir} (config.json で llamaCppDir を指定するか、~/llama.cpp に配置してください)`
+    });
+  }
+
+  const postLogPath = path.join(jobDir, 'postprocess.log');
+  const postLog = fs.createWriteStream(postLogPath);
+  const pythonPath = appConfig.tuning?.pythonPath || appConfig.pythonPath || 'python3';
+
+  function runStep(label, cmd, args, cwd, onDone) {
+    postLog.write(`\n=== ${label} ===\n`);
+    postLog.write(`$ ${cmd} ${args.join(' ')}\n`);
+    const p = spawn(cmd, args, { cwd, env: { ...process.env } });
+    currentPostprocess = { jobId, proc: p, step: label };
+    p.stdout.on('data', d => postLog.write(d));
+    p.stderr.on('data', d => postLog.write(d));
+    p.on('exit', (code) => {
+      postLog.write(`\n[${label}] exit code=${code}\n`);
+      onDone(code);
+    });
+  }
+
+  function step1Merge() {
+    const mergeScript = path.join(__dirname, 'merge_adapter.py');
+    if (!fs.existsSync(mergeScript)) {
+      postLog.end(`ERROR: merge_adapter.py が見つかりません: ${mergeScript}\n`);
+      currentPostprocess = null;
+      return;
+    }
+    runStep('Step 1: マージ', pythonPath, [mergeScript, jobDir], __dirname, (code) => {
+      if (code !== 0) { postLog.end(`マージ失敗 code=${code}\n`); currentPostprocess = null; return; }
+      step2Gguf();
+    });
+  }
+
+  function step2Gguf() {
+    const mergedDir = path.join(jobDir, 'merged');
+    if (!fs.existsSync(mergedDir)) {
+      postLog.end(`ERROR: マージ済みモデルがありません: ${mergedDir}\n`);
+      currentPostprocess = null;
+      return;
+    }
+    const convertScript = path.join(llamaDir, 'convert_hf_to_gguf.py');
+    if (!fs.existsSync(convertScript)) {
+      postLog.end(`ERROR: convert_hf_to_gguf.py が見つかりません: ${convertScript}\n`);
+      currentPostprocess = null;
+      return;
+    }
+    const ggufFile = path.join(jobDir, `${outputName}.gguf`);
+    runStep('Step 2: GGUF変換',
+      pythonPath, [convertScript, mergedDir, '--outfile', ggufFile, '--outtype', 'f16'],
+      llamaDir,
+      (code) => {
+        if (code !== 0) { postLog.end(`GGUF変換失敗 code=${code}\n`); currentPostprocess = null; return; }
+        if (quantize && quantize !== 'f16' && quantize !== 'bf16') step3Quantize(ggufFile);
+        else finalize();
+      });
+  }
+
+  function step3Quantize(ggufFile) {
+    const quantBin = path.join(llamaDir, 'build', 'bin', 'llama-quantize');
+    if (!fs.existsSync(quantBin)) {
+      postLog.end(`ERROR: llama-quantize が見つかりません: ${quantBin}\n`);
+      currentPostprocess = null;
+      return;
+    }
+    const quantFile = path.join(jobDir, `${outputName}-${quantize}.gguf`);
+    runStep(`Step 3: 量子化 (${quantize})`,
+      quantBin, [ggufFile, quantFile, quantize],
+      llamaDir,
+      (code) => {
+        if (code !== 0) { postLog.end(`量子化失敗 code=${code}\n`); currentPostprocess = null; return; }
+        finalize();
+      });
+  }
+
+  function finalize() {
+    postLog.write('\n=== 全工程完了 ===\n');
+    postLog.end();
+    // ジョブ情報に postprocess 完了を記録
+    const jobs = loadJobs();
+    const j = jobs.find(j => j.id === jobId);
+    if (j) {
+      j.postprocessStatus = 'completed';
+      j.postprocessEndedAt = Date.now();
+      saveJobs(jobs);
+    }
+    currentPostprocess = null;
+    log('-', `[tuning ${jobId}] 後処理完了`);
+  }
+
+  log(ip, `TUNING POSTPROCESS START: ${jobId} quantize=${quantize}`);
+  step1Merge();
+  res.json({ ok: true, message: '後処理を開始しました。/tuning/jobs/:id/postprocess-log でログを確認できます' });
+});
+
+// 後処理ログ取得
+app.get('/tuning/jobs/:id/postprocess-log', requireAuth, (req, res) => {
+  const jobId = req.params.id;
+  const logPath = path.join(TUNING_RUNS_DIR, jobId, 'postprocess.log');
+  if (!fs.existsSync(logPath)) return res.status(404).json({ error: 'ログがありません' });
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  fs.createReadStream(logPath).pipe(res);
+});
+
+// 後処理停止
+app.post('/tuning/jobs/:id/postprocess/stop', requireAuth, (req, res) => {
+  if (!currentPostprocess || currentPostprocess.jobId !== req.params.id) {
+    return res.status(404).json({ error: '後処理は実行中ではありません' });
+  }
+  try { currentPostprocess.proc.kill('SIGTERM'); } catch {}
+  res.json({ ok: true });
+});
+
+// ジョブのアーティファクト一覧（gguf等）
+app.get('/tuning/jobs/:id/artifacts', requireAuth, (req, res) => {
+  const jobId = req.params.id;
+  const jobDir = path.join(TUNING_RUNS_DIR, jobId);
+  if (!fs.existsSync(jobDir)) return res.status(404).json({ error: 'ジョブが見つかりません' });
+  const artifacts = [];
+  for (const f of fs.readdirSync(jobDir)) {
+    const fp = path.join(jobDir, f);
+    const st = fs.statSync(fp);
+    if (st.isFile()) {
+      artifacts.push({
+        name: f,
+        size: st.size,
+        sizeHuman: (st.size > 1024 * 1024) ? `${(st.size / 1024 / 1024).toFixed(1)} MB` : `${(st.size / 1024).toFixed(1)} KB`,
+        downloadable: f.endsWith('.gguf') || f.endsWith('.log') || f.endsWith('.json'),
+      });
+    }
+  }
+  res.json({ artifacts, jobDir });
+});
+
+// アーティファクトダウンロード
+app.get('/tuning/jobs/:id/artifacts/:name', requireAuth, (req, res) => {
+  const jobId = req.params.id;
+  const name = req.params.name;
+  // ディレクトリトラバーサル防止
+  if (name.includes('..') || name.includes('/') || name.includes('\\')) {
+    return res.status(400).json({ error: 'Invalid name' });
+  }
+  const fp = path.join(TUNING_RUNS_DIR, jobId, name);
+  if (!fs.existsSync(fp)) return res.status(404).json({ error: 'Not found' });
+  res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
+  fs.createReadStream(fp).pipe(res);
+});
+
 // ─── GPU ステータス (SSE) ───
 const GPU_INTERVAL = parseInt(process.env.GPU_INTERVAL) || 1000;
 let gpuBackend = null; // 'rocm' | 'nvidia' | 'none'

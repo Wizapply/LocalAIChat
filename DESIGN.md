@@ -2302,6 +2302,238 @@ body, .app-layout, .chat-area {
 55. **DNS解決とブラウザ・curl・Pythonの違い（hostsの罠）**
     Windowsの hosts ファイルは編集しても効かないことがある（DnsCacheサービスの挙動、行頭スペース、エンコーディング、行末コード CRLF/LF の差異）。ブラウザだけ動いて curl/Python が失敗する場合、`ipconfig /flushdns` + `net stop/start dnscache` を試す。SPA + 同一LAN内のサーバー運用では、クライアントから **直接IPアドレスを使ってテスト** することで切り分けが早い (`nslookup`/`ping`の結果を信用する)。
 
+56. **PyTorch ROCm版とCPU版の上書き事故**
+    llama.cpp の `requirements.txt` をそのまま `pip install -r` すると `torch+cpu` が入って ROCm版を上書きしてしまう。対策は2つ: (a) llama.cpp用に別venvを作る (`~/llama.cpp/.venv-llama`)、(b) `grep -v "^torch" requirements.txt > requirements-no-torch.txt` で除外してインストール。ファインチューニング用venv (`venv-tuning`) と GGUF変換用venv (`.venv-llama`) を明確に分離する。
+
+57. **`torch_dtype` は deprecated**
+    transformers 4.40 以降、`AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)` は警告が出る。`dtype=torch.bfloat16` に統一すべし。tune_runner.py ではこれを採用済み。
+
+58. **ROCm環境では `attn_implementation="eager"` を明示**
+    PyTorch ROCm版で `device_map="auto"` や SDPA (Scaled Dot Product Attention) を使うと `CUDA error: unspecified launch failure` が出ることがある。`attn_implementation="eager"` を明示し、`.to("cuda")` で単一GPU指定するのが安定。
+
+59. **`HIP_VISIBLE_DEVICES=0` で複数GPU暴走防止**
+    マルチGPU環境で DataParallel が自動起動して NCCL Error 1 を出すケースがある。学習スクリプト側で明示的に `HIP_VISIBLE_DEVICES=0` を設定するとシングルGPU動作に固定できる。OpenGeekLLMChat の `tuning.env` で自動設定される。
+
+60. **小さいモデル（0.5B〜1.5B）のQ4_K_M量子化は知識劣化**
+    Q4_K_M は 7B 以上を想定した量子化レベル。0.5B〜1.5B モデルにかけると知識が大幅に失われる。小型モデルは **F16 または Q8_0** で量子化すべし。tuning.html のPostProcessダイアログにはモデルサイズ別の推奨表記を載せた。
+
+61. **Reactの条件分岐レンダリングは state を破棄する**
+    `{tab === 'x' && <View />}` で false になると React は完全に unmount してコンポーネント state を破棄する。タブを行き来する画面では入力値・スクロール位置・モーダル開閉などが全て初期化されてしまう。`<div style={{display: tab === 'x' ? 'block' : 'none'}}>` でラップすれば DOM・state ともに保持される。useEffect の `[]` 依存も再実行されない。
+
+62. **チャット履歴の自動保存タイミング = 並び順の更新タイミング**
+    `useEffect([messages])` で自動保存すると、`loadChat` で履歴を開いた瞬間に setState → useEffect 発火 → POST → updatedAt 更新となり、開いただけのチャットが先頭に来てしまう。`messagesDirtyRef` で「実際にユーザー操作があったか」を追跡し、それが true のときだけ保存することで「開いただけでは並び順が変わらない」挙動を実現する。useState ではなく useRef を使うのはクロージャ問題と無駄な再レンダー回避のため。
+
+---
+
+## 🧠 ファインチューニング機能の設計
+
+OpenGeekLLMChat 内蔵のファインチューニング機能 (`tuning.html`) は、LoRA SFT による軽量ファインチューニングをUIから操作できる仕組み。実装上重要な設計判断と、ナレッジから学んだ実体験ベースの選択を記述。
+
+### アーキテクチャ
+
+```
+[ブラウザ: tuning.html]
+   │
+   ├─ サンプル管理（CRUD, CSV/JSONLインポート/エクスポート）
+   ├─ 学習開始（プリセット選択 + ハイパラ調整）
+   └─ ジョブ管理（一覧・ログストリーミング・後処理）
+        │
+[Express: /tuning/* API]
+   │
+   ├─ tuning/samples.jsonl         ← 学習データDB（JSONLファイルベース）
+   ├─ tuning/jobs.json             ← ジョブ履歴メタデータ
+   └─ tuning/runs/<job_id>/        ← ジョブごとの作業ディレクトリ
+        ├─ config.json             ← この学習の設定スナップショット
+        ├─ train.jsonl             ← 学習データスナップショット
+        ├─ training.log            ← Pythonの stdout/stderr
+        ├─ postprocess.log         ← マージ・GGUF変換・量子化ログ
+        ├─ adapter/                ← 学習済みLoRAアダプタ
+        ├─ merged/                 ← マージ済みフルモデル
+        └─ model-*.gguf            ← GGUF変換・量子化結果
+        │
+[child_process.spawn: Python]
+   │
+   ├─ tune_runner.py               ← TRL SFTTrainer (LoRA学習本体)
+   ├─ merge_adapter.py             ← PeftModel.merge_and_unload()
+   └─ convert_to_gguf.py           ← llama.cpp の convert_hf_to_gguf.py を呼ぶ
+        │
+[llama.cpp]
+   │
+   ├─ convert_hf_to_gguf.py        ← HF → GGUF (F16)
+   └─ build/bin/llama-quantize     ← GGUF量子化 (Q4_K_M等)
+```
+
+### 設計判断の理由
+
+#### なぜ JSONL ファイルで管理するか（SQLite ではなく）
+
+- 依存ゼロ（追加パッケージ不要、`fs` だけで完結）
+- 数千件規模なら全件読み込みでも十分速い
+- ユーザーが直接 `samples.jsonl` を編集できる（Git管理しやすい）
+- バックアップが `cp` だけで済む
+
+#### なぜ tune_runner.py を別プロセスで spawn するか
+
+- Node.js は GIL のない非同期I/O向き、CPU/GPU重い処理は子プロセスに分離
+- 学習が落ちても本体サーバーに影響しない
+- ログを `stdout` / `stderr` で取得して UI にストリーミング可能
+- Python venv の分離（本体用とは別venv が必要）
+
+#### なぜ tune_runner.py 内でマージまでやるか
+
+- ベースモデルがメモリに乗っている間にマージすると VRAM 効率が良い
+- ユーザーがUIから「📦 後処理」を別途実行する場合は merge_adapter.py で再マージできる（保険）
+
+#### なぜ後処理を別エンドポイントにしたか
+
+- マージ→GGUF→量子化は時間がかかる（数分〜数十分）
+- 学習とは別タイミングで何度でも試せる（量子化レベルを変えて再生成など）
+- Python venv が学習用と GGUF変換用で別 (`venv-tuning` vs `.venv-llama`) のため、別プロセスのほうが安全
+
+### config.json の `tuning` セクション
+
+```json
+"tuning": {
+  "pythonPath": "/path/to/venv-tuning/bin/python",
+  "llamaCppDir": "/path/to/llama.cpp",
+  "env": {
+    "HSA_OVERRIDE_GFX_VERSION": "12.0.1",
+    "PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True",
+    "HIP_VISIBLE_DEVICES": "0"
+  },
+  "modelPresets": [
+    { "value": "Qwen/Qwen2.5-0.5B-Instruct", "size": "0.5B", "vramLora": "~4GB", "desc": "...",
+      "epochs": 5, "lr": 0.0002, "batch": 2, "accum": 4, "r": 8, "alpha": 16, "maxLen": 2048 }
+  ]
+}
+```
+
+| キー | 役割 |
+|:--|:--|
+| `pythonPath` | tune_runner.py 用 Python（PyTorch ROCm版が入った venv 推奨） |
+| `llamaCppDir` | llama.cpp のクローン先（GGUF変換・量子化に使用） |
+| `env` | tune_runner.py 実行時に渡す環境変数。ROCm環境の安定化 |
+| `modelPresets[]` | UI に表示されるプリセット。プリセットを選ぶとハイパラも自動入力 |
+
+プリセットは **UIに固定で埋め込まず config 経由で配信** する。`GET /tuning/presets` でクライアントが取得し、必要に応じてカスタマイズや追加が可能。
+
+### tune_runner.py の重要ポイント（ナレッジ反映）
+
+```python
+# 1. torch_dtype は deprecated、dtype= に統一
+model = AutoModelForCausalLM.from_pretrained(
+    base_model,
+    dtype=torch.bfloat16,
+    attn_implementation="eager",   # ROCmではsdpaが不安定
+    trust_remote_code=True,
+)
+model = model.to("cuda")           # device_map="auto" は避ける
+
+# 2. TRL SFTTrainer + SFTConfig (新しいAPI、processing_class=tokenizer)
+training_args = SFTConfig(
+    output_dir=output_dir,
+    num_train_epochs=epochs,
+    bf16=True,
+    gradient_checkpointing=True,
+    max_length=max_seq_length,
+    dataset_text_field="text",
+    packing=False,
+)
+
+trainer = SFTTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset,
+    peft_config=peft_config,
+    processing_class=tokenizer,    # TRL 0.12+ では tokenizer= ではなく processing_class=
+)
+
+# 3. LoRA target_modules は 7種すべて指定（軽量モデルでも効果向上）
+peft_config = LoraConfig(
+    r=16, lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"],
+    task_type="CAUSAL_LM",
+)
+```
+
+### マルチターン対応
+
+サンプル形式を2系統サポート:
+
+**シングルターン（簡易）:**
+```json
+{"instruction": "宮城県の県庁所在地は?", "response": "仙台市です。"}
+```
+
+**マルチターン（messages, OpenAI形式）:**
+```json
+{"messages": [
+  {"role": "system", "content": "..."},
+  {"role": "user", "content": "..."},
+  {"role": "assistant", "content": "..."}
+]}
+```
+
+`to_messages()` 関数で両形式を `messages` 形式に統一してから `tokenizer.apply_chat_template()` に通す。chat_template が無いモデルは Alpaca 形式にフォールバック。
+
+### 後処理パイプライン
+
+UIで「📦」ボタン → POST `/tuning/jobs/:id/postprocess`
+
+```
+1. (任意) tune_runner.py 終了時に既にマージ済みなら skip
+   または merge_adapter.py で再実行
+
+2. python convert_hf_to_gguf.py <merged_dir> --outfile model-F16.gguf --outtype f16
+   → F16 中間GGUFを生成
+
+3. llama-quantize model-F16.gguf model-Q4_K_M.gguf Q4_K_M
+   → 量子化版を生成
+```
+
+各ステップのログは `postprocess.log` にリアルタイム書き込み、UIから取得可能。
+
+### UIの工夫
+
+#### タブ間状態保持（display切替）
+
+React の条件分岐レンダリングは unmount で state を破棄するため、入力中の値が消える。
+
+```jsx
+// Bad: タブ切替でTrainingViewのstate全消去
+{tab === 'training' && <TrainingView />}
+
+// Good: 常にマウント、表示だけ切替
+<div style={{display: tab === 'training' ? 'block' : 'none'}}>
+  <TrainingView />
+</div>
+```
+
+これでハイパラを設定中に「📚 学習データ」タブで内容確認しても、設定値が消えない。
+
+#### モデルサイズ別の量子化推奨表示
+
+PostProcessDialog で量子化レベル選択時、モデル名からサイズを推測して推奨を表示:
+- 0.5B〜1.5B → **F16 / Q8_0 推奨**（強い量子化は知識劣化）
+- 7B以上 → **Q4_K_M 推奨**
+
+ナレッジに基づく実体験から、ユーザーが誤って小型モデルを Q4_K_M で破壊するのを防ぐ。
+
+### サーバー設定要件
+
+ファインチューニング機能を使うには、本体とは別の準備が必要:
+
+1. **venv-tuning**: PyTorch ROCm/CUDA、transformers、peft、trl、datasets、accelerate
+2. **llama.cpp ビルド済み**: convert_hf_to_gguf.py + build/bin/llama-quantize
+3. **llama.cpp用 venv** (`.venv-llama`): convert スクリプトの依存（torch を除外して入れる）
+4. **config.json の tuning セクション**: pythonPath, llamaCppDir, env, modelPresets
+5. **systemd の Environment=**: 環境変数 HSA_OVERRIDE_GFX_VERSION 等を本体プロセスにも渡す
+6. **HF_HOME**: モデルダウンロード先（容量に余裕のあるディスクに）
+7. **HF_TOKEN**（任意）: Llama 等の gated model を使うとき
+
+詳細手順は README.md の「🧠 ファインチューニング機能」セクションを参照。
+
 ---
 
 ## 🌐 GPUクラスタ化（複数PC接続）
