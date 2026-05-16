@@ -218,6 +218,8 @@ function listExternalServers() {
       apiKey: s.apiKey,
       type: s.type,
       https: !!s.https,
+      ctx: s.ctx || null,
+      nParallel: s.nParallel || null,
       running: !!(s.proc && !s.proc.killed),
       startedAt: s.startedAt,
     });
@@ -290,11 +292,13 @@ async function startExternalServer({ modelName, host, port, apiKey, type, https 
       }
       return out;
     };
+    var ctxSize = model.ctx;
+    var npSize = model.nParallel ?? appConfig.llamaServer.nParallel ?? 1;
     args = [
       '-m', model.path,
-      '-c', String(model.ctx),
+      '-c', String(ctxSize),
       '-ngl', String(model.ngl),
-      '-np', String(model.nParallel ?? appConfig.llamaServer.nParallel ?? 1),
+      '-np', String(npSize),
       '--port', String(port),
       '--host', host,
       ...filterPairArgs(ls.commonArgs || [], ['--port', '--host']),
@@ -311,6 +315,8 @@ async function startExternalServer({ modelName, host, port, apiKey, type, https 
 
   const serverInfo = {
     proc, modelName, host, port, apiKey, type, https: !!https,
+    ctx: typeof ctxSize !== 'undefined' ? ctxSize : null,
+    nParallel: typeof npSize !== 'undefined' ? npSize : null,
     startedAt: Date.now(),
   };
   externalServers.set(id, serverInfo);
@@ -335,6 +341,43 @@ async function startExternalServer({ modelName, host, port, apiKey, type, https 
 }
 
 // 外部APIサーバーを停止
+// プロセスのみ停止（設定は保持。後で再起動できる）
+function stopExternalServerProcess(id) {
+  const s = externalServers.get(id);
+  if (!s) return false;
+  if (s.proc && !s.proc.killed) {
+    try { s.proc.kill('SIGTERM'); } catch {}
+    setTimeout(() => {
+      if (s.proc && !s.proc.killed) {
+        try { s.proc.kill('SIGKILL'); } catch {}
+      }
+    }, 5000);
+  }
+  s.proc = null;  // 設定は残す
+  log('-', `[外部API ${id}] プロセス停止: ${s.modelName}`);
+  return true;
+}
+
+// 停止中サーバーを再起動（既存設定でプロセスだけ起動し直す）
+async function restartExternalServer(id) {
+  const s = externalServers.get(id);
+  if (!s) throw new Error('Not found');
+  if (s.proc && !s.proc.killed) throw new Error('既に稼働中です');
+
+  // 元の設定で起動。既存のエントリは startExternalServer 内で別IDが振られないように
+  // 一旦消してから再生成（IDは新規）
+  externalServers.delete(id);
+  const newId = await startExternalServer({
+    modelName: s.modelName,
+    host: s.host,
+    port: s.port,
+    apiKey: s.apiKey,
+    type: s.type,
+    https: s.https,
+  });
+  return newId;
+}
+
 function stopExternalServer(id) {
   const s = externalServers.get(id);
   if (!s) return false;
@@ -1249,6 +1292,31 @@ app.delete('/external-servers/:id', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// プロセスのみ停止（設定は保持）
+app.post('/external-servers/:id/stop', requireAuth, (req, res) => {
+  const ip = getIP(req);
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
+  log(ip, `EXTERNAL API PROC STOP: ${id}`);
+  const ok = stopExternalServerProcess(id);
+  if (!ok) return res.status(404).json({ error: 'Not found' });
+  res.json({ ok: true });
+});
+
+// 停止中のサーバーを再起動
+app.post('/external-servers/:id/start', requireAuth, async (req, res) => {
+  const ip = getIP(req);
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
+  log(ip, `EXTERNAL API PROC START: ${id}`);
+  try {
+    const newId = await restartExternalServer(id);
+    res.json({ ok: true, id: newId });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
 // ════════════════════════════════════════════════
 // ファインチューニング機能
 // ════════════════════════════════════════════════
@@ -1810,7 +1878,160 @@ app.get('/tuning/jobs/:id/artifacts/:name', requireAuth, (req, res) => {
 
 // ─── GPU ステータス (SSE) ───
 const GPU_INTERVAL = parseInt(process.env.GPU_INTERVAL) || 1000;
-let gpuBackend = null; // 'rocm' | 'nvidia' | 'none'
+let gpuBackend = null; // 'amd' | 'rocm' | 'nvidia' | 'none'
+
+// 初回のみフィールド一覧をログに出力
+let amdSmiFieldsLogged = false;
+let rocmSmiFieldsLogged = false;
+
+// amd-smi はROCm 6.x以降の新しい標準ツール
+// 出力構造:
+//   { "gpu_data": [ { gpu: 0, asic: {...}, vram: {...}, clock: {...}, ... }, ... ] }
+// 注意: トップレベルは "gpu_data" でラップされている（配列ではない）
+
+function execAmdSmi(args) {
+  return new Promise((resolve) => {
+    const proc = spawn('amd-smi', args, { timeout: 5000 });
+    let out = '';
+    proc.stdout.on('data', (d) => { out += d.toString(); });
+    proc.stderr.on('data', () => {});
+    proc.on('close', () => {
+      try {
+        const parsed = JSON.parse(out);
+        // gpu_data でラップされている場合はその中身を返す、そうでなければそのまま
+        if (parsed && Array.isArray(parsed.gpu_data)) return resolve(parsed.gpu_data);
+        if (Array.isArray(parsed)) return resolve(parsed);
+        resolve(null);
+      } catch {
+        resolve(null);
+      }
+    });
+    proc.on('error', () => resolve(null));
+  });
+}
+
+// 値ヘルパー
+function amdVal(v) {
+  if (v == null || v === 'N/A') return 0;
+  if (typeof v === 'number') return v;
+  if (typeof v === 'object' && v.value != null && v.value !== 'N/A') return parseFloat(v.value) || 0;
+  return parseFloat(v) || 0;
+}
+
+// 文字列から先頭の数値を抜き出す ("1040MHz" → 1040)
+function amdParseClock(s) {
+  if (!s || s === 'N/A') return 0;
+  if (typeof s === 'object') {
+    return amdParseClock(s.current_frequency ?? s.value ?? s.current);
+  }
+  const m = String(s).match(/(\d+(?:\.\d+)?)/);
+  return m ? parseInt(m[1]) : 0;
+}
+
+async function parseAmdSmi() {
+  const [staticData, metricData] = await Promise.all([
+    execAmdSmi(['static', '--json']),
+    execAmdSmi(['metric', '--json']),
+  ]);
+
+  // staticData だけでも基本情報は出せるよう、両方なくても落ちないように
+  const staticArr = Array.isArray(staticData) ? staticData : [];
+  const metricArr = Array.isArray(metricData) ? metricData : [];
+
+  // gpu番号でstatic/metricをマップ化
+  const staticByGpu = {};
+  for (const item of staticArr) {
+    const num = item.gpu ?? item.gpu_id;
+    if (typeof num === 'number') staticByGpu[num] = item;
+  }
+  const metricByGpu = {};
+  for (const item of metricArr) {
+    const num = item.gpu ?? item.gpu_id;
+    if (typeof num === 'number') metricByGpu[num] = item;
+  }
+
+  // staticとmetricのGPU番号を統合
+  const allGpuNums = new Set([
+    ...Object.keys(staticByGpu).map(Number),
+    ...Object.keys(metricByGpu).map(Number),
+  ]);
+
+  const gpus = [];
+  for (const gpuNum of [...allGpuNums].sort((a, b) => a - b)) {
+    const st = staticByGpu[gpuNum] || {};
+    const mt = metricByGpu[gpuNum] || {};
+
+    if (!amdSmiFieldsLogged) {
+      console.log(`[amd-smi gpu${gpuNum}] static キー:`, Object.keys(st).sort());
+      console.log(`[amd-smi gpu${gpuNum}] metric キー:`, Object.keys(mt).sort());
+      for (const k of ['power', 'temperature', 'usage', 'fb_usage']) {
+        if (mt[k]) console.log(`  metric.${k}:`, JSON.stringify(mt[k]).slice(0, 200));
+      }
+    }
+
+    const asic = st.asic || mt.asic || {};
+    const vram = st.vram || {};
+    const clock = st.clock || mt.clock || {};
+
+    // ─── iGPU除外 ───
+    // 1. target_graphics_version で gfx10[345]x はiGPU（Phoenix, Raphael, Rembrandt等）
+    // 2. compute units が極端に少ない（R9700は64、iGPU Raphael は2）
+    // 3. VRAMサイズが2GB以下
+    const gfxVer = asic.target_graphics_version || '';
+    const numCU = asic.num_compute_units || 0;
+    const vramMB = amdVal(vram.size);
+    const isIGPU =
+      /^gfx10(3[3-9]|4[0-9])/.test(gfxVer) ||  // gfx103x/104x はAPU
+      (numCU > 0 && numCU < 8) ||              // 8CU未満はiGPU
+      (vramMB > 0 && vramMB <= 4096);          // VRAM 4GB以下はiGPU
+    if (isIGPU) continue;
+
+    const gpu = { id: `gpu${gpuNum}` };
+
+    // ─── 製品名 (static.asic.market_name が確実) ───
+    gpu.name = asic.market_name || asic.product_name ||
+               (st.board?.product_name && st.board.product_name !== 'N/A' ? st.board.product_name : null) ||
+               '';
+    if (typeof gpu.name === 'object') gpu.name = '';
+    gpu.name = String(gpu.name || '').trim();
+    if (/^(n\/a|none|null|unknown)$/i.test(gpu.name)) gpu.name = '';
+
+    // ─── 使用率 ───
+    const usage = mt.usage || {};
+    gpu.usage = parseInt(amdVal(usage.gfx_activity ?? usage.gpu_activity)) || 0;
+
+    // ─── 温度 ───
+    const temp = mt.temperature || {};
+    gpu.temp = amdVal(temp.edge ?? temp.edge_temperature);
+    gpu.tempHotspot = amdVal(temp.hotspot ?? temp.junction ?? temp.hotspot_temperature);
+    gpu.tempMem = amdVal(temp.mem ?? temp.memory ?? temp.vram ?? temp.hbm);
+
+    // ─── 電力 ───
+    const power = mt.power || {};
+    gpu.power = amdVal(power.current_socket_power ?? power.socket_power ??
+                        power.average_socket_power ?? power.gfx);
+
+    // ─── VRAM ───
+    // static.vram.size.value = 30576 (MB) を総容量として優先
+    // metric.fb_usage.used を使用量として
+    const fb = mt.fb_usage || mt.vram_usage || {};
+    const totalMB = vramMB || amdVal(fb.total ?? fb.vram_total);
+    const usedMB = amdVal(fb.used ?? fb.vram_used);
+    gpu.vramTotalMB = totalMB;
+    gpu.vramUsedMB = usedMB;
+    gpu.vramPct = totalMB > 0 ? Math.round(usedMB / totalMB * 100) : 0;
+
+    // ─── クロック ("1040MHz" 形式) ───
+    // static.clock.sys.current_frequency や metric.clock.gfx を見る
+    gpu.sclk = amdParseClock(clock.sys ?? clock.gfx ?? clock.gfxclk);
+    gpu.mclk = amdParseClock(clock.mem ?? clock.memclk ?? clock.memory);
+
+    gpus.push(gpu);
+  }
+
+  amdSmiFieldsLogged = true;
+  return gpus;
+}
 
 function parseRocmSmi() {
   return new Promise((resolve) => {
@@ -1827,6 +2048,11 @@ function parseRocmSmi() {
         for (const [key, val] of Object.entries(data)) {
           if (!key.startsWith('card')) continue;
           const gpu = { id: key };
+
+          // 初回のみフィールド名を全部ログ出力（デバッグ用）
+          if (!rocmSmiFieldsLogged) {
+            console.log(`[rocm-smi ${key}] 利用可能なフィールド:`, Object.keys(val).sort());
+          }
 
           // GPU使用率
           gpu.usage = parseInt(val['GPU use (%)']) || 0;
@@ -1857,8 +2083,36 @@ function parseRocmSmi() {
           gpu.sclk = parseClock('sclk clock speed:');
           gpu.mclk = parseClock('mclk clock speed:');
 
+          // GPU 製品名: rocm-smi のバージョンで大きく変動するので幅広く探す
+          // 完全マッチで試したあと、見つからなければ部分マッチで探す
+          const exactKeys = [
+            'Card Series', 'Card Model', 'Card SKU',
+            'GFX Version', 'Device Name', 'Product Name', 'Marketing Name',
+          ];
+          for (const k of exactKeys) {
+            if (val[k] && typeof val[k] === 'string' && val[k].trim()) {
+              gpu.name = val[k].trim();
+              break;
+            }
+          }
+          // 部分マッチ: "name", "series", "model", "product" を含むキー
+          if (!gpu.name) {
+            const fallbackKey = Object.keys(val).find(k =>
+              /\b(name|series|model|product|marketing)\b/i.test(k) &&
+              !/path|node|number|id|guid|uuid|firmware|driver|version|date|count|level/i.test(k)
+            );
+            if (fallbackKey && val[fallbackKey]) {
+              gpu.name = String(val[fallbackKey]).trim();
+            }
+          }
+          // "0x73a5" のような16進ID形式は捨てる
+          if (gpu.name && /^0x[0-9a-f]+$/i.test(gpu.name)) gpu.name = '';
+          // "N/A" や空文字も捨てる
+          if (gpu.name && /^(n\/a|none|null|unknown)$/i.test(gpu.name)) gpu.name = '';
+
           gpus.push(gpu);
         }
+        rocmSmiFieldsLogged = true;
         // card番号でソート
         gpus.sort((a, b) => {
           const na = parseInt(a.id.replace('card', ''));
@@ -1918,16 +2172,20 @@ function parseNvidiaSmi() {
 
 async function queryGpu() {
   if (gpuBackend === 'none') return [];
+  if (gpuBackend === 'amd') return parseAmdSmi();
   if (gpuBackend === 'nvidia') return parseNvidiaSmi();
   if (gpuBackend === 'rocm') return parseRocmSmi();
 
-  // 初回: 自動検出
+  // 初回: 自動検出（amd-smi → rocm-smi → nvidia-smi の順）
+  // amd-smi はROCm 6.x以降の新標準。GPU名やセンサー値が正確に取れる
+  const amd = await parseAmdSmi();
+  if (amd.length > 0) { gpuBackend = 'amd'; console.log('  GPU backend: amd-smi'); return amd; }
   const rocm = await parseRocmSmi();
   if (rocm.length > 0) { gpuBackend = 'rocm'; console.log('  GPU backend: rocm-smi'); return rocm; }
   const nv = await parseNvidiaSmi();
   if (nv.length > 0) { gpuBackend = 'nvidia'; console.log('  GPU backend: nvidia-smi'); return nv; }
   gpuBackend = 'none';
-  console.log('  GPU backend: none (rocm-smi / nvidia-smi not found)');
+  console.log('  GPU backend: none (amd-smi / rocm-smi / nvidia-smi not found)');
   return [];
 }
 

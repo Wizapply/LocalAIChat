@@ -2323,6 +2323,143 @@ body, .app-layout, .chat-area {
 62. **チャット履歴の自動保存タイミング = 並び順の更新タイミング**
     `useEffect([messages])` で自動保存すると、`loadChat` で履歴を開いた瞬間に setState → useEffect 発火 → POST → updatedAt 更新となり、開いただけのチャットが先頭に来てしまう。`messagesDirtyRef` で「実際にユーザー操作があったか」を追跡し、それが true のときだけ保存することで「開いただけでは並び順が変わらない」挙動を実現する。useState ではなく useRef を使うのはクロージャ問題と無駄な再レンダー回避のため。
 
+63. **`amd-smi` の JSON 出力は `{gpu_data: [...]}` でラップされている**
+    ROCm 6.x以降の新標準 `amd-smi static/metric --json` は、配列を直接返すのではなく `{ "gpu_data": [...] }` というオブジェクトでラップする。`JSON.parse(out)` の結果が配列だと思って `data.forEach()` するとエラー。`parsed.gpu_data || parsed` のような両対応が必要。また、GPU名は `board.product_name` が `"N/A"` のことが多いため `asic.market_name` を優先する。
+
+64. **iGPU を LLM 用 GPU リストから除外する**
+    AMD APU (Ryzen 9000/Phoenix等) は内蔵 GPU を持っており、`amd-smi` や `rocm-smi` ではこれも GPU としてリストされる。LLM 用途では使えないため自動除外が必要。判定条件は: (a) `target_graphics_version` が `gfx10[345]x` (Phoenix/Raphael/Rembrandt等のAPU)、(b) `num_compute_units < 8`、(c) VRAM ≤ 4GB のいずれか。OR で判定すれば確実に内蔵GPUだけが除外され、dGPU は残る。
+
+65. **CSS変数 `var(--text)` のような未定義変数を使うとブラウザのデフォルト色になる**
+    React/JSXで動的に書いたスタイルだとTypeScript的に分からない問題。CSS変数が未定義だとフォールバックなしで「初期値（黒に近い色）」になる。ダーク背景上では文字がほぼ見えなくなる。対策は `:root` で定義済みの変数名（`--text-primary`, `--text-secondary`, `--text-muted`）を厳格に使うこと。プロジェクト初期のリファクタで `--text` → `--text-primary` 等にリネームした際の取りこぼしに注意。
+
+66. **`<select>` の `<option>` 要素の色はブラウザデフォルトで固定**
+    `<select>` 自体のCSSは効くが、ドロップダウンが開いた時の `<option>` のスタイルはOSダイアログレベルで描画されるため、`color`/`background` を明示しないとブラウザの白背景で表示される。`select option { background: var(--bg-secondary); color: var(--text-primary); }` で明示する必要がある。
+
+67. **外部APIサーバーの「プロセス停止」と「設定削除」を分ける**
+    一つの「停止」ボタンだけだと、ユーザーは「一時的に止めて後で再起動したい」のか「完全に削除したい」のか区別がつかない。設計として `● 稼働中 ⇄ ○ 停止中` トグルでプロセスのみ操作（設定は保持）、`✕` で設定ごと削除、と機能を明確に分けることでUXが向上する。サーバー側も `stopExternalServerProcess()`（設定保持）と `stopExternalServer()`（設定削除）を分離する。
+
+---
+
+## 🎮 GPU監視バックエンドの設計
+
+LLM サーバー運用で GPU 状態（VRAM 使用量、温度、電力等）を把握することは重要。OpenGeekLLMChat は複数のバックエンドツールを自動検出して透過的に扱う。
+
+### 検出順序と理由
+
+```
+1. amd-smi   ← ROCm 6.x以降の新標準 (最優先)
+2. rocm-smi  ← レガシー (ROCm 5.x 互換用)
+3. nvidia-smi ← NVIDIA 環境
+```
+
+`amd-smi` を最優先にする理由:
+- 新しい ROCm では `amd-smi` 推奨、`rocm-smi` は将来非推奨
+- JSON フォーマットがより構造化されている（型情報・単位明示）
+- GPU 製品名・compute unit 数・gfx バージョン等の詳細情報が取れる
+
+### amd-smi の出力構造
+
+```json
+{
+  "gpu_data": [
+    {
+      "gpu": 0,
+      "asic": {
+        "market_name": "AMD Radeon AI PRO R9700",
+        "num_compute_units": 64,
+        "target_graphics_version": "gfx1201"
+      },
+      "vram": {
+        "size": { "value": 30576, "unit": "MB" }
+      },
+      "clock": {
+        "sys": { "current_frequency": "1040MHz" },
+        "mem": { "current_frequency": "96MHz" }
+      }
+    },
+    ...
+  ]
+}
+```
+
+- トップレベルが配列ではなく `gpu_data` でラップされる
+- 値が `{ value: 30576, unit: "MB" }` 形式と直接スカラーの両方ある
+- クロックは `"1040MHz"` の文字列で、数値抽出が必要
+
+`amd-smi metric --json` で動的なセンサー値（温度・電力・使用率・VRAM使用量）、`amd-smi static --json` で静的情報（GPU名・compute unit 数・VRAM 総容量）を取得する。
+
+### iGPU 自動除外ロジック
+
+APU環境では iGPU（例: Ryzen 9950X 内蔵 Radeon Graphics）も `amd-smi` の出力に含まれるが、LLM 用途では使えない。以下の OR 条件で iGPU と判定して除外:
+
+```javascript
+const isIGPU =
+  /^gfx10(3[3-9]|4[0-9])/.test(gfxVer) ||  // Phoenix/Raphael/Rembrandt等のAPU
+  (numCU > 0 && numCU < 8) ||              // R9700は64CU、iGPUは2CU
+  (vramMB > 0 && vramMB <= 4096);          // dGPU≥16GB、iGPU≤2GB
+```
+
+dGPU（Discrete GPU）と iGPU で値が明確に違うため、誤検出は起こらない。
+
+### 値の正規化
+
+`amd-smi` の値は型がバラバラなので、ヘルパー関数 `amdVal()` で統一:
+
+```javascript
+function amdVal(v) {
+  if (v == null || v === 'N/A') return 0;
+  if (typeof v === 'number') return v;
+  if (typeof v === 'object' && v.value != null && v.value !== 'N/A')
+    return parseFloat(v.value) || 0;
+  return parseFloat(v) || 0;
+}
+```
+
+これで `temperature.edge: 52`（数値）も `power.current_socket_power: {value: 78, unit: "W"}`（オブジェクト）も同じように `amdVal()` で取得できる。
+
+### フィールド名の差分吸収
+
+`amd-smi` のフィールド名はバージョンによって変わるので、複数候補を `??` でフォールバック:
+
+```javascript
+gpu.temp = amdVal(temp.edge ?? temp.edge_temperature);
+gpu.tempHotspot = amdVal(temp.hotspot ?? temp.junction ?? temp.hotspot_temperature);
+gpu.power = amdVal(power.current_socket_power ?? power.socket_power ?? power.average_socket_power);
+```
+
+将来の `amd-smi` で名前が変わっても、新しい名前を `??` チェーンに追加するだけで対応可能。
+
+---
+
+## 🎨 CSS分離の設計
+
+初期は `index.html` に `<style>` インラインで CSS をすべて持っていたが、ファイルサイズ 6,716 行（177KB）に達したため `styles.css` と `tuning-styles.css` に分離。
+
+### 分離前後の差
+
+| 項目 | Before | After |
+|:--|:--|:--|
+| `index.html` | 6,716 行 / 177KB | 3,945 行 / 119KB |
+| `styles.css` | （なし） | 2,770 行 / 62KB |
+| `tuning.html` | 1,295 行 / 49KB | 839 行 / 36KB |
+| `tuning-styles.css` | （なし） | 455 行 / 13KB |
+
+### メリット
+
+1. **ブラウザキャッシュ効率**: HTML 更新時に CSS まで再ダウンロードしなくて済む。CSS だけ更新すれば HTML は304返却。
+2. **並列ダウンロード**: HTML/CSS/JS がブラウザの並列接続で同時にダウンロードされ、初期表示が高速化
+3. **エディタの動作**: 大きい単一HTMLよりシンタックスハイライト・補完が軽快
+4. **責務の分離**: CSS編集時にHTML部分で迷子にならない、Git diff も明確
+5. **DevTools の体験**: スタイルの行番号が `styles.css:123` のように明示される（以前は `index.html (style):500` のような表示で分かりにくかった）
+
+### 注意点（SPAルーティング対応）
+
+`<link rel="stylesheet" href="/styles.css" />` のように **絶対パス** で参照する。相対パス `styles.css` だと `/chat/<id>` のような深い URL でアクセスした際に `/chat/styles.css` を取りに行って 404 になる。
+
+### Express で配信する
+
+`server.js` には `app.use(express.static('public'))` があるため、`public/styles.css` は自動的に `/styles.css` で配信される。サーバー側のコード追加は不要。
+
 ---
 
 ## 🧠 ファインチューニング機能の設計
