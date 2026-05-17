@@ -72,7 +72,15 @@ renderer.code = function(arg1, arg2) {
   } else {
     try { highlighted = hljs.highlightAuto(text).value; } catch { highlighted = text; }
   }
-  const id = 'code-' + Math.random().toString(36).slice(2, 9);
+  // 重要: ID は code テキストのハッシュから決定的に生成する
+  // Math.random() を使うと再レンダリングのたびに ID が変わり、
+  // ユーザーが「▶ 実行」を押した直後の再レンダリングで output-<id> が消滅する
+  // → runPython() の document.getElementById() が失敗して結果が表示されない
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) {
+    hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
+  }
+  const id = 'code-' + Math.abs(hash).toString(36) + '-' + text.length;
   const isPython = /^py(thon[23]?)?$/.test(language);
   const isPreviewable = /^(html|threejs|three\.js|3d|webgl|canvas)$/.test(language);
   let actionBtns = '';
@@ -458,37 +466,43 @@ function renderLatex(text) {
 }
 
 // ─── MarkdownContent コンポーネント ───
-function MarkdownContent({ content }) {
+// MarkdownContent: メッセージのcontentをMarkdownレンダリング
+// React.memo でラップして、contentが変わらなければ再レンダリングしない（出力DOMの保持のため重要）
+const MarkdownContent = React.memo(function MarkdownContent({ content }) {
   const ref = useRef(null);
 
   // [[gen_image:URL|encodedPrompt]] マーカーをパースしてセグメントに分割
-  // text / gen_image / text / gen_image / ... の配列にする
+  // 高速パス: マーカーが含まれていなければ分割せず単純レンダリング
   const segments = React.useMemo(() => {
     if (!content) return [];
+    if (!content.includes('[[gen_image:')) {
+      return [{ type: 'text', value: content }];
+    }
     const result = [];
     const regex = /\[\[gen_image:([^|\]]+)(?:\|([^\]]*))?\]\]/g;
     let lastIndex = 0;
     let match;
     while ((match = regex.exec(content)) !== null) {
-      // マーカー前のテキスト
       if (match.index > lastIndex) {
         result.push({ type: 'text', value: content.slice(lastIndex, match.index) });
       }
-      // 画像マーカー
       let promptText = '';
       try { promptText = decodeURIComponent(match[2] || ''); } catch { promptText = match[2] || ''; }
       result.push({ type: 'gen_image', url: match[1], prompt: promptText });
       lastIndex = regex.lastIndex;
     }
-    // 末尾の残り
     if (lastIndex < content.length) {
       result.push({ type: 'text', value: content.slice(lastIndex) });
     }
     return result;
   }, [content]);
 
-  // セグメントがなく単純なテキストならそのまま
-  if (segments.length <= 1 && (!segments[0] || segments[0].type === 'text')) {
+  const hasMarkers = segments.some(s => s.type === 'gen_image');
+
+  // マーカー無し: dangerouslySetInnerHTML でシンプルにレンダリング
+  // React.memo で contentが変わらない限りこの関数自体が呼ばれないので、
+  // 既に書き込まれた output-* の中身は再レンダリングで消えない
+  if (!hasMarkers) {
     const html = renderLatex(content || '');
     return React.createElement('div', {
       ref,
@@ -496,7 +510,7 @@ function MarkdownContent({ content }) {
     });
   }
 
-  // マーカーがある場合はセグメント毎に React で描画
+  // マーカーがある場合: セグメント毎に描画
   return (
     <div ref={ref}>
       {segments.map((seg, i) => {
@@ -512,7 +526,7 @@ function MarkdownContent({ content }) {
       })}
     </div>
   );
-}
+});
 
 // ─── 生成画像コンポーネント ───
 // チャット欄に小さなサムネイルで表示し、クリックでフルサイズプレビュー、

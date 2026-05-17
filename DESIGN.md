@@ -2386,6 +2386,23 @@ body, .app-layout, .chat-area {
 83. **React state 更新時の既存フィールド保持忘れ**
     メッセージオブジェクトに後から追加したフィールド (例: `generatedImages`、`searchQueries`、`tokenInfo`) は、その後の `streamResponse` などで `copy[i] = {role, content, ...}` のように完全置き換えすると消える。`copy[i] = {...copy[i], role, content, ...}` のように既存フィールドをスプレッドで保持する必要がある。特に「非同期で追加されるフィールド」がある場合は要注意。テストするときは、複数ツールを連続実行するシナリオで検証する。
 
+84. **`useEffect` 内での `innerHTML` 直書き換えは React 管理外DOMを破壊する**
+    `MarkdownContent` で `useEffect` 内で `ref.current.innerHTML = html` する実装は、複数のコンポーネントが並んだ時に他のコンポーネントの DOM を操作してしまう可能性がある。実体験: メッセージリストの中で、画像生成したメッセージのDOMと別のメッセージのDOMが混在表示されるバグが発生。原因は ref の参照ずれと、React 管理外で innerHTML を書き換えることによる Reconciliation との競合。解決策: `dangerouslySetInnerHTML` + `React.memo` の組み合わせを使う。React 標準パターンなので安全。
+
+85. **`React.memo` でストリーミング中の過去メッセージを保護**
+    ストリーミングで親 state が頻繁に更新される時、メッセージリストの全要素が再レンダリング対象になり、過去のメッセージも巻き込まれる。すると、ユーザーが過去のコードブロックで「▶ 実行」を押した直後でも、ストリーミングの更新で `dangerouslySetInnerHTML` が再実行されて `output-*` の中身が消える。`MarkdownContent` を `React.memo` でラップし、`content` が変わらない限り再レンダリングをスキップすれば、過去メッセージのコードブロック実行結果 (`output-*` の中身) が破壊されない。副次効果として、長いチャット履歴でも高速化される。
+
+86. **`Math.random()` で生成した DOM ID は再レンダリングで変わる**
+    marked の `renderer.code` で `Math.random()` で code id を生成すると、ストリーミング中の再レンダリングで毎回違う ID になる。ユーザーが「▶ 実行」を押した直後の再レンダリングで `output-<id>` 要素が消失して、結果が表示されない。コードテキストのハッシュから決定的に生成すれば、同じコード = 同じ ID で再生成されても DOM が同じ場所に維持される:
+    ```javascript
+    let hash = 0;
+    for (let i = 0; i < text.length; i++) {
+      hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
+    }
+    const id = 'code-' + Math.abs(hash).toString(36) + '-' + text.length;
+    ```
+    `React.memo` と組み合わせれば二重に安全。
+
 ---
 
 ## 🎮 GPU監視バックエンドの設計

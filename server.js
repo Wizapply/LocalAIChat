@@ -896,6 +896,16 @@ try:
         print(f"__OGC_IMAGE__:{base}", flush=True)
     _plt.show = _auto_show
     _plt.savefig = _auto_savefig
+    # ユーザーコードが 'import matplotlib.pyplot as plt' だけして
+    # その後 'matplotlib.use(Agg)' を呼ぶケースに備え、
+    # matplotlib モジュール自体もグローバル名として露出させる
+except ImportError:
+    pass
+# LLMが 'matplotlib.use(Agg)' を呼ぶケースに備え、user code が見るグローバル空間にも
+# matplotlib をバインドしておく（既にプレアンブル内で Agg バックエンド設定済みなので
+# 再呼び出しは no-op に近い、警告は出るが無害）
+try:
+    import matplotlib
 except ImportError:
     pass
 # ─── user code below ───
