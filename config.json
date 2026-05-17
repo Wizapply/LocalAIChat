@@ -11,9 +11,9 @@
   "accentColor": "#34d399",
   "defaultModel": "",
   "password": "e10adc3949ba59abbe56e057f20f883e",
-  "pythonPath": "/home/wizapply-ai/opengeek-llm-chat/venv/bin/python",
+  "pythonPath": "/home/[user]/opengeek-llm-chat/venv/bin/python",
   "logLevel": "quiet",
-  "llamaCppDir": "/home/wizapply-ai/llama.cpp",
+  "llamaCppDir": "/home/[user]/llama.cpp",
   "tuningEnv": {
     "HSA_OVERRIDE_GFX_VERSION": "12.0.1",
     "PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True",
@@ -43,34 +43,34 @@
   "chatModels": [
     {
       "name": "Qwen2.5 0.5B",
-      "path": "/home/wizapply-ai/opengeek-llm-chat/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
+      "path": "/home/[user]/opengeek-llm-chat/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
       "ctx": 8192,
       "ngl": 99,
       "extraArgs": []
     },
     {
       "name": "Gemma4 31B",
-      "path": "/home/wizapply-ai/opengeek-llm-chat/models/gemma-4-31B-it-UD-Q4_K_XL.gguf",
+      "path": "/home/[user]/opengeek-llm-chat/models/gemma-4-31B-it-UD-Q4_K_XL.gguf",
       "ctx": 32768,
       "ngl": 99,
       "extraArgs": [
         "--mmproj",
-        "/home/wizapply-ai/opengeek-llm-chat/models/mmproj-gemma-4-31B-it-BF16.gguf"
+        "/home/[user]/opengeek-llm-chat/models/mmproj-gemma-4-31B-it-BF16.gguf"
       ]
     },
     {
       "name": "Qwen3.6 35B-A3B[MoE]",
-      "path": "/home/wizapply-ai/opengeek-llm-chat/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+      "path": "/home/[user]/opengeek-llm-chat/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
       "ctx": 32768,
       "ngl": 99,
       "extraArgs": [
         "--mmproj",
-        "/home/wizapply-ai/opengeek-llm-chat/models/mmproj-Qwen3.6-35B-A3B-F16.gguf"
+        "/home/[user]/opengeek-llm-chat/models/mmproj-Qwen3.6-35B-A3B-F16.gguf"
       ]
     }
   ],
   "embeddingModel": {
-    "path": "/home/wizapply-ai/opengeek-llm-chat/models/mxbai-embed-large-v1-f16.gguf",
+    "path": "/home/[user]/opengeek-llm-chat/models/mxbai-embed-large-v1-f16.gguf",
     "ctx": 512,
     "ngl": 99,
     "poolingType": "mean",
@@ -80,8 +80,8 @@
     ]
   },
   "tuning": {
-    "pythonPath": "/home/wizapply-ai/opengeek-llm-chat/venv-tuning/bin/python",
-    "llamaCppDir": "/home/wizapply-ai/llama.cpp",
+    "pythonPath": "/home/[user]/opengeek-llm-chat/venv-tuning/bin/python",
+    "llamaCppDir": "/home/[user]/llama.cpp",
     "env": {
       "HSA_OVERRIDE_GFX_VERSION": "12.0.1",
       "PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True",
@@ -103,7 +103,7 @@
   "stableDiffusion": {
     "binPath": "/usr/local/bin/sd-server",
     "port": 7860,
-    "readyTimeoutMs": 90000,
+    "readyTimeoutMs": 300000,
     "idleUnloadMs": 600000,
     "defaultModel": "SDXL Base 1.0",
     "env": {
@@ -115,8 +115,8 @@
     {
       "name": "SDXL Base 1.0",
       "desc": "万能、商用OK、SDXL 1024x1024",
-      "path": "/home/wizapply-ai/opengeek-llm-chat/models/sd/sd_xl_base_1.0.safetensors",
-      "vae": "/home/wizapply-ai/opengeek-llm-chat/models/sd/sdxl_vae.safetensors",
+      "path": "/home/[user]/opengeek-llm-chat/models/sd/sd_xl_base_1.0.safetensors",
+      "vae": "/home/[user]/opengeek-llm-chat/models/sd/sdxl_vae.safetensors",
       "extraArgs": []
     }
   ],

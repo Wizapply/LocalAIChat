@@ -912,6 +912,32 @@ function App() {
   }
 
   // ─── チャット送信 ───
+  // 503 リトライ付き fetch ヘルパー
+  // チャットモデルがロード中の場合、サーバーは503を返す前に待機するが
+  // それでも初回ロード遅延等で503が来ることがある。最大5回リトライ。
+  async function fetchWithRetry(url, options, maxRetries = 5) {
+    let lastError = null;
+    for (let i = 0; i <= maxRetries; i++) {
+      const res = await fetch(url, options);
+      if (res.ok) return res;
+      // 503以外（4xx/500等）は即エラー扱い
+      if (res.status !== 503) return res;
+      // 最後の試行なら結果を返す（呼び出し側でエラー処理）
+      if (i === maxRetries) return res;
+      // 503: モデル起動中なので少し待ってリトライ
+      let info = '';
+      try {
+        const errData = await res.clone().json();
+        info = errData.error || '';
+      } catch {}
+      console.log(`[fetch 503] ${info} → ${(i + 1) * 5}秒後にリトライ (${i + 1}/${maxRetries})`);
+      await new Promise(r => setTimeout(r, 5000));
+      // AbortController がトリガーされてたら中断
+      if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    }
+    return null;
+  }
+
   async function sendMessage() {
     const text = input.trim();
     const hasImages = chatImages.length > 0;
@@ -941,13 +967,15 @@ function App() {
         if (!mdata.current || mdata.starting || mdata.autoUnloaded) {
           setModelReady(false);
 
-          // 自動アンロードからの復帰: ダミーリクエストで再ロード開始
-          if (mdata.autoUnloaded) {
+          // 自動アンロードからの復帰 or 初回ロード: ダミーリクエストで再ロード開始
+          // (mdata.autoUnloaded がない場合でも、!mdata.current ならまだ一度もロードされていない初回状態)
+          if (mdata.autoUnloaded || (!mdata.current && !mdata.starting)) {
+            const targetModel = mdata.autoUnloaded || chatModel;
             const isFirst = mdata.firstLoadPending;
-            console.log(`[${isFirst ? '初回ロード' : 'アイドル復帰'}] モデル「${mdata.autoUnloaded}」のロードを開始`);
+            console.log(`[${isFirst ? '初回ロード' : 'アイドル復帰'}] モデル「${targetModel}」のロードを開始`);
             setLoadingMessage(isFirst
-              ? `モデル「${mdata.autoUnloaded}」をロード中`
-              : `モデル「${mdata.autoUnloaded}」を再ロード中`);
+              ? `モデル「${targetModel}」をロード中`
+              : `モデル「${targetModel}」を再ロード中`);
             // 503を期待しつつヘルスチェック的に叩いて再ロードトリガー
             fetch('/v1/chat/completions', {
               method: 'POST',
@@ -1658,9 +1686,10 @@ function App() {
               });
 
               try {
-                // 画像生成は時間がかかるので長めのタイムアウト (3分)
+                // 画像生成は時間がかかるので長めのタイムアウト (5分)
                 const ctrl = new AbortController();
-                const timer = setTimeout(() => ctrl.abort(), 180000);
+                const timer = setTimeout(() => ctrl.abort(), 300000);
+                console.log(`[generate_image] リクエスト送信: prompt="${prompt}", w=${width}, h=${height}, steps=${steps}, count=${count}`);
                 const res = await fetch('/image-gen', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
@@ -1671,27 +1700,28 @@ function App() {
                 });
                 clearTimeout(timer);
                 const data = await res.json();
-                if (!res.ok) throw new Error(data.error || '生成失敗');
+                console.log(`[generate_image] レスポンス: status=${res.status}`, data);
+                if (!res.ok) throw new Error(data.error || `生成失敗 (HTTP ${res.status})`);
+                if (!data.images || data.images.length === 0) {
+                  throw new Error('画像が返されませんでした (images=空)');
+                }
 
                 searchQueries[searchQueries.length - 1].resultCount = data.images.length;
 
-                // 生成画像はカスタムマーカー [[gen_image:URL|alt]] で返す。
-                // メッセージ表示側でこのマーカーを検出して <GeneratedImage> コンポーネントを描画。
-                // プロンプトも保持して、画像クリック時にコピーやプレビューに使う。
+                // 生成画像はカスタムマーカー [[gen_image:URL|prompt]] で返す
+                // LLMがそのまま応答に含めて出力 → MarkdownContent側でパースして <GeneratedImage> 描画
                 const imageMarkers = data.images.map((url) => {
-                  // パイプ区切りで url|prompt をエンコードして埋め込む
                   const encoded = encodeURIComponent(prompt);
                   return `[[gen_image:${url}|${encoded}]]`;
                 }).join('\n\n');
-                const summary = `🎨 画像を ${data.images.length} 枚生成しました（${data.elapsed}秒、モデル: ${data.model}）\n\n` +
-                                `${imageMarkers}\n\n` +
-                                `プロンプト: ${prompt}\n\n` +
-                                `重要: 上記の [[gen_image:...]] マーカーは画像表示用なので、そのまま改変せずに最終応答に含めてください。あなたは簡単なコメント（例: "ご依頼の通り、〇〇の画像を生成しました。" 等）を1〜2文添えるだけで十分です。`;
+                const summary = `画像を ${data.images.length} 枚生成しました（${data.elapsed}秒、モデル: ${data.model}）。\n\n${imageMarkers}\n\n` +
+                                `重要: 上記の [[gen_image:...]] マーカーを、必ずそのまま改変せずに最終応答にコピーして含めてください。これは画像を表示するための重要なタグです。あなたは「ご依頼の通り、〇〇の画像を生成しました。」のような1〜2文のコメントを添えるだけで結構です。マーカーを忘れずに含めてください。`;
                 apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: summary });
               } catch (e) {
-                const errMsg = e.name === 'AbortError' ? 'タイムアウト（3分超過）' : e.message;
+                const errMsg = e.name === 'AbortError' ? 'タイムアウト（5分超過）' : e.message;
+                console.error(`[generate_image] エラー:`, e);
                 searchQueries[searchQueries.length - 1].resultCount = 0;
-                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: `画像生成失敗: ${errMsg}` });
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: `画像生成失敗: ${errMsg}\n\nユーザーに「画像生成サーバーがまだ起動中の可能性があります。1〜2分待ってからもう一度お試しください」と伝えてください。` });
               } finally {
                 setMessages(prev => {
                   const copy = [...prev];
@@ -1730,7 +1760,7 @@ function App() {
           return copy;
         });
 
-        const finalRes = await fetch('/v1/chat/completions', {
+        const finalRes = await fetchWithRetry('/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1835,7 +1865,7 @@ function App() {
             return copy;
           });
 
-          const retryRes = await fetch('/v1/chat/completions', {
+          const retryRes = await fetchWithRetry('/v1/chat/completions', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1866,7 +1896,7 @@ function App() {
           fullSystemPrompt += '\n\n【ユーザー指定の役割・指示】\n' + chatRole.trim();
         }
 
-        const res = await fetch('/v1/chat/completions', {
+        const res = await fetchWithRetry('/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -2000,6 +2030,7 @@ function App() {
           setMessages(prev => {
             const copy = [...prev];
             copy[copy.length - 1] = {
+              ...copy[copy.length - 1],  // 既存フィールド (generatedImages 等) を保持
               role: 'assistant',
               content: displayContent,
               thinking: displayThinking,
@@ -3637,7 +3668,9 @@ ${conversationText}
                     </div>
                   )}
                   {msg.role === 'assistant' ? (
-                    <div className="msg-bubble"><MarkdownContent content={msg.content} /></div>
+                    <div className="msg-bubble">
+                      <MarkdownContent content={msg.content} />
+                    </div>
                   ) : (
                     <React.Fragment>
                       {msg.images && msg.images.length > 0 && (

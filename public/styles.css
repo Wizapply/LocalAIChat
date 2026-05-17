@@ -2478,6 +2478,12 @@
   .msg-image-thumb:hover { opacity: 0.85; }
 
   /* ── 生成画像カード（LLMツールで生成された画像） ── */
+  .generated-images-container {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+  }
   .gen-image-card {
     display: inline-flex;
     flex-direction: column;

@@ -182,6 +182,33 @@ function waitForReady(host, port, timeoutMs, useHttps) {
   });
 }
 
+// sd-server等、/health エンドポイントを持たないサーバー用
+// TCP接続が成功すれば「ポートを開いてる」と判定。さらに2秒待ってモデルロード完了を待つ
+function waitForTcpReady(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const net = require('net');
+    const check = () => {
+      const sock = new net.Socket();
+      let done = false;
+      const finish = (success) => {
+        if (done) return;
+        done = true;
+        try { sock.destroy(); } catch {}
+        if (success) return resolve(true);
+        if (Date.now() - start > timeoutMs) return resolve(false);
+        setTimeout(check, 2000);
+      };
+      sock.setTimeout(2000);
+      sock.once('connect', () => finish(true));
+      sock.once('error', () => finish(false));
+      sock.once('timeout', () => finish(false));
+      sock.connect(port, host);
+    };
+    check();
+  });
+}
+
 function spawnLlamaServer(args, label) {
   const ls = appConfig.llamaServer;
   log('-', `[${label}] spawn: ${ls.binPath} ${args.join(' ')}`);
@@ -430,6 +457,10 @@ async function startImageModel(modelName) {
   if (!fs.existsSync(model.path)) throw new Error(`モデルファイルが存在しません: ${model.path}`);
 
   sdProcStarting = true;
+  // 重要: 起動開始時に sdLastActivity をリセット
+  // これを忘れると、前回終了時から大きく時間が経過した場合に
+  // 起動中のアイドルチェックで「アイドル時間が長い」と判定されて即終了してしまう
+  sdLastActivity = Date.now();
   try {
     await stopImageModel();
     const sdConfig = appConfig.stableDiffusion || {};
@@ -447,29 +478,45 @@ async function startImageModel(modelName) {
     ];
 
     log('-', `[sd-server] 起動: ${binPath} ${args.join(' ')}`);
-    sdProc = spawn(binPath, args, {
+    const proc = spawn(binPath, args, {
       cwd: __dirname,
       env: { ...process.env, ...(sdConfig.env || {}) },
     });
+    sdProc = proc;
 
-    sdProc.stdout.on('data', (d) => {
-      if (appConfig.logLevel !== 'quiet') process.stdout.write(`[sd-server] ${d}`);
+    proc.stdout.on('data', (d) => {
+      // sd-serverは進捗ログが重要なので常に出力（logLevel=quietでも）
+      process.stdout.write(`[sd-server] ${d}`);
     });
-    sdProc.stderr.on('data', (d) => {
-      if (appConfig.logLevel !== 'quiet') process.stderr.write(`[sd-server] ${d}`);
+    proc.stderr.on('data', (d) => {
+      process.stderr.write(`[sd-server] ${d}`);
     });
-    sdProc.on('exit', (code) => {
-      log('-', `[sd-server] 終了 (code=${code})`);
-      if (sdProc && sdProc.pid === sdProc?.pid) sdProc = null;
+    // クロージャでこのプロセスを保持。新プロセスに切り替わった後で
+    // 古いプロセスの exit イベントが来ても sdProc を誤って null にしないよう、
+    // 現在の sdProc と一致する場合のみクリアする
+    proc.on('exit', (code) => {
+      log('-', `[sd-server] 終了 (code=${code}, pid=${proc.pid})`);
+      if (sdProc === proc) {
+        sdProc = null;
+        sdCurrentModel = null;
+      }
+    });
+    proc.on('error', (err) => {
+      log('-', `[sd-server] プロセスエラー: ${err.message}`);
+      if (sdProc === proc) {
+        sdProc = null;
+        sdCurrentModel = null;
+      }
     });
 
     // 起動完了を待つ
-    const ready = await waitForReady('127.0.0.1', port, sdConfig.readyTimeoutMs || 60000, false);
-    if (!ready) throw new Error(`sd-server が ${sdConfig.readyTimeoutMs || 60000}ms 以内に起動しませんでした`);
+    // sd-server には /health エンドポイントがないため、TCP接続だけで判定
+    const ready = await waitForTcpReady('127.0.0.1', port, sdConfig.readyTimeoutMs || 300000);
+    if (!ready) throw new Error(`sd-server が ${sdConfig.readyTimeoutMs || 300000}ms 以内に起動しませんでした`);
 
     sdCurrentModel = modelName;
     sdLastActivity = Date.now();
-    log('-', `[sd-server] Ready (model=${modelName}, port=${port})`);
+    log('-', `[sd-server] Ready (model=${modelName}, port=${port}, pid=${proc.pid})`);
   } finally {
     sdProcStarting = false;
   }
@@ -599,13 +646,14 @@ setInterval(async () => {
 // 自動アンロード後のリクエスト時に再ロード
 async function ensureChatModelLoaded() {
   if (chatProc) return true;  // 既にロード済み
-  if (chatProcStarting) return false;  // 起動中（プロキシ側で503応答）
-  if (!chatProcAutoUnloaded) return false;  // 自動アンロードされてない（手動で停止された）
-  const modelToReload = chatProcAutoUnloaded;
+  if (chatProcStarting) return false;  // 起動中（プロキシ側で待機）
+  // 自動アンロードされたモデルがあればそれを優先、なければデフォルトを使う（初回ロード対応）
+  const modelToReload = chatProcAutoUnloaded || appConfig.defaultModel;
+  if (!modelToReload) return false;
   chatProcAutoUnloaded = null;
-  log('-', `アイドル復帰: モデル「${modelToReload}」を再ロード`);
-  startChatModel(modelToReload).catch(e => log('-', `再ロードエラー: ${e.message}`));
-  return false;  // 起動中なのでこのリクエストは503扱い
+  log('-', `自動ロード: モデル「${modelToReload}」を起動`);
+  startChatModel(modelToReload).catch(e => log('-', `自動ロードエラー: ${e.message}`));
+  return false;  // 起動中なのでこのリクエストは待機（プロキシ側で待つ）
 }
 
 // Embedding未起動時に再ロード（Promise返却、完了を待てる）
@@ -1185,32 +1233,50 @@ function proxyToLlama(targetHost, targetPort, pathPrefix, isChatProxy) {
     const targetPath = pathPrefix + req.url;
     const isQuiet = appConfig.logLevel === 'quiet';
 
-    // チャットプロキシの場合: モデル起動中なら503で早期返却（ユーザーに明確な状態を伝える）
+    // チャットプロキシの場合: モデル起動中・未ロード時は起動完了を待ってから処理を続行
+    // （Embeddingプロキシと同様の挙動。クライアントは「初回送信で503」を見ずに済む）
     if (isChatProxy) {
+      // 既に起動中の場合は完了を待つ
       if (chatProcStarting) {
-        if (!isQuiet) log(ip, `503 ${req.method} ${targetPath} (model starting)`);
-        return res.status(503).json({
-          error: 'モデル起動中です。10〜30秒お待ちください。',
-          starting: true,
-          model: chatProcModel || appConfig.defaultModel,
-        });
-      }
-      if (!chatProc) {
-        // 自動アンロードされていれば自動再ロード開始
-        if (chatProcAutoUnloaded) {
-          ensureChatModelLoaded();  // バックグラウンドで再ロード開始
-          if (!isQuiet) log(ip, `503 ${req.method} ${targetPath} (auto-reloading)`);
+        if (!isQuiet) log(ip, `${req.method} ${targetPath} → モデル起動中、完了を待機`);
+        // 最大60秒待つ（モデルロードのタイムアウト）
+        const startWait = Date.now();
+        while (chatProcStarting && (Date.now() - startWait < 60000)) {
+          await new Promise(r => setTimeout(r, 500));
+        }
+        if (chatProcStarting || !chatProc) {
+          if (!isQuiet) log(ip, `503 ${req.method} ${targetPath} (起動タイムアウト)`);
           return res.status(503).json({
-            error: 'アイドル状態からモデルを再ロード中です。10〜30秒お待ちください。',
-            starting: true,
-            model: chatProcModel || appConfig.defaultModel,
+            error: 'モデル起動がタイムアウトしました。サーバーログを確認してください。',
+            starting: false,
           });
         }
-        if (!isQuiet) log(ip, `503 ${req.method} ${targetPath} (no model loaded)`);
-        return res.status(503).json({
-          error: 'チャットモデルがロードされていません。',
-          starting: false,
-        });
+      }
+      // プロセスが存在しない場合: アイドル復帰または初回ロードを行う
+      if (!chatProc) {
+        // 初回ロード（サーバー起動後の最初のチャット）または自動アンロードからの復帰
+        if (chatProcAutoUnloaded || appConfig.defaultModel) {
+          if (!isQuiet) log(ip, `${req.method} ${targetPath} → モデル自動ロード待機`);
+          ensureChatModelLoaded();  // バックグラウンドで起動開始
+          // 起動完了を待つ（最大60秒）
+          const startWait = Date.now();
+          while ((chatProcStarting || !chatProc) && (Date.now() - startWait < 60000)) {
+            await new Promise(r => setTimeout(r, 500));
+          }
+          if (!chatProc) {
+            if (!isQuiet) log(ip, `503 ${req.method} ${targetPath} (自動ロード失敗)`);
+            return res.status(503).json({
+              error: 'モデル自動ロードに失敗しました。サーバーログを確認してください。',
+              starting: false,
+            });
+          }
+        } else {
+          if (!isQuiet) log(ip, `503 ${req.method} ${targetPath} (モデル未ロード)`);
+          return res.status(503).json({
+            error: 'チャットモデルがロードされていません。',
+            starting: false,
+          });
+        }
       }
       chatLastUsed = Date.now();
     } else {
@@ -1475,7 +1541,7 @@ app.post('/image-gen', requireAuth, jsonParser, async (req, res) => {
   }
 
   // モデルが起動していなければ起動（オンデマンド）
-  if (!sdProc || sdProc.killed) {
+  if (!sdProc || sdProc.killed || sdProc.exitCode !== null) {
     try {
       log(ip, `[IMAGE-GEN] sd-server を起動: ${targetModel}`);
       await startImageModel(targetModel);
@@ -1492,23 +1558,40 @@ app.post('/image-gen', requireAuth, jsonParser, async (req, res) => {
   const startTime = Date.now();
   for (let i = 0; i < Math.min(batchCount, 4); i++) {
     try {
+      // sd-server プロセスが生きてるか確認（ループ中に死んだ場合の検知）
+      if (!sdProc || sdProc.killed || sdProc.exitCode !== null) {
+        throw new Error('sd-serverプロセスが終了しています。再試行してください。');
+      }
+
+      // タイムアウト付き fetch（hangを防ぐ）
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 180000);  // 3分
+
       // sd-server の HTTP API に転送
+      // sd-server (stable-diffusion.cpp) は AUTOMATIC1111互換だが、
+      // サポートされてるパラメータが限定的。
+      // 検証: curlで {prompt, width, height, steps} のみで成功する
+      // 追加パラメータは存在する場合だけ送る
+      const sdBody = {
+        prompt,
+        width: Math.min(Math.max(width, 64), 2048),
+        height: Math.min(Math.max(height, 64), 2048),
+        steps: Math.min(Math.max(steps, 1), 100),
+        batch_size: 1,
+        n_iter: 1,
+      };
+      if (negativePrompt) sdBody.negative_prompt = negativePrompt;
+      if (cfgScale != null && cfgScale > 0) sdBody.cfg_scale = cfgScale;
+      if (seed !== -1) sdBody.seed = seed;
+      // サンプラー名は省略するとデフォルト (SDXL用は euler_a が自動選択)
+      // 明示指定しない方が互換性が高い
+
       const sdResp = await fetch(`http://127.0.0.1:${port}/sdapi/v1/txt2img`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt,
-          negative_prompt: negativePrompt,
-          width: Math.min(Math.max(width, 64), 2048),
-          height: Math.min(Math.max(height, 64), 2048),
-          steps: Math.min(Math.max(steps, 1), 100),
-          cfg_scale: cfgScale,
-          sampler_name: sampler,
-          seed: seed === -1 ? Math.floor(Math.random() * 2**31) : seed,
-          batch_size: 1,
-          n_iter: 1,
-        }),
-      });
+        body: JSON.stringify(sdBody),
+        signal: ctrl.signal,
+      }).finally(() => clearTimeout(timer));
       if (!sdResp.ok) {
         const errText = await sdResp.text().catch(() => '');
         throw new Error(`sd-server エラー ${sdResp.status}: ${errText.slice(0, 200)}`);
@@ -2206,7 +2289,7 @@ async function parseAmdSmi() {
     if (!amdSmiFieldsLogged) {
       console.log(`[amd-smi gpu${gpuNum}] static キー:`, Object.keys(st).sort());
       console.log(`[amd-smi gpu${gpuNum}] metric キー:`, Object.keys(mt).sort());
-      for (const k of ['power', 'temperature', 'usage', 'fb_usage']) {
+      for (const k of ['power', 'temperature', 'usage', 'mem_usage', 'fb_usage']) {
         if (mt[k]) console.log(`  metric.${k}:`, JSON.stringify(mt[k]).slice(0, 200));
       }
     }
@@ -2254,11 +2337,12 @@ async function parseAmdSmi() {
                         power.average_socket_power ?? power.gfx);
 
     // ─── VRAM ───
+    // amd-smi 26.x では mem_usage を使う (旧バージョンでは fb_usage / vram_usage)
     // static.vram.size.value = 30576 (MB) を総容量として優先
-    // metric.fb_usage.used を使用量として
-    const fb = mt.fb_usage || mt.vram_usage || {};
-    const totalMB = vramMB || amdVal(fb.total ?? fb.vram_total);
-    const usedMB = amdVal(fb.used ?? fb.vram_used);
+    const mem = mt.mem_usage || mt.fb_usage || mt.vram_usage || {};
+    // 使用量フィールド候補: used_vram (amd-smi 26.x) / used / vram_used
+    const totalMB = vramMB || amdVal(mem.total_vram ?? mem.total ?? mem.vram_total);
+    const usedMB = amdVal(mem.used_vram ?? mem.used ?? mem.vram_used);
     gpu.vramTotalMB = totalMB;
     gpu.vramUsedMB = usedMB;
     gpu.vramPct = totalMB > 0 ? Math.round(usedMB / totalMB * 100) : 0;
