@@ -2117,7 +2117,7 @@ app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => 
       (code) => {
         if (code !== 0) { postLog.end(`GGUF変換失敗 code=${code}\n`); currentPostprocess = null; return; }
         if (quantize && quantize !== 'f16' && quantize !== 'bf16') step3Quantize(ggufFile);
-        else finalize();
+        else finalize(ggufFile);
       });
   }
 
@@ -2134,23 +2134,52 @@ app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => 
       llamaDir,
       (code) => {
         if (code !== 0) { postLog.end(`量子化失敗 code=${code}\n`); currentPostprocess = null; return; }
-        finalize();
+        finalize(quantFile);
       });
   }
 
-  function finalize() {
-    postLog.write('\n=== 全工程完了 ===\n');
+  function finalize(finalGgufFile) {
+    // ファイルサイズ取得（人間に読める形式に変換）
+    let fileSizeStr = '';
+    if (finalGgufFile && fs.existsSync(finalGgufFile)) {
+      const sizeBytes = fs.statSync(finalGgufFile).size;
+      const sizeMB = sizeBytes / (1024 * 1024);
+      const sizeGB = sizeMB / 1024;
+      fileSizeStr = sizeGB >= 1 ? `${sizeGB.toFixed(2)} GB` : `${sizeMB.toFixed(1)} MB`;
+    }
+
+    postLog.write('\n');
+    postLog.write('=====================================================\n');
+    postLog.write('  ✅ 後処理完了\n');
+    postLog.write('=====================================================\n');
+    if (finalGgufFile) {
+      postLog.write(`\n📦 生成されたGGUFファイル:\n`);
+      postLog.write(`   ${finalGgufFile}\n`);
+      if (fileSizeStr) postLog.write(`   (サイズ: ${fileSizeStr})\n`);
+      postLog.write(`\n💡 使い方:\n`);
+      postLog.write(`   1) config.json の models[] にこのパスを追加してチャットに組み込み\n`);
+      postLog.write(`   2) または llama-server で直接起動:\n`);
+      postLog.write(`      llama-server -m "${finalGgufFile}" --port 8080 -c 4096 -ngl 99 -fa on\n`);
+    }
+    postLog.write('\n');
     postLog.end();
-    // ジョブ情報に postprocess 完了を記録
+
+    // ジョブ情報に postprocess 完了 + 最終GGUFパスを記録
     const jobs = loadJobs();
     const j = jobs.find(j => j.id === jobId);
     if (j) {
       j.postprocessStatus = 'completed';
       j.postprocessEndedAt = Date.now();
+      if (finalGgufFile) {
+        j.ggufPath = finalGgufFile;
+        try {
+          j.ggufSize = fs.statSync(finalGgufFile).size;
+        } catch {}
+      }
       saveJobs(jobs);
     }
     currentPostprocess = null;
-    log('-', `[tuning ${jobId}] 後処理完了`);
+    log('-', `[tuning ${jobId}] 後処理完了 → ${finalGgufFile || '(GGUF生成なし)'}`);
   }
 
   log(ip, `TUNING POSTPROCESS START: ${jobId} quantize=${quantize}`);

@@ -727,6 +727,9 @@ function JobsView({ jobs, currentJobId, reload, showToast }) {
             <div className="job-meta-row"><span className="job-meta-key">サンプル数:</span><span className="job-meta-val">{j.sampleCount}</span></div>
             <div className="job-meta-row"><span className="job-meta-key">開始:</span><span className="job-meta-val">{new Date(j.startedAt).toLocaleString('ja-JP')}</span></div>
           </div>
+          {j.postprocessStatus === 'completed' && j.ggufPath && (
+            <GgufPathDisplay path={j.ggufPath} size={j.ggufSize} />
+          )}
           {expandedJobs[j.id] && (
             <>
               <div className="job-log">{jobLogs[j.id] || 'ログ読み込み中...'}</div>
@@ -750,6 +753,44 @@ function JobsView({ jobs, currentJobId, reload, showToast }) {
       ))}
 
       {postProcessing && <PostProcessDialog job={postProcessing} onClose={() => setPostProcessing(null)} onStarted={() => { setPostProcessing(null); reload(); showToast('後処理を開始しました', 'success'); }} />}
+    </div>
+  );
+}
+
+// ─── GGUFパス表示（後処理完了時）───
+function GgufPathDisplay({ path, size }) {
+  const [copied, setCopied] = useState(false);
+  const filename = path ? path.split('/').pop() : '';
+  const sizeStr = size ? (size >= 1024 * 1024 * 1024
+    ? `${(size / 1024 / 1024 / 1024).toFixed(2)} GB`
+    : `${(size / 1024 / 1024).toFixed(1)} MB`) : '';
+
+  function copyPath() {
+    navigator.clipboard.writeText(path).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }).catch(() => {});
+  }
+
+  return (
+    <div className="gguf-path-box">
+      <div className="gguf-path-header">
+        <span className="gguf-path-icon">📦</span>
+        <span className="gguf-path-title">生成されたGGUFファイル</span>
+        {sizeStr && <span className="gguf-path-size">{sizeStr}</span>}
+      </div>
+      <div className="gguf-path-content">
+        <code className="gguf-path-code" title={path}>{filename}</code>
+        <button className="btn small" onClick={copyPath} title="フルパスをコピー">
+          {copied ? '✓ コピー済' : '📋 パスをコピー'}
+        </button>
+      </div>
+      <div className="gguf-path-full" title={path}>
+        <span className="gguf-path-label">フルパス:</span> <code>{path}</code>
+      </div>
+      <div className="gguf-path-hint">
+        💡 <code>config.json</code> の <code>models[]</code> にこのパスを追加してチャットで使えます
+      </div>
     </div>
   );
 }
