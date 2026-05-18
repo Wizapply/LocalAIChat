@@ -28,6 +28,8 @@ function App() {
   const [jobs, setJobs] = useState([]);
   const [currentJobId, setCurrentJobId] = useState(null);
   const [toast, setToast] = useState(null);
+  // サイドバー開閉（モバイル/狭画面でドロワー表示用）
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -86,7 +88,11 @@ function App() {
 
   return (
     <div className="app-layout">
-      <aside className="sidebar">
+      {/* サイドバー オーバーレイ (モバイル時、サイドバー開いている時にバックドロップとして表示) */}
+      <div className={`sidebar-overlay ${sidebarOpen ? 'open' : ''}`} onClick={() => setSidebarOpen(false)} />
+
+      <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
+        <button className="sidebar-close-btn" onClick={() => setSidebarOpen(false)} title="サイドバーを閉じる">×</button>
         <div className="sidebar-header">
           <div className="logo">
             <div className="logo-icon" />
@@ -120,6 +126,7 @@ function App() {
 
       <main className="main">
         <header className="main-header">
+          <button className="menu-btn" onClick={() => setSidebarOpen(!sidebarOpen)} title="メニュー">☰</button>
           <div className="main-title">🧠 ファインチューニング</div>
         </header>
         <div className="tab-bar">
@@ -241,24 +248,45 @@ function SamplesView({ samples, reload, showToast }) {
         <div className="sample-list">
           {samples.map(s => (
             <div key={s.id} className="sample-item">
-              {s.system && (
-                <div className="sample-row">
-                  <div className="sample-label">System</div>
-                  <div className="sample-text">{s.system}</div>
-                </div>
+              {Array.isArray(s.messages) ? (
+                /* マルチターン形式: messages配列を順に表示 */
+                <>
+                  <div className="sample-multiturn-badge">🔁 マルチターン ({s.messages.length}件)</div>
+                  {s.messages.map((m, mi) => (
+                    <div key={mi} className="sample-row">
+                      <div className={`sample-label ${m.role}`}>{m.role === 'system' ? 'System' : m.role === 'user' ? 'User' : 'Assistant'}</div>
+                      <div className="sample-text">{m.content}</div>
+                      {mi === 0 && (
+                        <div className="sample-actions">
+                          <button className="sample-icon-btn delete" onClick={() => handleDelete(s.id)} title="削除">×</button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </>
+              ) : (
+                /* シングルターン形式 */
+                <>
+                  {s.system && (
+                    <div className="sample-row">
+                      <div className="sample-label">System</div>
+                      <div className="sample-text">{s.system}</div>
+                    </div>
+                  )}
+                  <div className="sample-row">
+                    <div className="sample-label user">User</div>
+                    <div className="sample-text">{s.instruction}</div>
+                    <div className="sample-actions">
+                      <button className="sample-icon-btn" onClick={() => setEditing(s)} title="編集">✏️</button>
+                      <button className="sample-icon-btn delete" onClick={() => handleDelete(s.id)} title="削除">×</button>
+                    </div>
+                  </div>
+                  <div className="sample-row">
+                    <div className="sample-label assistant">Assistant</div>
+                    <div className="sample-text">{s.response}</div>
+                  </div>
+                </>
               )}
-              <div className="sample-row">
-                <div className="sample-label user">User</div>
-                <div className="sample-text">{s.instruction}</div>
-                <div className="sample-actions">
-                  <button className="sample-icon-btn" onClick={() => setEditing(s)} title="編集">✏️</button>
-                  <button className="sample-icon-btn delete" onClick={() => handleDelete(s.id)} title="削除">×</button>
-                </div>
-              </div>
-              <div className="sample-row">
-                <div className="sample-label assistant">Assistant</div>
-                <div className="sample-text">{s.response}</div>
-              </div>
             </div>
           ))}
         </div>
@@ -384,7 +412,9 @@ function ImportDialog({ onClose, onImport }) {
             </select>
             <span className="field-hint">
               <strong>CSV</strong>: 1行目をヘッダー。<code>instruction</code> と <code>response</code> 必須、<code>system</code> 任意<br />
-              <strong>JSONL</strong>: 各行 <code>{`{"instruction":"...","response":"...","system":"..."}`}</code>
+              <strong>JSONL (シングルターン)</strong>: <code>{`{"instruction":"...","response":"...","system":"..."}`}</code><br />
+              <strong>JSONL (マルチターン)</strong>: <code>{`{"messages":[{"role":"system","content":"..."},{"role":"user","content":"..."},{"role":"assistant","content":"..."},{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}`}</code><br />
+              <span style={{color: 'var(--accent)'}}>※ マルチターン形式は <code>messages</code> キーで判定。<code>system</code>/<code>user</code>/<code>assistant</code> ロールが交互に並ぶ会話形式。学習時に <code>apply_chat_template()</code> でモデルのチャットテンプレートに変換される。</span>
             </span>
           </div>
           <div className="field">
@@ -396,7 +426,7 @@ function ImportDialog({ onClose, onImport }) {
             <textarea className="textarea" rows="10" value={content} onChange={e => setContent(e.target.value)}
               placeholder={format === 'csv'
                 ? 'instruction,response,system\n"宮城県の県庁所在地は?","仙台市です。",""'
-                : '{"instruction":"宮城県の県庁所在地は?","response":"仙台市です。"}'} />
+                : '// シングルターン:\n{"instruction":"宮城県の県庁所在地は?","response":"仙台市です。"}\n// マルチターン:\n{"messages":[{"role":"user","content":"こんにちは"},{"role":"assistant","content":"こんにちは!何かお手伝いできることはありますか?"},{"role":"user","content":"宮城県の県庁所在地は?"},{"role":"assistant","content":"仙台市です。"}]}'} />
           </div>
         </div>
         <div className="modal-footer">
@@ -790,6 +820,9 @@ function GgufPathDisplay({ path, size }) {
       </div>
       <div className="gguf-path-hint">
         💡 <code>config.json</code> の <code>models[]</code> にこのパスを追加してチャットで使えます
+        <a className="gguf-path-edit-btn" href="/editconfig.html" target="_blank" rel="noopener noreferrer" title="config.json を編集">
+          ⚙️ config.json を編集
+        </a>
       </div>
     </div>
   );

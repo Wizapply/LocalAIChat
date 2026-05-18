@@ -1766,9 +1766,34 @@ app.post('/tuning/samples/import', requireAuth, jsonParser, (req, res) => {
   let added = 0;
   try {
     if (format === 'jsonl') {
-      const lines = content.split('\n').filter(l => l.trim());
+      const lines = content.split('\n').filter(l => l.trim() && !l.trim().startsWith('//'));
       for (const line of lines) {
-        const obj = JSON.parse(line);
+        let obj;
+        try { obj = JSON.parse(line); } catch { continue; }
+
+        // マルチターン形式: {"messages": [{"role": "user|assistant|system", "content": "..."}]}
+        if (Array.isArray(obj.messages) && obj.messages.length >= 2) {
+          // 検証: 各メッセージに role と content が必要
+          const valid = obj.messages.every(m =>
+            m && typeof m === 'object' &&
+            ['system', 'user', 'assistant'].includes(m.role) &&
+            typeof m.content === 'string'
+          );
+          if (!valid) continue;
+          // 最後の assistant メッセージがないと学習対象がないのでスキップ
+          const lastMsg = obj.messages[obj.messages.length - 1];
+          if (lastMsg.role !== 'assistant') continue;
+          samples.push({
+            id: generateSampleId(),
+            messages: obj.messages,  // マルチターン形式そのまま保存
+            tags: Array.isArray(obj.tags) ? obj.tags : [],
+            createdAt: Date.now(),
+          });
+          added++;
+          continue;
+        }
+
+        // シングルターン形式: {"instruction": "...", "response": "...", "system": "..."}
         if (!obj.instruction || !obj.response) continue;
         samples.push({
           id: generateSampleId(),
@@ -1841,12 +1866,22 @@ function parseCsvLine(line) {
 // エクスポート (JSONL形式でダウンロード)
 app.get('/tuning/samples/export', requireAuth, (req, res) => {
   const samples = loadAllSamples();
-  const jsonl = samples.map(s => JSON.stringify({
-    instruction: s.instruction,
-    response: s.response,
-    system: s.system || undefined,
-    tags: s.tags && s.tags.length > 0 ? s.tags : undefined,
-  })).join('\n');
+  const jsonl = samples.map(s => {
+    // マルチターン形式のサンプルはそのまま出力
+    if (Array.isArray(s.messages)) {
+      return JSON.stringify({
+        messages: s.messages,
+        tags: s.tags && s.tags.length > 0 ? s.tags : undefined,
+      });
+    }
+    // シングルターン形式
+    return JSON.stringify({
+      instruction: s.instruction,
+      response: s.response,
+      system: s.system || undefined,
+      tags: s.tags && s.tags.length > 0 ? s.tags : undefined,
+    });
+  }).join('\n');
   res.setHeader('Content-Type', 'application/x-ndjson');
   res.setHeader('Content-Disposition', 'attachment; filename="training_samples.jsonl"');
   res.send(jsonl);
@@ -1907,12 +1942,20 @@ app.post('/tuning/jobs', requireAuth, jsonParser, async (req, res) => {
   fs.mkdirSync(jobDir, { recursive: true });
 
   // 学習データを JSONL で保存
+  // - マルチターン形式 (s.messages あり) はそのまま messages を出力
+  // - シングルターン形式 (s.instruction, s.response) は instruction/response/system 形式
+  // tune_runner.py 側がどちらの形式も受け付ける (to_messages 関数)
   const dataPath = path.join(jobDir, 'train.jsonl');
-  fs.writeFileSync(dataPath, samples.map(s => JSON.stringify({
-    instruction: s.instruction,
-    response: s.response,
-    system: s.system || '',
-  })).join('\n'));
+  fs.writeFileSync(dataPath, samples.map(s => {
+    if (Array.isArray(s.messages)) {
+      return JSON.stringify({ messages: s.messages });
+    }
+    return JSON.stringify({
+      instruction: s.instruction,
+      response: s.response,
+      system: s.system || '',
+    });
+  }).join('\n'));
 
   // 設定保存
   const config = {
