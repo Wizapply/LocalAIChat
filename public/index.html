@@ -926,25 +926,26 @@ function App() {
   }
 
   // ─── チャット送信 ───
-  // 503 リトライ付き fetch ヘルパー
+  // 503 等のリトライ付き fetch ヘルパー
   // チャットモデルがロード中の場合、サーバーは503を返す前に待機するが
   // それでも初回ロード遅延等で503が来ることがある。最大5回リトライ。
+  // 500/502/504 などサーバー側の一時的エラーも対象（一時的なクラッシュやプロキシ問題の自動復帰）
   async function fetchWithRetry(url, options, maxRetries = 5) {
     let lastError = null;
     for (let i = 0; i <= maxRetries; i++) {
       const res = await fetch(url, options);
       if (res.ok) return res;
-      // 503以外（4xx/500等）は即エラー扱い
-      if (res.status !== 503) return res;
-      // 最後の試行なら結果を返す（呼び出し側でエラー処理）
-      if (i === maxRetries) return res;
-      // 503: モデル起動中なので少し待ってリトライ
+      // リトライ対象のステータスコード
+      const isRetryable = res.status === 503 || res.status === 500 || res.status === 502 || res.status === 504;
+      if (!isRetryable) return res;  // 4xx 等は即エラー扱い（呼び出し側で処理）
+      if (i === maxRetries) return res;  // 最後の試行
+      // 一時的エラー: 少し待ってリトライ
       let info = '';
       try {
         const errData = await res.clone().json();
         info = errData.error || '';
       } catch {}
-      console.log(`[fetch 503] ${info} → ${(i + 1) * 5}秒後にリトライ (${i + 1}/${maxRetries})`);
+      console.log(`[fetch ${res.status}] ${info} → 5秒後にリトライ (${i + 1}/${maxRetries})`);
       await new Promise(r => setTimeout(r, 5000));
       // AbortController がトリガーされてたら中断
       if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -1382,10 +1383,11 @@ function App() {
               }),
               signal: controller.signal,
             });
-            // 503の場合はモデル起動中なので少し待ってリトライ
-            if (toolRes.status === 503 && retryCount < MAX_RETRIES) {
+            // 503 = モデル起動中、500/502/504 = サーバー側一時エラー の場合はリトライ
+            const isRetryable = toolRes.status === 503 || toolRes.status === 500 || toolRes.status === 502 || toolRes.status === 504;
+            if (isRetryable && retryCount < MAX_RETRIES) {
               const errData = await toolRes.json().catch(() => ({}));
-              console.log(`[ツール判断 503] ${errData.error || ''} - 5秒後にリトライ (${retryCount + 1}/${MAX_RETRIES})`);
+              console.log(`[ツール判断 ${toolRes.status}] ${errData.error || ''} - 5秒後にリトライ (${retryCount + 1}/${MAX_RETRIES})`);
               await new Promise(r => setTimeout(r, 5000));
               retryCount++;
               continue;
@@ -1393,7 +1395,17 @@ function App() {
             break;
           }
 
-          if (!toolRes.ok) throw new Error(`API Error: ${toolRes.status}`);
+          if (!toolRes.ok) {
+            // エラー詳細をできるだけ取得してメッセージに含める
+            let errBody = '';
+            try {
+              const errData = await toolRes.json();
+              errBody = errData.error?.message || errData.error || JSON.stringify(errData).slice(0, 200);
+            } catch {
+              try { errBody = (await toolRes.text()).slice(0, 200); } catch {}
+            }
+            throw new Error(`API Error ${toolRes.status}${errBody ? ': ' + errBody : ''}`);
+          }
           const toolData = await toolRes.json();
           // OpenAI互換: { choices: [{ message: { role, content, tool_calls } }] }
           const choice = toolData.choices?.[0];
@@ -1932,7 +1944,36 @@ function App() {
     } catch (e) {
       if (e.name === 'AbortError') {
         // 停止ボタンで中断
+        // 最後のメッセージの agentStatus をクリア（途中で止めた場合）
+        setMessages(prev => {
+          if (prev.length === 0) return prev;
+          const copy = [...prev];
+          const last = copy[copy.length - 1];
+          if (last.role === 'assistant') {
+            copy[copy.length - 1] = { ...last, agentStatus: null };
+          }
+          return copy;
+        });
       } else {
+        // ツール判断中・ストリーミング中などにエラーが起きた場合、
+        // agentStatus が残ってしまうとUIが「ツール判断中...」のまま固まる。
+        // エラーメッセージをチャットに表示し、agentStatus は解除する。
+        setMessages(prev => {
+          if (prev.length === 0) return prev;
+          const copy = [...prev];
+          const last = copy[copy.length - 1];
+          if (last.role === 'assistant') {
+            copy[copy.length - 1] = {
+              ...last,
+              agentStatus: null,
+              // content が空ならエラー内容を入れる、既に何か出力されてれば追記
+              content: last.content
+                ? last.content + `\n\n⚠️ エラー: ${e.message}`
+                : `⚠️ エラーが発生しました: ${e.message}\n\nもう一度お試しいただくか、サーバーログを確認してください。`,
+            };
+          }
+          return copy;
+        });
         setError(e.message);
       }
     } finally {
