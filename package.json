@@ -1,7 +1,7 @@
 {
   "name": "opengeek-llm-chat",
-  "version": "1.0.0",
-  "description": "OpenGeekLLMChat - A geek-oriented browser-based chat app for local LLMs (llama.cpp backend)",
+  "version": "2.0.0",
+  "description": "OpenGeekLLMChat - A geek-oriented browser-based chat app for local LLMs (llama.cpp backend) with built-in fine-tuning and machine learning (ML)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -17,6 +17,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "duckdb": "^1.1.3",
     "express": "^4.21.0",
     "ws": "^8.17.0"
   }

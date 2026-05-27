@@ -1,7 +1,7 @@
 {
   "appName": "OpenGeekLLMChat",
-  "logoMain": "OpenGeek",
-  "logoSub": "LLM Chat",
+  "logoMain": "OpenGeekLLM",
+  "logoSub": "Chat",
   "welcomeMessage": "ローカルLLM(llama.cpp)を使ったプライベートなAIアシスタントです。ドキュメントをアップロードしてRAG質問応答を行うか、自由にチャットを開始できます。",
   "welcomeHints": [
     "このコードを解説して",
@@ -100,6 +100,10 @@
   "webSearch": true,
   "fileAccess": true,
   "imageGen": true,
+  "ml": {
+    "enabled": true,
+    "apiTokens": []
+  },
   "stableDiffusion": {
     "binPath": "/usr/local/bin/sd-server",
     "port": 7860,

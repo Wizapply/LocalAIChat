@@ -92,7 +92,7 @@ def main():
         sys.exit(1)
 
     log("=" * 60)
-    log("OpenGeek Fine-Tuning: LoRA SFT トレーニング")
+    log("OpenGeekLLM Fine-Tuning: LoRA SFT トレーニング")
     log("=" * 60)
     log(f"ジョブディレクトリ: {job_dir}")
 

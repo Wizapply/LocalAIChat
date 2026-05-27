@@ -1,0 +1,1692 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>OpenGeekLLM 機械学習</title>
+<link rel="icon" type="image/jpeg" href="/aiicon.jpg" />
+<link rel="stylesheet" href="/tuning-styles.css" />
+<link rel="stylesheet" href="/ml-styles.css" />
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+function App() {
+  const [authenticated, setAuthenticated] = useState(false);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [tables, setTables] = useState([]);
+  const [duckdbAvailable, setDuckdbAvailable] = useState(true);
+  const [duckdbHint, setDuckdbHint] = useState('');
+  const [activeTab, setActiveTab] = useState('tables');
+  const [selectedTable, setSelectedTable] = useState(null);
+  const [tableSchema, setTableSchema] = useState(null);
+  const [previewRows, setPreviewRows] = useState([]);
+  const [queryText, setQueryText] = useState('SELECT * FROM ');
+  const [queryResult, setQueryResult] = useState(null);
+  const [queryError, setQueryError] = useState('');
+  const [toast, setToast] = useState(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const [showApiImport, setShowApiImport] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const cfg = await (await fetch('/config')).json();
+        if (cfg.hasPassword) {
+          setAuthRequired(true);
+          if (cfg.authenticated) setAuthenticated(true);
+        } else {
+          setAuthenticated(true);
+        }
+      } catch {}
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!authenticated) return;
+    loadTables();
+  }, [authenticated]);
+
+  async function loadTables() {
+    try {
+      const data = await (await fetch('/ml/datasets')).json();
+      setTables(data.tables || []);
+      if (data.duckdbAvailable === false) {
+        setDuckdbAvailable(false);
+        setDuckdbHint(data.hint || '');
+      } else {
+        setDuckdbAvailable(true);
+      }
+    } catch (e) { showToast(`一覧取得失敗: ${e.message}`, 'error'); }
+  }
+
+  async function loadTableDetails(name) {
+    setSelectedTable(name);
+    setTableSchema(null);
+    setPreviewRows([]);
+    try {
+      const [schemaRes, previewRes] = await Promise.all([
+        fetch(`/ml/datasets/${encodeURIComponent(name)}/schema`).then(r => r.json()),
+        fetch(`/ml/datasets/${encodeURIComponent(name)}/preview?limit=50`).then(r => r.json()),
+      ]);
+      setTableSchema(schemaRes);
+      setPreviewRows(previewRes.rows || []);
+    } catch (e) { showToast(`詳細取得失敗: ${e.message}`, 'error'); }
+  }
+
+  async function runQuery() {
+    setQueryError('');
+    setQueryResult(null);
+    try {
+      const r = await fetch('/ml/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sql: queryText, limit: 1000 }),
+      });
+      const data = await r.json();
+      if (!r.ok) {
+        setQueryError(data.error || `HTTP ${r.status}`);
+        return;
+      }
+      setQueryResult(data);
+    } catch (e) { setQueryError(e.message); }
+  }
+
+  async function deleteTable(name) {
+    if (!confirm(`テーブル「${name}」を完全に削除します。本当によろしいですか？`)) return;
+    try {
+      const r = await fetch(`/ml/datasets/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      showToast(`テーブル「${name}」を削除しました`, 'success');
+      if (selectedTable === name) {
+        setSelectedTable(null);
+        setTableSchema(null);
+        setPreviewRows([]);
+      }
+      loadTables();
+    } catch (e) { showToast(`削除失敗: ${e.message}`, 'error'); }
+  }
+
+  function showToast(msg, type = 'info') {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 3000);
+  }
+
+  if (!authenticated) {
+    return <AuthGate authRequired={authRequired} onAuth={() => setAuthenticated(true)} />;
+  }
+
+  return (
+    <div className="app-layout">
+      <div className={`sidebar-overlay ${sidebarOpen ? 'open' : ''}`} onClick={() => setSidebarOpen(false)} />
+      <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
+        <button className="sidebar-close-btn" onClick={() => setSidebarOpen(false)} title="サイドバーを閉じる">×</button>
+        <div className="sidebar-header">
+          <div className="logo">
+            <div className="logo-icon" />
+            <div className="logo-text">
+              <div className="logo-main">OpenGeekLLM</div>
+              <div className="logo-sub">機械学習 (ML)</div>
+            </div>
+          </div>
+        </div>
+        <div className="nav-links">
+          <a className="nav-link" href="/">💬 チャット</a>
+          <a className="nav-link" href="/tuning.html">🧠 ファインチューニング</a>
+        </div>
+        <div className="sidebar-section">
+          <div className="section-title">統計</div>
+          <div className="stats-card">
+            <div className="stats-card-label">テーブル数</div>
+            <div className="stats-card-value accent">{tables.length}</div>
+          </div>
+          <div className="stats-card">
+            <div className="stats-card-label">合計行数</div>
+            <div className="stats-card-value">{tables.reduce((s, t) => s + (t.rowCount || 0), 0).toLocaleString()}</div>
+          </div>
+          {!duckdbAvailable && (
+            <div className="stats-card">
+              <div className="stats-card-label">⚠️ DuckDB 未導入</div>
+              <div className="stats-card-value orange" style={{fontSize: 11, lineHeight: 1.4}}>{duckdbHint}</div>
+            </div>
+          )}
+        </div>
+      </aside>
+
+      <main className="main">
+        <header className="main-header">
+          <button className="menu-btn" onClick={() => setSidebarOpen(!sidebarOpen)} title="メニュー">☰</button>
+          <div className="main-title">🤖 機械学習</div>
+        </header>
+        <div className="tab-bar">
+          <button className={`tab ${activeTab === 'tables' ? 'active' : ''}`} onClick={() => setActiveTab('tables')}>🗂️ データテーブル</button>
+          <button className={`tab ${activeTab === 'query' ? 'active' : ''}`} onClick={() => setActiveTab('query')}>🔍 SQL クエリ</button>
+          <button className={`tab ${activeTab === 'models' ? 'active' : ''}`} onClick={() => setActiveTab('models')}>🧠 モデル (学習)</button>
+          <button className={`tab ${activeTab === 'api' ? 'active' : ''}`} onClick={() => setActiveTab('api')}>📡 API (外部連携)</button>
+        </div>
+        <div className="main-body">
+          {!duckdbAvailable && (
+            <div className="warn-banner">
+              <strong>⚠️ DuckDB がインストールされていません</strong><br />
+              サーバー側で <code>npm install duckdb</code> を実行し、サービスを再起動してください。
+            </div>
+          )}
+
+          {activeTab === 'tables' && (
+            <>
+              <div className="toolbar">
+                <button className="btn primary" onClick={() => setShowImport(true)} disabled={!duckdbAvailable}>
+                  📥 CSVをインポート
+                </button>
+                <button className="btn" onClick={() => setShowApiImport(true)} disabled={!duckdbAvailable}>
+                  🌐 Web API をインポート
+                </button>
+                <button className="btn" onClick={loadTables}>🔄 更新</button>
+              </div>
+
+              <div className="ml-layout">
+                <div className="ml-table-list">
+                  {tables.length === 0 ? (
+                    <div className="empty-state">テーブルがありません。<br />「📥 CSVをインポート」から開始してください。</div>
+                  ) : tables.map(t => (
+                    <div
+                      key={t.name}
+                      className={`ml-table-item ${selectedTable === t.name ? 'selected' : ''}`}
+                      onClick={() => loadTableDetails(t.name)}
+                    >
+                      <div className="ml-table-name">🗂️ {t.name}</div>
+                      <div className="ml-table-meta">{t.rowCount.toLocaleString()} 行</div>
+                      {t.description && <div className="ml-table-desc">{t.description}</div>}
+                    </div>
+                  ))}
+                </div>
+
+                <div className="ml-table-detail">
+                  {selectedTable ? (
+                    <TableDetailView
+                      name={selectedTable}
+                      schema={tableSchema}
+                      preview={previewRows}
+                      onDelete={() => deleteTable(selectedTable)}
+                      onQueryHere={() => {
+                        setQueryText(`SELECT * FROM ${selectedTable} LIMIT 100`);
+                        setActiveTab('query');
+                      }}
+                    />
+                  ) : (
+                    <div className="empty-state">← 左のテーブルを選択してください</div>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+
+          {activeTab === 'query' && (
+            <QueryView
+              sql={queryText}
+              setSql={setQueryText}
+              result={queryResult}
+              error={queryError}
+              onRun={runQuery}
+              tables={tables}
+            />
+          )}
+          {activeTab === 'models' && (
+            <ModelsView tables={tables} showToast={showToast} />
+          )}
+          {activeTab === 'api' && (
+            <ApiUsageView showToast={showToast} />
+          )}
+        </div>
+      </main>
+
+      {showImport && <ImportDialog onClose={() => setShowImport(false)} onDone={() => { setShowImport(false); loadTables(); }} showToast={showToast} />}
+      {showApiImport && <ApiImportDialog onClose={() => setShowApiImport(false)} onDone={() => { setShowApiImport(false); loadTables(); }} showToast={showToast} />}
+      {toast && <div className={`toast ${toast.type}`}>{toast.msg}</div>}
+    </div>
+  );
+}
+
+// ─── テーブル詳細 ───
+function TableDetailView({ name, schema, preview, onDelete, onQueryHere }) {
+  if (!schema) return <div className="empty-state">読み込み中...</div>;
+  return (
+    <div className="ml-detail">
+      <div className="ml-detail-header">
+        <h2>🗂️ {name}</h2>
+        <div className="ml-detail-actions">
+          <button className="btn small" onClick={onQueryHere}>🔍 SQLで開く</button>
+          <button className="btn small danger" onClick={onDelete}>🗑️ 削除</button>
+        </div>
+      </div>
+
+      {schema.description && (
+        <div className="ml-section" style={{color: 'var(--text-secondary)', fontSize: 13}}>
+          📝 {schema.description}
+        </div>
+      )}
+
+      {schema.importedFrom === 'api' && schema.apiUrl && (
+        <div className="ml-section" style={{
+          background: 'var(--bg-tertiary)',
+          padding: 10,
+          borderRadius: 4,
+          fontSize: 12,
+          color: 'var(--text-secondary)',
+        }}>
+          <div style={{marginBottom: 4}}>
+            <strong style={{color: 'var(--accent)'}}>🌐 Web API インポート元</strong>
+          </div>
+          <div style={{fontFamily: 'var(--font-mono)', fontSize: 11, wordBreak: 'break-all'}}>
+            <span style={{color: 'var(--text-muted)'}}>{schema.apiMethod || 'GET'}</span> {schema.apiUrl}
+            {schema.apiJsonPath && <div>
+              <span style={{color: 'var(--text-muted)'}}>jsonPath:</span> {schema.apiJsonPath}
+            </div>}
+          </div>
+        </div>
+      )}
+
+      {schema.importedFrom === 'csv' && (
+        <div className="ml-section" style={{color: 'var(--text-muted)', fontSize: 11}}>
+          📥 CSVから取り込み
+        </div>
+      )}
+
+      <div className="ml-section">
+        <h3>スキーマ</h3>
+        <table className="ml-schema-table">
+          <thead>
+            <tr><th>カラム名</th><th>型</th><th>NULL許可</th></tr>
+          </thead>
+          <tbody>
+            {schema.columns.map(c => (
+              <tr key={c.name}>
+                <td className="mono">{c.name}</td>
+                <td>{c.type}</td>
+                <td>{c.nullable ? '◯' : '✕'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="ml-section">
+        <h3>プレビュー (先頭50行)</h3>
+        <ResultTable rows={preview} columns={schema.columns.map(c => c.name)} />
+      </div>
+    </div>
+  );
+}
+
+// ─── 結果テーブル ───
+function ResultTable({ rows, columns }) {
+  if (!rows || rows.length === 0) return <div className="empty-state">データがありません</div>;
+  const cols = columns || Object.keys(rows[0]);
+  return (
+    <div className="ml-result-wrap">
+      <table className="ml-result-table">
+        <thead>
+          <tr>{cols.map(c => <th key={c}>{c}</th>)}</tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={i}>
+              {cols.map(c => <td key={c} className={typeof r[c] === 'number' ? 'num' : ''}>{formatCell(r[c])}</td>)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function formatCell(v) {
+  if (v === null || v === undefined) return <span className="null">NULL</span>;
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (typeof v === 'number') return v.toLocaleString();
+  return String(v);
+}
+
+// ─── クエリビュー ───
+function QueryView({ sql, setSql, result, error, onRun, tables }) {
+  function insertTableName(name) {
+    setSql(prev => prev + name);
+  }
+  return (
+    <div className="ml-query-view">
+      <div className="toolbar">
+        <button className="btn primary" onClick={onRun}>▶ 実行 (Ctrl+Enter)</button>
+        <span className="hint">読み取り専用 (SELECT / WITH のみ、LIMIT無しは自動で1000行に制限)</span>
+      </div>
+      <textarea
+        className="ml-sql-input"
+        value={sql}
+        onChange={e => setSql(e.target.value)}
+        onKeyDown={e => {
+          if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); onRun(); }
+        }}
+        placeholder="SELECT * FROM your_table WHERE ..."
+        spellCheck="false"
+        rows={8}
+      />
+      {tables.length > 0 && (
+        <div className="ml-table-pills">
+          <span style={{color: 'var(--text-muted)', fontSize: 11}}>テーブル挿入:</span>
+          {tables.map(t => (
+            <button key={t.name} className="pill" onClick={() => insertTableName(t.name)}>{t.name}</button>
+          ))}
+        </div>
+      )}
+      {error && <div className="error-box">❌ {error}</div>}
+      {result && (
+        <div className="ml-section">
+          <h3>
+            結果: {result.count.toLocaleString()} 行 ({result.elapsedMs}ms)
+            {result.truncated && <span style={{color: 'var(--orange)', fontSize: 12, marginLeft: 8}}>※ LIMIT で制限されています</span>}
+          </h3>
+          <ResultTable rows={result.rows} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── 🧠 モデル管理ビュー ───
+function ModelsView({ tables, showToast }) {
+  const [models, setModels] = useState([]);
+  const [jobs, setJobs] = useState([]);
+  const [runningJobId, setRunningJobId] = useState(null);
+  const [editing, setEditing] = useState(null);  // 編集中のモデル定義
+  const [showCreate, setShowCreate] = useState(false);
+  const [selectedJob, setSelectedJob] = useState(null);
+  const [jobLog, setJobLog] = useState('');
+  const [predictModel, setPredictModel] = useState(null);  // 予測ダイアログ対象
+
+  useEffect(() => {
+    loadModels();
+    loadJobs();
+    const t = setInterval(() => { loadModels(); loadJobs(); }, 3000);
+    return () => clearInterval(t);
+  }, []);
+
+  // 選択中のジョブのログを定期取得
+  useEffect(() => {
+    if (!selectedJob) { setJobLog(''); return; }
+    const fetchLog = async () => {
+      try {
+        const r = await fetch(`/ml/jobs/${selectedJob}/log`);
+        const data = await r.json();
+        setJobLog(data.log || '');
+        // 実行中でなければポーリング停止のフラグを立てるため、コンポーネント側で判断
+      } catch {}
+    };
+    fetchLog();
+    const t = setInterval(fetchLog, 2000);
+    return () => clearInterval(t);
+  }, [selectedJob]);
+
+  async function loadModels() {
+    try {
+      const r = await fetch('/ml/models');
+      const data = await r.json();
+      setModels(data.models || []);
+      setRunningJobId(data.runningJob?.jobId || null);
+    } catch {}
+  }
+  async function loadJobs() {
+    try {
+      const r = await fetch('/ml/jobs');
+      const data = await r.json();
+      setJobs(data.jobs || []);
+    } catch {}
+  }
+
+  async function startJob(modelName) {
+    if (runningJobId) {
+      showToast('既に学習中のジョブがあります', 'error');
+      return;
+    }
+    try {
+      const r = await fetch('/ml/jobs/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modelName }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      showToast(`学習開始: ${modelName} (${data.jobId})`, 'success');
+      setSelectedJob(data.jobId);
+      loadJobs();
+    } catch (e) { showToast(`開始失敗: ${e.message}`, 'error'); }
+  }
+
+  async function stopJob(jobId) {
+    if (!confirm(`ジョブ ${jobId} を停止しますか?`)) return;
+    try {
+      const r = await fetch(`/ml/jobs/${jobId}/stop`, { method: 'POST' });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      showToast('停止要求しました', 'success');
+    } catch (e) { showToast(`停止失敗: ${e.message}`, 'error'); }
+  }
+
+  async function deleteModel(name) {
+    if (!confirm(`モデル「${name}」と学習成果物を完全に削除します。よろしいですか?`)) return;
+    try {
+      const r = await fetch(`/ml/models/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      showToast('削除しました', 'success');
+      loadModels();
+    } catch (e) { showToast(`削除失敗: ${e.message}`, 'error'); }
+  }
+
+  return (
+    <div className="ml-models-view">
+      <div className="toolbar">
+        <button className="btn primary" onClick={() => { setEditing(null); setShowCreate(true); }}>
+          ➕ モデルを新規作成
+        </button>
+        {runningJobId && (
+          <span style={{
+            background: 'var(--orange-dim)', color: 'var(--orange)',
+            padding: '4px 10px', borderRadius: 10, fontSize: 12,
+            fontFamily: 'var(--font-mono)',
+          }}>⚙️ 学習中: {runningJobId}</span>
+        )}
+      </div>
+
+      <div className="ml-layout">
+        {/* 左: モデル一覧 */}
+        <div className="ml-table-list">
+          {models.length === 0 ? (
+            <div className="empty-state">
+              モデルがありません。<br />「➕ モデルを新規作成」から開始してください。
+            </div>
+          ) : models.map(m => (
+            <div key={m.name} className="ml-table-item" style={{position: 'relative'}}>
+              <button
+                className="ml-model-delete-btn"
+                onClick={(e) => { e.stopPropagation(); deleteModel(m.name); }}
+                title={`モデル「${m.name}」を削除`}
+                aria-label="削除"
+              >×</button>
+              <div className="ml-table-name" style={{paddingRight: 24}}>
+                {m.task === 'regression' ? '📈' : m.task === 'classification' ? '🏷️' : '⏱️'} {m.name}
+                {m.trained && <span style={{
+                  marginLeft: 6, fontSize: 10,
+                  background: 'var(--accent-dim)', color: 'var(--accent)',
+                  padding: '1px 6px', borderRadius: 8,
+                }}>✓ 学習済</span>}
+              </div>
+              <div className="ml-table-meta">
+                {m.task} | テーブル: {m.tableName}
+              </div>
+              {m.description && <div className="ml-table-desc">{m.description}</div>}
+              {m.metrics && (
+                <div style={{fontSize: 10, color: 'var(--text-muted)', marginTop: 4, fontFamily: 'var(--font-mono)'}}>
+                  {m.metrics.finalAccuracy !== undefined && m.metrics.finalAccuracy !== null
+                    ? `acc: ${(m.metrics.finalAccuracy * 100).toFixed(1)}%`
+                    : m.metrics.finalMAE !== undefined && m.metrics.finalMAE !== null
+                    ? `MAE: ${m.metrics.finalMAE.toFixed(3)}`
+                    : `loss: ${m.metrics.finalTestLoss?.toFixed(4)}`}
+                  {' '}({m.metrics.trainSamples}/{m.metrics.testSamples} samples)
+                </div>
+              )}
+              <div style={{display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap'}}>
+                <button className="btn small primary"
+                  onClick={() => startJob(m.name)}
+                  disabled={!!runningJobId}>
+                  ▶ 学習開始
+                </button>
+                {m.trained && (
+                  <button className="btn small"
+                    onClick={() => setPredictModel(m)}
+                    disabled={!!runningJobId}
+                    title="学習済みモデルで予測を実行">
+                    🎯 予測
+                  </button>
+                )}
+                <button className="btn small" onClick={() => { setEditing(m); setShowCreate(true); }}>✏️ 編集</button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* 右: ジョブ履歴 + ログ */}
+        <div className="ml-table-detail">
+          <h3 style={{marginTop: 0}}>学習ジョブ履歴</h3>
+          {jobs.length === 0 ? (
+            <div className="empty-state">ジョブがまだありません</div>
+          ) : (
+            <div style={{maxHeight: 250, overflowY: 'auto', marginBottom: 16}}>
+              {jobs.map(j => (
+                <div
+                  key={j.id}
+                  className={`ml-table-item ${selectedJob === j.id ? 'selected' : ''}`}
+                  onClick={() => setSelectedJob(j.id)}
+                  style={{marginBottom: 6}}
+                >
+                  <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
+                    <span className="ml-table-name">
+                      {j.status === 'running' ? '⚙️' : j.status === 'completed' ? '✅' : '❌'} {j.modelName}
+                    </span>
+                    {j.status === 'running' && j.id === runningJobId && (
+                      <button className="btn small danger" onClick={(e) => { e.stopPropagation(); stopJob(j.id); }}>⏹ 停止</button>
+                    )}
+                  </div>
+                  <div className="ml-table-meta">
+                    {new Date(j.startedAt).toLocaleString('ja-JP')}
+                    {j.endedAt && ` • ${Math.round((j.endedAt - j.startedAt) / 1000)}秒`}
+                    {j.finalAccuracy !== undefined && j.finalAccuracy !== null && ` • acc=${(j.finalAccuracy * 100).toFixed(1)}%`}
+                    {j.finalMAE !== undefined && j.finalMAE !== null && ` • MAE=${j.finalMAE.toFixed(3)}`}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {selectedJob && (
+            <div>
+              <h3>ジョブログ: {selectedJob}</h3>
+              <pre style={{
+                background: 'var(--bg-tertiary)',
+                color: 'var(--text-primary)',
+                padding: 10,
+                borderRadius: 4,
+                fontSize: 11,
+                fontFamily: 'var(--font-mono)',
+                maxHeight: 400,
+                overflow: 'auto',
+                whiteSpace: 'pre-wrap',
+                margin: 0,
+              }}>{jobLog || '(ログを取得中...)'}</pre>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {showCreate && (
+        <ModelEditDialog
+          tables={tables}
+          initial={editing}
+          onClose={() => setShowCreate(false)}
+          onDone={() => { setShowCreate(false); loadModels(); }}
+          showToast={showToast}
+        />
+      )}
+      {predictModel && (
+        <PredictDialog
+          model={predictModel}
+          onClose={() => setPredictModel(null)}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── 🎯 予測ダイアログ ───
+function PredictDialog({ model, onClose, showToast }) {
+  // model.features: ["region", "product", "quantity"] 等
+  // 学習済みのため、テーブルからカテゴリ列の値候補を取得して select 化
+  const [values, setValues] = useState({});
+  const [columnInfo, setColumnInfo] = useState(null);  // {colName: {type, options?}}
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState('');
+
+  // 学習時の元テーブルから列情報を取得して、カテゴリ列なら DISTINCT 値を select 候補に
+  useEffect(() => {
+    if (!model) return;
+    (async () => {
+      try {
+        // テーブルのスキーマ
+        const schemaRes = await fetch(`/ml/datasets/${encodeURIComponent(model.tableName)}/schema`);
+        const schema = await schemaRes.json();
+        if (!schemaRes.ok) {
+          setError(`スキーマ取得失敗: ${schema.error || schemaRes.status}`);
+          return;
+        }
+        const info = {};
+        for (const col of model.features) {
+          const colSchema = schema.columns?.find(c => c.name === col);
+          if (!colSchema) {
+            info[col] = { type: 'unknown' };
+            continue;
+          }
+          const t = (colSchema.type || '').toUpperCase();
+          if (t.includes('DATE') || t.includes('TIME') || t.includes('TIMESTAMP')) {
+            info[col] = { type: 'datetime', rawType: colSchema.type };
+          } else if (t.includes('VARCHAR') || t.includes('TEXT') || t.includes('STRING') || t === 'BOOLEAN') {
+            // DISTINCT 値を取得 (上限 100件)
+            try {
+              const qRes = await fetch('/ml/query', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  sql: `SELECT DISTINCT "${col}" AS v FROM "${model.tableName}" WHERE "${col}" IS NOT NULL ORDER BY 1 LIMIT 100`,
+                }),
+              });
+              const qData = await qRes.json();
+              info[col] = {
+                type: 'category',
+                options: (qData.rows || []).map(r => r.v),
+                rawType: colSchema.type,
+              };
+            } catch {
+              info[col] = { type: 'category', options: [], rawType: colSchema.type };
+            }
+          } else {
+            info[col] = { type: 'numeric', rawType: colSchema.type };
+          }
+        }
+        setColumnInfo(info);
+      } catch (e) {
+        setError(`列情報取得失敗: ${e.message}`);
+      }
+    })();
+  }, [model]);
+
+  async function runPredict() {
+    // 入力検証
+    for (const col of model.features) {
+      if (values[col] === undefined || values[col] === '') {
+        showToast(`特徴量 "${col}" を入力してください`, 'error');
+        return;
+      }
+    }
+    setBusy(true);
+    setError('');
+    setResult(null);
+    try {
+      // 数値型は数値に変換、日時/カテゴリ/その他は文字列のまま
+      const features = {};
+      for (const col of model.features) {
+        const v = values[col];
+        if (columnInfo?.[col]?.type === 'numeric') {
+          const n = parseFloat(v);
+          if (isNaN(n)) throw new Error(`"${col}" は数値である必要があります: ${v}`);
+          features[col] = n;
+        } else {
+          // datetime / category / unknown はそのまま渡す (Python側で適切にパース)
+          features[col] = v;
+        }
+      }
+      const r = await fetch(`/ml/models/${encodeURIComponent(model.name)}/predict`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ features }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      setResult(data);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()} style={{maxWidth: 600}}>
+        <div className="modal-header">
+          <div className="modal-title">🎯 予測: {model.name}</div>
+          <button className="modal-close" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          <div style={{
+            background: 'var(--bg-tertiary)',
+            padding: 8, borderRadius: 4, marginBottom: 12, fontSize: 11,
+            color: 'var(--text-secondary)',
+          }}>
+            <div>{model.task === 'regression' ? '📈 回帰' : model.task === 'classification' ? '🏷️ 分類' : '⏱️ 時系列'}</div>
+            <div>テーブル: <code>{model.tableName}</code> / ターゲット: <code>{model.target}</code></div>
+          </div>
+
+          {!columnInfo ? (
+            <div className="empty-state">列情報を読み込み中...</div>
+          ) : (
+            <>
+              {model.features.map(col => {
+                const info = columnInfo[col] || {};
+                return (
+                  <div key={col} className="field">
+                    <label className="field-label">
+                      {col} <span style={{color: 'var(--text-muted)', fontWeight: 'normal', fontSize: 11}}>({info.rawType || info.type})</span>
+                    </label>
+                    {info.type === 'category' && info.options?.length > 0 ? (
+                      <select className="select" value={values[col] ?? ''} onChange={e => setValues({...values, [col]: e.target.value})}>
+                        <option value="">-- 選択 --</option>
+                        {info.options.map(o => <option key={o} value={o}>{o}</option>)}
+                      </select>
+                    ) : info.type === 'datetime' ? (
+                      <input className="input" type="date"
+                        value={values[col] ?? ''}
+                        onChange={e => setValues({...values, [col]: e.target.value})} />
+                    ) : info.type === 'numeric' ? (
+                      <input className="input" type="number" step="any"
+                        value={values[col] ?? ''}
+                        onChange={e => setValues({...values, [col]: e.target.value})}
+                        placeholder="数値" />
+                    ) : (
+                      <input className="input"
+                        value={values[col] ?? ''}
+                        onChange={e => setValues({...values, [col]: e.target.value})} />
+                    )}
+                  </div>
+                );
+              })}
+            </>
+          )}
+
+          {error && <div className="error-box" style={{marginTop: 10}}>❌ {error}</div>}
+
+          {result && (
+            <div style={{
+              marginTop: 14, padding: 12,
+              background: 'linear-gradient(135deg, rgba(46, 204, 113, 0.08), rgba(46, 204, 113, 0.03))',
+              border: '1px solid rgba(46, 204, 113, 0.3)',
+              borderRadius: 4,
+            }}>
+              <div style={{fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6}}>📊 予測結果</div>
+              {model.task === 'classification' ? (
+                <div>
+                  <div style={{fontSize: 24, color: 'var(--accent)', fontWeight: 600, marginBottom: 8}}>
+                    {result.predictions[0]}
+                  </div>
+                  <div style={{fontSize: 11, color: 'var(--text-muted)'}}>確率:</div>
+                  {result.classes.map((cls, i) => (
+                    <div key={cls} style={{
+                      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                      fontSize: 12, marginTop: 4, fontFamily: 'var(--font-mono)',
+                    }}>
+                      <span>{cls}</span>
+                      <span>
+                        {(result.probabilities[0][i] * 100).toFixed(1)}%
+                        <span style={{
+                          display: 'inline-block', width: 100, height: 6, marginLeft: 8,
+                          background: 'var(--bg-tertiary)', borderRadius: 3, overflow: 'hidden',
+                          verticalAlign: 'middle',
+                        }}>
+                          <span style={{
+                            display: 'block', height: '100%',
+                            width: `${result.probabilities[0][i] * 100}%`,
+                            background: cls === result.predictions[0] ? 'var(--accent)' : 'var(--text-muted)',
+                          }} />
+                        </span>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={{fontSize: 28, color: 'var(--accent)', fontWeight: 600, fontFamily: 'var(--font-mono)'}}>
+                  {result.predictions[0].toLocaleString(undefined, {maximumFractionDigits: 2})}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="modal-footer">
+          <button className="btn" onClick={onClose}>閉じる</button>
+          <button className="btn primary" onClick={runPredict} disabled={busy || !columnInfo}>
+            {busy ? '推論中...' : '🎯 予測実行'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── モデル定義 編集/作成ダイアログ ───
+function ModelEditDialog({ tables, initial, onClose, onDone, showToast }) {
+  const [name, setName] = useState(initial?.name || '');
+  const [task, setTask] = useState(initial?.task || 'regression');
+  const [tableName, setTableName] = useState(initial?.tableName || '');
+  const [tableSchema, setTableSchema] = useState(null);
+  const [features, setFeatures] = useState(initial?.features || []);
+  const [target, setTarget] = useState(initial?.target || '');
+  const [timeCol, setTimeCol] = useState(initial?.timeCol || '');
+  const [windowSize, setWindowSize] = useState(initial?.windowSize || 7);
+  const [epochs, setEpochs] = useState(initial?.epochs || 300);
+  const [learningRate, setLearningRate] = useState(initial?.learningRate || 0.001);
+  const [batchSize, setBatchSize] = useState(initial?.batchSize || 32);
+  const [hiddenSize, setHiddenSize] = useState(initial?.hiddenSize || 64);
+  const [numLayers, setNumLayers] = useState(initial?.numLayers || 2);
+  const [testRatio, setTestRatio] = useState(initial?.testRatio || 0.2);
+  const [description, setDescription] = useState(initial?.description || '');
+  const [busy, setBusy] = useState(false);
+
+  // 選択されたテーブルのスキーマを取得
+  useEffect(() => {
+    if (!tableName) { setTableSchema(null); return; }
+    (async () => {
+      try {
+        const r = await fetch(`/ml/datasets/${encodeURIComponent(tableName)}/schema`);
+        const data = await r.json();
+        if (r.ok) setTableSchema(data);
+      } catch {}
+    })();
+  }, [tableName]);
+
+  function toggleFeature(col) {
+    setFeatures(prev => prev.includes(col) ? prev.filter(c => c !== col) : [...prev, col]);
+  }
+
+  async function submit() {
+    if (!/^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(name)) {
+      showToast('モデル名は英字で始まり英数字とアンダースコアのみ', 'error');
+      return;
+    }
+    if (!tableName) { showToast('テーブルを選択してください', 'error'); return; }
+    if (features.length === 0) { showToast('特徴量を1つ以上選択', 'error'); return; }
+    if (!target) { showToast('ターゲットを選択', 'error'); return; }
+    if (task === 'timeseries' && !timeCol) { showToast('時系列タスクには時間カラムを選択', 'error'); return; }
+    if (features.includes(target)) { showToast('ターゲットは特徴量と重複できません', 'error'); return; }
+
+    setBusy(true);
+    try {
+      const r = await fetch('/ml/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name, task, tableName, features, target,
+          timeCol: task === 'timeseries' ? timeCol : null,
+          windowSize: task === 'timeseries' ? parseInt(windowSize) : null,
+          epochs: parseInt(epochs),
+          learningRate: parseFloat(learningRate),
+          batchSize: parseInt(batchSize),
+          hiddenSize: parseInt(hiddenSize),
+          numLayers: parseInt(numLayers),
+          testRatio: parseFloat(testRatio),
+          description,
+        }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      showToast(initial ? 'モデル定義を更新しました' : 'モデル定義を作成しました', 'success');
+      onDone();
+    } catch (e) { showToast(`失敗: ${e.message}`, 'error'); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()} style={{maxWidth: 720}}>
+        <div className="modal-header">
+          <div className="modal-title">{initial ? '✏️ モデル定義を編集' : '➕ モデルを新規作成'}</div>
+          <button className="modal-close" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12}}>
+            <div className="field">
+              <label className="field-label">モデル名</label>
+              <input className="input" value={name} onChange={e => setName(e.target.value)}
+                placeholder="例: sales_predictor" disabled={!!initial} />
+              <span className="field-hint">英字+英数字+アンダースコア、最大64文字。作成後は変更不可。</span>
+            </div>
+            <div className="field">
+              <label className="field-label">タスク種別</label>
+              <select className="select" value={task} onChange={e => setTask(e.target.value)}>
+                <option value="regression">📈 回帰 (数値予測, MLP)</option>
+                <option value="classification">🏷️ 分類 (カテゴリ予測, MLP)</option>
+                <option value="timeseries">⏱️ 時系列 (LSTM)</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="field">
+            <label className="field-label">データテーブル</label>
+            <select className="select" value={tableName} onChange={e => setTableName(e.target.value)}>
+              <option value="">-- 選択 --</option>
+              {tables.map(t => (
+                <option key={t.name} value={t.name}>{t.name} ({t.rowCount.toLocaleString()} 行)</option>
+              ))}
+            </select>
+          </div>
+
+          {tableSchema && (
+            <>
+              <div className="field">
+                <label className="field-label">特徴量カラム (複数選択)</label>
+                <div style={{
+                  border: '1px solid var(--border)', borderRadius: 4, padding: 8,
+                  background: 'var(--bg-tertiary)', maxHeight: 150, overflowY: 'auto',
+                }}>
+                  {tableSchema.columns.map(c => {
+                    const isDatetime = /date|time|timestamp/i.test(c.type);
+                    const isDisabled = c.name === target;
+                    return (
+                      <label key={c.name} style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 4,
+                        marginRight: 12, marginBottom: 4, fontSize: 12,
+                        cursor: isDisabled ? 'not-allowed' : 'pointer',
+                      }}
+                      title={isDatetime
+                        ? '日時列は自動で年/月/日/曜日/曜日種別の6特徴量に分解されます (推論時も日付文字列を渡せばOK)'
+                        : ''}>
+                        <input type="checkbox"
+                          checked={features.includes(c.name)}
+                          onChange={() => toggleFeature(c.name)}
+                          disabled={isDisabled}
+                        />
+                        <code style={{
+                          color: c.name === target ? 'var(--text-muted)'
+                              : isDatetime ? 'var(--accent)' : 'var(--accent)'
+                        }}>{c.name}</code>
+                        <span style={{color: 'var(--text-muted)', fontSize: 10}}>({c.type})</span>
+                        {isDatetime && (
+                          <span style={{color: 'var(--accent)', fontSize: 9}} title="自動分解">📅 自動分解</span>
+                        )}
+                      </label>
+                    );
+                  })}
+                </div>
+                <span className="field-hint">
+                  数値列は自動 StandardScale、文字列列は自動 LabelEncoder されます。<br />
+                  <span style={{color: 'var(--accent)'}}>📅 日時列を選ぶと自動で year/month/day/dayofweek/dayofyear/is_weekend の6特徴に分解されます (季節性や曜日効果を学習)。</span>
+                </span>
+              </div>
+
+              <div style={{display: 'grid', gridTemplateColumns: task === 'timeseries' ? '1fr 1fr' : '1fr', gap: 12}}>
+                <div className="field">
+                  <label className="field-label">ターゲット (予測対象)</label>
+                  <select className="select" value={target} onChange={e => setTarget(e.target.value)}>
+                    <option value="">-- 選択 --</option>
+                    {tableSchema.columns.filter(c => !features.includes(c.name)).map(c => (
+                      <option key={c.name} value={c.name}>{c.name} ({c.type})</option>
+                    ))}
+                  </select>
+                </div>
+                {task === 'timeseries' && (
+                  <div className="field">
+                    <label className="field-label">時間カラム (ソート用)</label>
+                    <select className="select" value={timeCol} onChange={e => setTimeCol(e.target.value)}>
+                      <option value="">-- 選択 --</option>
+                      {tableSchema.columns.map(c => (
+                        <option key={c.name} value={c.name}>{c.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </div>
+
+              {task === 'timeseries' && (
+                <div className="field">
+                  <label className="field-label">ウィンドウサイズ (過去N点を入力)</label>
+                  <input className="input" type="number" min="2" max="200" value={windowSize}
+                    onChange={e => setWindowSize(e.target.value)} />
+                </div>
+              )}
+            </>
+          )}
+
+          <div className="field">
+            <label className="field-label">説明 (任意)</label>
+            <input className="input" value={description} onChange={e => setDescription(e.target.value)}
+              placeholder="例: 月別売上から翌月を予測するモデル" />
+          </div>
+
+          <details style={{marginTop: 8}}>
+            <summary style={{cursor: 'pointer', fontSize: 13, color: 'var(--text-secondary)', userSelect: 'none'}}>
+              ⚙️ 学習ハイパーパラメータ (詳細)
+            </summary>
+            <div style={{
+              display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginTop: 12,
+            }}>
+              <div className="field">
+                <label className="field-label">エポック数</label>
+                <input className="input" type="number" min="1" max="10000" value={epochs}
+                  onChange={e => setEpochs(e.target.value)} />
+              </div>
+              <div className="field">
+                <label className="field-label">学習率</label>
+                <input className="input" type="number" step="0.0001" min="0.00001" max="1" value={learningRate}
+                  onChange={e => setLearningRate(e.target.value)} />
+              </div>
+              <div className="field">
+                <label className="field-label">バッチサイズ</label>
+                <input className="input" type="number" min="1" max="2048" value={batchSize}
+                  onChange={e => setBatchSize(e.target.value)} />
+              </div>
+              <div className="field">
+                <label className="field-label">隠れ層サイズ</label>
+                <input className="input" type="number" min="2" max="1024" value={hiddenSize}
+                  onChange={e => setHiddenSize(e.target.value)} />
+              </div>
+              <div className="field">
+                <label className="field-label">層数</label>
+                <input className="input" type="number" min="1" max="10" value={numLayers}
+                  onChange={e => setNumLayers(e.target.value)} />
+              </div>
+              <div className="field">
+                <label className="field-label">テスト分割比</label>
+                <input className="input" type="number" step="0.05" min="0.05" max="0.5" value={testRatio}
+                  onChange={e => setTestRatio(e.target.value)} />
+              </div>
+            </div>
+          </details>
+        </div>
+        <div className="modal-footer">
+          <button className="btn" onClick={onClose}>キャンセル</button>
+          <button className="btn primary" onClick={submit} disabled={busy}>
+            {busy ? '保存中...' : (initial ? '更新' : '作成')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── API 使い方ビュー (外部連携) ───
+function ApiUsageView({ showToast }) {
+  const [tokens, setTokens] = useState([]);
+  const [generatedToken, setGeneratedToken] = useState('');
+  const [exampleHost, setExampleHost] = useState(window.location.origin);
+
+  useEffect(() => {
+    loadTokens();
+  }, []);
+
+  async function loadTokens() {
+    try {
+      const r = await fetch('/api-tokens');
+      const data = await r.json();
+      setTokens(data.tokens || []);
+    } catch (e) { showToast(`トークン一覧取得失敗: ${e.message}`, 'error'); }
+  }
+
+  async function generateNewToken() {
+    try {
+      const r = await fetch('/api-tokens/generate');
+      const data = await r.json();
+      setGeneratedToken(data.token);
+    } catch (e) { showToast(`生成失敗: ${e.message}`, 'error'); }
+  }
+
+  function copyText(text) {
+    navigator.clipboard.writeText(text).then(() => showToast('クリップボードにコピーしました', 'success')).catch(() => {});
+  }
+
+  // サンプルコードで使うトークン: 生成済みなら新規、なければプレースホルダー
+  const sampleToken = generatedToken || (tokens[0]?.tokenPreview ? `<token-from-config>` : `<your-token-here>`);
+
+  const pythonExample = `import requests
+
+BASE = "${exampleHost}"
+TOKEN = "${sampleToken}"
+HEADERS = {"Authorization": f"Bearer {TOKEN}"}
+
+# 1. テーブル一覧
+r = requests.get(f"{BASE}/ml/datasets", headers=HEADERS, verify=False)
+print(r.json())
+
+# 2. SQLクエリ (読み取り専用)
+r = requests.post(f"{BASE}/ml/query", headers=HEADERS, verify=False, json={
+    "sql": "SELECT region, SUM(sales) FROM sales_test GROUP BY region"
+})
+print(r.json())
+
+# 3. センサーデータを1行追記 (テーブルが無ければ自動作成)
+r = requests.post(f"{BASE}/ml/datasets/append", headers=HEADERS, verify=False, json={
+    "tableName": "sensor_data",
+    "rows": [{"timestamp": "2026-05-26 14:00:00", "temp": 23.5, "humidity": 60}],
+    "createIfMissing": True
+})
+print(r.json())
+
+# 4. 複数行を一気に追記 (バッチ)
+r = requests.post(f"{BASE}/ml/datasets/append", headers=HEADERS, verify=False, json={
+    "tableName": "sensor_data",
+    "rows": [
+        {"timestamp": "2026-05-26 14:01:00", "temp": 23.6, "humidity": 61},
+        {"timestamp": "2026-05-26 14:02:00", "temp": 23.7, "humidity": 60},
+    ]
+})
+
+# 5. CSVを丸ごとアップロード
+with open("data.csv") as f:
+    r = requests.post(f"{BASE}/ml/datasets/import/csv", headers=HEADERS, verify=False, json={
+        "tableName": "my_data",
+        "csvContent": f.read(),
+        "mode": "replace",
+        "description": "Pythonスクリプトからアップロード"
+    })
+
+# 6. 学習済みモデルで推論
+r = requests.post(f"{BASE}/ml/models/sales_yosoku/predict", headers=HEADERS, verify=False, json={
+    "features": {"region": "Tokyo", "product": "ProductA", "quantity": 5}
+})
+print(r.json())  # → {"predictions": [15234.56], "task": "regression", ...}
+
+# 7. バッチ推論 (複数件まとめて)
+r = requests.post(f"{BASE}/ml/models/sales_yosoku/predict", headers=HEADERS, verify=False, json={
+    "features": [
+        {"region": "Tokyo", "product": "ProductA", "quantity": 5},
+        {"region": "Osaka", "product": "ProductB", "quantity": 3},
+        {"region": "Nagoya", "product": "ProductC", "quantity": 10},
+    ]
+})
+print(r.json())  # → {"predictions": [15234.56, 8765.43, 23456.78], "count": 3, ...}`;
+
+  const curlExample = `# テーブル一覧
+curl -H "Authorization: Bearer ${sampleToken}" \\
+  "${exampleHost}/ml/datasets"
+
+# SQL実行
+curl -H "Authorization: Bearer ${sampleToken}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"sql":"SELECT * FROM sales_test LIMIT 5"}' \\
+  "${exampleHost}/ml/query"
+
+# センサーデータ追記
+curl -H "Authorization: Bearer ${sampleToken}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"tableName":"sensor_data","rows":[{"ts":"2026-05-26T14:00","temp":23.5}],"createIfMissing":true}' \\
+  "${exampleHost}/ml/datasets/append"`;
+
+  return (
+    <div className="api-usage-view">
+      <div className="ml-section">
+        <h3>📡 外部APIとして使う</h3>
+        <p style={{color: 'var(--text-secondary)', fontSize: 13, lineHeight: 1.6}}>
+          Python スクリプトや他のアプリから ML データテーブルに直接アクセスできます。<br />
+          認証は <code>Authorization: Bearer &lt;token&gt;</code> ヘッダー方式。
+          センサーログ、IoTデータ収集、定期的なETL処理などに活用してください。
+        </p>
+      </div>
+
+      <div className="ml-section">
+        <h3>🔑 APIトークンを生成</h3>
+        <div className="toolbar">
+          <button className="btn primary" onClick={generateNewToken}>🎲 新規トークン生成</button>
+        </div>
+        {generatedToken && (
+          <div style={{
+            background: 'var(--bg-tertiary)',
+            padding: 12,
+            borderRadius: 4,
+            marginTop: 8,
+            fontFamily: 'var(--font-mono)',
+            fontSize: 12,
+            wordBreak: 'break-all',
+          }}>
+            <div style={{color: 'var(--accent)', marginBottom: 6, fontFamily: 'inherit', fontSize: 11}}>
+              ✓ 生成されました。下記サンプルにもこのトークンが反映されています:
+            </div>
+            <div style={{display: 'flex', alignItems: 'center', gap: 8}}>
+              <code style={{flex: 1}}>{generatedToken}</code>
+              <button className="btn small" onClick={() => copyText(generatedToken)}>📋 コピー</button>
+            </div>
+            <div style={{color: 'var(--orange)', fontSize: 11, marginTop: 8, fontFamily: 'inherit', lineHeight: 1.5}}>
+              ⚠️ このトークンを実際に使うには、<code>config.json</code> の <code>ml.apiTokens[]</code> に登録する必要があります:<br />
+              <pre style={{margin: '6px 0 0', padding: 8, background: 'var(--bg-secondary)', borderRadius: 3, fontSize: 11, color: 'var(--text-primary)'}}>
+{`"ml": {
+  "enabled": true,
+  "apiTokens": [
+    {
+      "name": "python-scripts",
+      "token": "${generatedToken}",
+      "permissions": ["ml:read", "ml:write"]
+    }
+  ]
+}`}
+              </pre>
+              <div style={{marginTop: 6}}>
+                <a href="/editconfig.html" target="_blank" rel="noopener noreferrer" style={{color: 'var(--accent)'}}>
+                  ⚙️ editconfig.html を開いて編集する
+                </a>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="ml-section">
+        <h3>📋 登録済みトークン</h3>
+        {tokens.length === 0 ? (
+          <div className="empty-state" style={{padding: 20}}>
+            トークンが登録されていません。<br />
+            上で「新規トークン生成」してから config.json に登録してください。
+          </div>
+        ) : (
+          <table className="ml-schema-table">
+            <thead><tr><th>名前</th><th>権限</th><th>トークン (一部)</th></tr></thead>
+            <tbody>
+              {tokens.map((t, i) => (
+                <tr key={i}>
+                  <td>{t.name || <span style={{color: 'var(--text-muted)'}}>(無名)</span>}</td>
+                  <td style={{fontFamily: 'var(--font-mono)', fontSize: 11}}>
+                    {(t.permissions || []).map(p => (
+                      <span key={p} style={{
+                        background: p.includes('write') ? 'var(--orange-dim)' : 'var(--accent-dim)',
+                        color: p.includes('write') ? 'var(--orange)' : 'var(--accent)',
+                        padding: '2px 6px',
+                        borderRadius: 3,
+                        marginRight: 4,
+                        fontSize: 10,
+                      }}>{p}</span>
+                    ))}
+                  </td>
+                  <td className="mono">{t.tokenPreview}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="ml-section">
+        <h3>🐍 Python サンプルコード</h3>
+        <div style={{position: 'relative'}}>
+          <button
+            className="btn small"
+            style={{position: 'absolute', top: 6, right: 6, zIndex: 1}}
+            onClick={() => copyText(pythonExample)}
+          >📋 コピー</button>
+          <pre style={{
+            background: 'var(--bg-tertiary)',
+            padding: 12,
+            paddingTop: 36,
+            borderRadius: 4,
+            fontSize: 11,
+            overflow: 'auto',
+            margin: 0,
+            maxHeight: 400,
+            color: 'var(--text-primary)',
+            fontFamily: 'var(--font-mono)',
+          }}>{pythonExample}</pre>
+        </div>
+        <div className="field-hint" style={{marginTop: 6}}>
+          ※ HTTPS自己署名証明書を使っている場合は <code>verify=False</code> 必須 (本番では正規証明書推奨)。
+        </div>
+      </div>
+
+      <div className="ml-section">
+        <h3>🖥️ curl サンプル</h3>
+        <div style={{position: 'relative'}}>
+          <button
+            className="btn small"
+            style={{position: 'absolute', top: 6, right: 6, zIndex: 1}}
+            onClick={() => copyText(curlExample)}
+          >📋 コピー</button>
+          <pre style={{
+            background: 'var(--bg-tertiary)',
+            padding: 12,
+            paddingTop: 36,
+            borderRadius: 4,
+            fontSize: 11,
+            overflow: 'auto',
+            margin: 0,
+            maxHeight: 300,
+            color: 'var(--text-primary)',
+            fontFamily: 'var(--font-mono)',
+          }}>{curlExample}</pre>
+        </div>
+      </div>
+
+      <div className="ml-section">
+        <h3>📖 エンドポイント一覧</h3>
+        <table className="ml-schema-table">
+          <thead><tr><th>メソッド</th><th>パス</th><th>権限</th><th>説明</th></tr></thead>
+          <tbody>
+            <tr><td className="mono">GET</td><td className="mono">/ml/datasets</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>テーブル一覧</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/datasets/:name/schema</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>カラム情報</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/datasets/:name/preview</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>先頭N行</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/query</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>SELECT/WITH 実行</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/datasets/append</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>1行〜複数行追記、新規作成可</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/datasets/import/csv</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>CSVデータ取り込み</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/datasets/import/api</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>Web APIから取り込み</td></tr>
+            <tr><td className="mono">PUT</td><td className="mono">/ml/datasets/:name</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>説明文更新</td></tr>
+            <tr><td className="mono">DELETE</td><td className="mono">/ml/datasets/:name</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>テーブル削除</td></tr>
+            <tr><td colSpan={4} style={{textAlign: 'center', background: 'var(--bg-tertiary)', padding: '4px', fontSize: 11}}>— 🧠 モデル学習 (Phase 3) —</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/models</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>モデル一覧</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/models</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>モデル定義作成/更新</td></tr>
+            <tr><td className="mono">DELETE</td><td className="mono">/ml/models/:name</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>モデル削除</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/models/:name/metrics</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>学習メトリクス取得</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/jobs</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>学習ジョブ履歴</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/jobs/start</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>学習ジョブ開始</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/jobs/:id/stop</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>学習ジョブ停止</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/jobs/:id/log</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>学習ログ取得</td></tr>
+            <tr><td colSpan={4} style={{textAlign: 'center', background: 'var(--bg-tertiary)', padding: '4px', fontSize: 11}}>— 🎯 推論 (Phase 4) —</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/models/:name/config</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>モデル設定取得</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/models/:name/predict</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>推論実行 (単発/バッチ)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── インポートダイアログ ───
+function ImportDialog({ onClose, onDone, showToast }) {
+  const [tableName, setTableName] = useState('');
+  const [csvContent, setCsvContent] = useState('');
+  const [mode, setMode] = useState('replace');
+  const [description, setDescription] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  function handleFile(e) {
+    const f = e.target.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => setCsvContent(String(reader.result));
+    reader.readAsText(f, 'utf-8');
+    // ファイル名から拡張子を除去してテーブル名候補に
+    if (!tableName) {
+      const base = f.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_]/g, '_');
+      setTableName(base.match(/^[a-zA-Z]/) ? base : 'tbl_' + base);
+    }
+  }
+
+  async function submit() {
+    if (!/^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(tableName)) {
+      showToast('テーブル名は英字で始まり、英数字とアンダースコアのみ', 'error');
+      return;
+    }
+    if (!csvContent.trim()) {
+      showToast('CSVデータが空です', 'error');
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await fetch('/ml/datasets/import/csv', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tableName, csvContent, mode, description }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      showToast(`インポート完了: ${data.rowCount.toLocaleString()} 行`, 'success');
+      onDone();
+    } catch (e) {
+      showToast(`インポート失敗: ${e.message}`, 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <div className="modal-title">📥 CSVをインポート</div>
+          <button className="modal-close" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          <div className="field">
+            <label className="field-label">テーブル名</label>
+            <input className="input" value={tableName} onChange={e => setTableName(e.target.value)} placeholder="例: sales_2024" />
+            <span className="field-hint">英字で始まり、英数字とアンダースコアのみ。最大64文字。</span>
+          </div>
+          <div className="field">
+            <label className="field-label">CSVファイル</label>
+            <input className="input" type="file" accept=".csv,.tsv,.txt" onChange={handleFile} />
+          </div>
+          <div className="field">
+            <label className="field-label">または直接貼り付け</label>
+            <textarea className="textarea" rows={8} value={csvContent} onChange={e => setCsvContent(e.target.value)}
+              placeholder="date,sales,region&#10;2024-01-01,12345,Tokyo&#10;..." />
+            <span className="field-hint">1行目をヘッダー、列の型はDuckDBが自動推定します。</span>
+          </div>
+          <div className="field">
+            <label className="field-label">テーブル説明 (任意)</label>
+            <input className="input" value={description} onChange={e => setDescription(e.target.value)} placeholder="例: 2024年の店舗別売上データ" />
+            <span className="field-hint">LLMがこの説明を参考に適切なクエリを組み立てます。</span>
+          </div>
+          <div className="field">
+            <label className="field-label">モード</label>
+            <select className="select" value={mode} onChange={e => setMode(e.target.value)}>
+              <option value="replace">置換 (既存テーブルを削除して再作成)</option>
+              <option value="append">追加 (既存テーブルに追記、列構造が一致必須)</option>
+            </select>
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button className="btn" onClick={onClose}>キャンセル</button>
+          <button className="btn primary" onClick={submit} disabled={busy}>
+            {busy ? 'インポート中...' : 'インポート実行'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Web API インポートダイアログ ───
+function ApiImportDialog({ onClose, onDone, showToast }) {
+  const [tableName, setTableName] = useState('');
+  const [url, setUrl] = useState('');
+  const [method, setMethod] = useState('GET');
+  const [headersText, setHeadersText] = useState('');  // 1行=Key: Value 形式
+  const [reqBody, setReqBody] = useState('');           // POST/PUT時
+  const [jsonPath, setJsonPath] = useState('');         // 配列の位置
+  const [description, setDescription] = useState('');
+  const [mode, setMode] = useState('replace');
+  const [allowPrivate, setAllowPrivate] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [preview, setPreview] = useState(null);          // インポート後にプレビュー表示
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // Key: Value 形式のヘッダーテキストを object に変換
+  function parseHeaders(text) {
+    const out = {};
+    for (const line of (text || '').split('\n')) {
+      const m = line.match(/^\s*([^:]+):\s*(.+?)\s*$/);
+      if (m) out[m[1].trim()] = m[2].trim();
+    }
+    return out;
+  }
+
+  async function submit() {
+    if (!/^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(tableName)) {
+      showToast('テーブル名は英字で始まり、英数字とアンダースコアのみ', 'error');
+      return;
+    }
+    if (!/^https?:\/\//i.test(url)) {
+      showToast('URL は http:// または https:// で始める必要があります', 'error');
+      return;
+    }
+    setBusy(true);
+    setPreview(null);
+    try {
+      const payload = {
+        tableName, url, method,
+        headers: parseHeaders(headersText),
+        jsonPath: jsonPath.trim(),
+        mode,
+        description,
+        allowPrivateNetwork: allowPrivate,
+      };
+      if (method !== 'GET' && reqBody.trim()) {
+        // JSON として送信を試みる
+        try { payload.body = JSON.parse(reqBody); }
+        catch { payload.body = reqBody; }  // 文字列のまま
+      }
+      const r = await fetch('/ml/datasets/import/api', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      showToast(`インポート完了: ${data.rowCount.toLocaleString()} 行`, 'success');
+      setPreview(data.sampleRow);
+      // 自動で閉じずに、サンプル行を見せてからユーザーが閉じる
+      setTimeout(() => onDone(), 800);
+    } catch (e) {
+      showToast(`インポート失敗: ${e.message}`, 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()} style={{maxWidth: 720}}>
+        <div className="modal-header">
+          <div className="modal-title">🌐 Web API をインポート</div>
+          <button className="modal-close" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          <div className="field">
+            <label className="field-label">テーブル名</label>
+            <input className="input" value={tableName} onChange={e => setTableName(e.target.value)} placeholder="例: jpy_rates" />
+            <span className="field-hint">英字で始まり、英数字とアンダースコアのみ。最大64文字。</span>
+          </div>
+          <div className="field">
+            <label className="field-label">URL</label>
+            <input className="input" value={url} onChange={e => setUrl(e.target.value)}
+              placeholder="https://api.example.com/data" />
+            <span className="field-hint">
+              http:// または https:// で始まる URL。応答が JSON である必要があります。<br />
+              ローカル/内部IP宛は SSRF 対策で拒否されます (許可するには下の「内部ネットワーク許可」をON)。
+            </span>
+          </div>
+          <div className="field">
+            <label className="field-label">JSON Path (任意)</label>
+            <input className="input" value={jsonPath} onChange={e => setJsonPath(e.target.value)}
+              placeholder="例: data.items / results / leave empty" />
+            <span className="field-hint">
+              応答内のどこから配列を取り出すかをドット記法で指定。<br />
+              空欄なら応答ルート自体を配列とみなします。<br />
+              例: <code>data.items</code>、<code>results[0].rows</code>、<code>response.body.list</code>
+            </span>
+          </div>
+          <div className="field">
+            <label className="field-label">テーブル説明 (任意)</label>
+            <input className="input" value={description} onChange={e => setDescription(e.target.value)}
+              placeholder="例: JPY為替レート (日次)" />
+          </div>
+          <div className="field">
+            <label className="field-label">モード</label>
+            <select className="select" value={mode} onChange={e => setMode(e.target.value)}>
+              <option value="replace">置換 (既存テーブルを削除して再作成)</option>
+              <option value="append">追加 (既存テーブルに追記、列構造が一致必須)</option>
+            </select>
+          </div>
+
+          <div style={{marginTop: 12, marginBottom: 12}}>
+            <button className="btn small" onClick={() => setShowAdvanced(!showAdvanced)}>
+              {showAdvanced ? '▼' : '▶'} 詳細オプション (HTTPメソッド、ヘッダー、リクエストボディ)
+            </button>
+          </div>
+
+          {showAdvanced && (
+            <>
+              <div className="field">
+                <label className="field-label">HTTPメソッド</label>
+                <select className="select" value={method} onChange={e => setMethod(e.target.value)}>
+                  <option value="GET">GET</option>
+                  <option value="POST">POST</option>
+                  <option value="PUT">PUT</option>
+                </select>
+              </div>
+              <div className="field">
+                <label className="field-label">ヘッダー (1行1個、Key: Value 形式)</label>
+                <textarea className="textarea" rows={4} value={headersText} onChange={e => setHeadersText(e.target.value)}
+                  placeholder={'Authorization: Bearer xxxxxx\nX-API-Key: xxxxxx'} />
+                <span className="field-hint">機密情報を含むヘッダーはサーバーログにも meta.json にも保存されません。</span>
+              </div>
+              {method !== 'GET' && (
+                <div className="field">
+                  <label className="field-label">リクエストボディ (POST/PUT)</label>
+                  <textarea className="textarea" rows={6} value={reqBody} onChange={e => setReqBody(e.target.value)}
+                    placeholder='{"query": "...", "limit": 100}' />
+                  <span className="field-hint">JSON として送信されます。Content-Type は自動で application/json になります。</span>
+                </div>
+              )}
+              <div className="field">
+                <label style={{display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer'}}>
+                  <input type="checkbox" checked={allowPrivate} onChange={e => setAllowPrivate(e.target.checked)} />
+                  <span style={{fontSize: 13}}>内部ネットワーク許可 (localhost / 10.x / 192.168.x 等への接続を許可)</span>
+                </label>
+                <span className="field-hint" style={{color: 'var(--orange)'}}>
+                  ⚠️ 社内 API などで必要な時のみ有効化してください (SSRF 対策が無効化されます)。
+                </span>
+              </div>
+            </>
+          )}
+
+          {preview && (
+            <div className="field">
+              <label className="field-label">サンプル行 (取り込まれたデータの1行目)</label>
+              <pre style={{
+                background: 'var(--bg-tertiary)',
+                padding: 10,
+                borderRadius: 4,
+                fontSize: 11,
+                overflow: 'auto',
+                maxHeight: 200,
+                margin: 0,
+              }}>{JSON.stringify(preview, null, 2)}</pre>
+            </div>
+          )}
+        </div>
+        <div className="modal-footer">
+          <button className="btn" onClick={onClose}>キャンセル</button>
+          <button className="btn primary" onClick={submit} disabled={busy}>
+            {busy ? '取得中...' : 'インポート実行'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── 認証ゲート (tuning.html と同じ構造・クラス名) ───
+function AuthGate({ authRequired, onAuth }) {
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  async function handleLogin() {
+    setBusy(true);
+    setError('');
+    try {
+      const r = await fetch('/auth', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        setError(d.error || '認証失敗');
+        return;
+      }
+      onAuth();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  }
+  if (!authRequired) return <div>認証不要、リダイレクト中...</div>;
+  return (
+    <div className="login-container">
+      <div className="login-box">
+        <div className="login-title">🔐 認証</div>
+        <div className="field">
+          <input className="input" type="password" placeholder="パスワード"
+            value={password} onChange={e => setPassword(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && handleLogin()} autoFocus />
+        </div>
+        {error && <div style={{ color: 'var(--red)', fontSize: 12, marginBottom: 12 }}>{error}</div>}
+        <button className="btn primary" style={{ width: '100%', justifyContent: 'center' }}
+          onClick={handleLogin} disabled={busy || !password}>
+          {busy ? '認証中...' : 'ログイン'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>

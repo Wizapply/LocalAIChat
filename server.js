@@ -20,8 +20,8 @@ const PYTHON_TIMEOUT = parseInt(process.env.PYTHON_TIMEOUT) || 60000;
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 const DEFAULT_CONFIG = {
   appName: 'OpenGeekLLMChat',
-  logoMain: 'OpenGeek',
-  logoSub: 'LLM Chat',
+  logoMain: 'OpenGeekLLM',
+  logoSub: 'Chat',
   welcomeMessage: 'ドキュメントをアップロードしてRAGベースの質問応答を行うか、自由にチャットを開始できます。',
   welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
   accentColor: '#34d399',
@@ -68,6 +68,14 @@ const DEFAULT_CONFIG = {
   webSearch: true,
   fileAccess: true,
   imageGen: false,           // 画像生成（stable-diffusion.cpp連携）。imageModels[]を定義して有効化
+  // ─── 機械学習 (ML) 設定 ───
+  // データテーブル(DuckDB)、Web API インポート、PyTorch学習、外部APIトークン
+  // 旧フォーマット (`mlEnabled` / `apiTokens` トップレベル) も後方互換読み込み対応
+  ml: {
+    enabled: false,          // 機械学習機能の有効化。要 `npm install duckdb`
+    apiTokens: [],           // 外部API用トークン: [{name, token, permissions}]
+                             //   permissions: "ml:read" / "ml:write" / "*" (全部)
+  },
   ragTopK: 10,
   ragMode: 'agentic',
   systemPrompts: {
@@ -99,7 +107,7 @@ function loadConfig() {
     if (fs.existsSync(CONFIG_FILE)) {
       const userConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
       const merged = { ...DEFAULT_CONFIG, ...userConfig };
-      ['systemPrompts', 'agentContext', 'transcribe', 'llamaServer', 'embeddingModel'].forEach(key => {
+      ['systemPrompts', 'agentContext', 'transcribe', 'llamaServer', 'embeddingModel', 'ml'].forEach(key => {
         if (DEFAULT_CONFIG[key] && typeof DEFAULT_CONFIG[key] === 'object') {
           merged[key] = { ...DEFAULT_CONFIG[key], ...(userConfig[key] || {}) };
         }
@@ -1662,8 +1670,18 @@ const TUNING_RUNS_DIR = path.join(TUNING_DIR, 'runs');
 const TUNING_SAMPLES_FILE = path.join(TUNING_DIR, 'samples.jsonl');
 const TUNING_JOBS_FILE = path.join(TUNING_DIR, 'jobs.json');
 
+// ─── 機械学習(ML)機能の定数 ─────────────────────────────────────────
+// 表データ用の DuckDB を1ファイルに集約。テーブル単位で管理。
+// LLMからは読み取り専用(SELECT)で公開。
+const ML_DIR = path.join(__dirname, 'ml');
+const ML_DB_FILE = path.join(ML_DIR, 'datasets.duckdb');
+const ML_META_FILE = path.join(ML_DIR, 'meta.json');  // テーブル説明等のメタ情報
+const ML_MODELS_DIR = path.join(ML_DIR, 'models');     // 学習成果物の保存先（モデル毎にディレクトリ）
+const ML_MODELS_FILE = path.join(ML_DIR, 'models.json'); // モデル定義一覧（メタ情報）
+const ML_JOBS_FILE = path.join(ML_DIR, 'jobs.json');   // 学習ジョブ履歴
+
 // ディレクトリ作成
-for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR]) {
+for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR, ML_DIR, ML_MODELS_DIR]) {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 }
 
@@ -2692,23 +2710,52 @@ function verifyPassword(input, stored) {
 // ─── 認証ミドルウェア ───
 function requireAuth(req, res, next) {
   if (!appConfig.password) return next(); // パスワード未設定なら認証不要
-  // CookieまたはAuthorizationヘッダーからトークン取得
+  // 1. CookieまたはX-Auth-Tokenヘッダー (ブラウザ用セッション)
   const cookieToken = (req.headers.cookie || '').split(';')
     .map(c => c.trim())
     .find(c => c.startsWith('wz_session='))?.split('=')[1];
   const headerToken = req.headers['x-auth-token'];
   const token = cookieToken || headerToken;
   if (isValidSession(token)) return next();
+  // 2. Authorization: Bearer <token> (API トークン、Python等の外部呼び出し用)
+  const authHeader = req.headers.authorization || '';
+  if (authHeader.startsWith('Bearer ')) {
+    const apiToken = authHeader.slice(7).trim();
+    if (apiToken) {
+      const tokens = appConfig.ml?.apiTokens || [];
+      const tokenObj = tokens.find(t => t && t.token === apiToken);
+      if (tokenObj) {
+        req.apiToken = tokenObj;  // ルートで権限チェックできる (req.apiToken.permissions)
+        return next();
+      }
+    }
+  }
   res.status(401).json({ error: '認証が必要です' });
 }
 
+// API トークンの権限チェック (Cookie セッションは全権限あり)
+// 使い方: app.post('/path', requireAuth, requirePermission('ml:write'), handler)
+function requirePermission(perm) {
+  return (req, res, next) => {
+    // Cookie セッション (req.apiToken なし) は全権限とみなす
+    if (!req.apiToken) return next();
+    const perms = req.apiToken.permissions || [];
+    if (perms.includes(perm) || perms.includes('*')) return next();
+    return res.status(403).json({
+      error: `権限 "${perm}" が必要です (現在のトークンの権限: ${perms.join(', ') || 'none'})`,
+    });
+  };
+}
+
 app.get('/config', (req, res) => {
-  // 公開しない: password, llamaServer内のbinPath, embeddingModelの実体パス
-  const { password, llamaServer, embeddingModel, ...rest } = appConfig;
+  // 公開しない: password, llamaServer内のbinPath, embeddingModelの実体パス, ml.apiTokens(機密)
+  const { password, llamaServer, embeddingModel, ml, ...rest } = appConfig;
   const safeConfig = {
     ...rest,
     // llamaServer情報は最小限のみ
     llamaServer: { chatPort: llamaServer.chatPort, embeddingPort: llamaServer.embeddingPort },
+    // ml は enabled のみ公開、apiTokens(機密)は出さない
+    ml: { enabled: !!(ml?.enabled) },
   };
   safeConfig.hasPassword = !!password;
 
@@ -3238,6 +3285,1107 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/plots/')) return next();
   express.static(path.join(__dirname, 'public'))(req, res, next);
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// 🤖 機械学習 (ML) - 表データ管理
+// ═══════════════════════════════════════════════════════════════════
+// DuckDB を用いてCSV/Web APIから取り込んだ表データを管理。
+// LLMからは読み取り(SELECT)専用ツール経由でアクセス可能。
+// 外部の Python スクリプト等からは Authorization: Bearer <token> で直接利用可能 (config.json の apiTokens[])。
+// Phase 1: テーブルCRUD + CSVインポート + SELECT実行 + LLM読み取りツール
+// Phase 2: WebAPIインポート、外部APIトークン、append エンドポイント
+// Phase 3以降: モデル学習(PyTorch)、推論API
+
+// CORS: ML系エンドポイントは別オリジン(ブラウザJS / curl等)からも叩けるように許可
+// Pythonの requests からは関係ないが、Webダッシュボード等のクロスオリジン利用に対応
+app.use('/ml', (req, res, next) => {
+  res.set('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Auth-Token');
+  res.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.set('Access-Control-Allow-Credentials', 'true');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
+
+let _duckdb = null;        // duckdb モジュール (lazy load)
+let _mlDb = null;           // データベース接続
+let _mlDbConn = null;       // 接続オブジェクト
+let _mlDbInitFailed = false; // duckdb モジュール初期化失敗フラグ
+let currentMlJob = null;    // 実行中の学習ジョブ { jobId, modelName, proc, log: [] }
+                            // DuckDB は排他ロックなので学習中は Node 側で DB を開かない
+
+function getDuckDB() {
+  if (_duckdb) return _duckdb;
+  if (_mlDbInitFailed) return null;
+  try {
+    _duckdb = require('duckdb');
+    return _duckdb;
+  } catch (e) {
+    log('-', `[ML] duckdb モジュールがロードできません: ${e.message}。'npm install duckdb' で導入してください`);
+    _mlDbInitFailed = true;
+    return null;
+  }
+}
+
+function getMlDb() {
+  // 学習中(currentMlJob 実行中)は ML DB を絶対に開かない
+  // Python(ml_runner)が排他ロックを取得しているため、Node側で開こうとすると失敗する
+  if (currentMlJob) {
+    throw new Error('現在 ML 学習ジョブ実行中のため DuckDB は一時的にアクセスできません (ジョブ終了後に再試行してください)');
+  }
+  if (_mlDbConn) return _mlDbConn;
+  const duckdb = getDuckDB();
+  if (!duckdb) return null;
+  _mlDb = new duckdb.Database(ML_DB_FILE);
+  _mlDbConn = _mlDb.connect();
+  return _mlDbConn;
+}
+
+// Promise化したクエリ実行
+function mlQuery(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    const conn = getMlDb();
+    if (!conn) return reject(new Error('DuckDB が利用できません。npm install duckdb で導入してください'));
+    conn.all(sql, ...params, (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows);
+    });
+  });
+}
+function mlExec(sql) {
+  return new Promise((resolve, reject) => {
+    const conn = getMlDb();
+    if (!conn) return reject(new Error('DuckDB が利用できません'));
+    conn.exec(sql, (err) => {
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+}
+
+// ─── メタ情報管理（テーブル説明文等） ───
+function loadMlMeta() {
+  if (!fs.existsSync(ML_META_FILE)) return { tables: {} };
+  try { return JSON.parse(fs.readFileSync(ML_META_FILE, 'utf-8')); }
+  catch { return { tables: {} }; }
+}
+function saveMlMeta(meta) {
+  fs.writeFileSync(ML_META_FILE, JSON.stringify(meta, null, 2), 'utf-8');
+}
+
+// ─── テーブル名検証（SQLインジェクション対策） ───
+// 英数字とアンダースコアのみ、最大64文字、先頭は文字
+function isValidTableName(name) {
+  return typeof name === 'string'
+    && /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(name)
+    && !RESERVED_SQL_KEYWORDS.includes(name.toLowerCase());
+}
+const RESERVED_SQL_KEYWORDS = [
+  'select', 'from', 'where', 'insert', 'update', 'delete', 'drop',
+  'create', 'alter', 'table', 'index', 'view', 'join', 'union',
+];
+
+// ─── SELECT専用判定（LLMアクセス制限用） ───
+// シングルステートメント、SELECT/WITHのみ、危険キーワード禁止
+function isSafeReadOnlySql(sql) {
+  if (typeof sql !== 'string') return false;
+  const s = sql.trim().toLowerCase();
+  // セミコロンは末尾1つだけ許容
+  const semiCount = (s.match(/;/g) || []).length;
+  if (semiCount > 1) return false;
+  if (semiCount === 1 && !s.endsWith(';')) return false;
+  // 先頭が SELECT / WITH 以外は拒否
+  if (!/^(select|with)\b/.test(s)) return false;
+  // 書き込み・スキーマ変更系のキーワード禁止
+  const forbidden = /\b(insert|update|delete|drop|create|alter|attach|copy|export|import|truncate|grant|revoke|pragma|set|call|execute|prepare)\b/;
+  if (forbidden.test(s)) return false;
+  return true;
+}
+
+// ─── テーブル一覧 ───
+app.get('/ml/datasets', requireAuth, requirePermission('ml:read'), async (req, res) => {
+  try {
+    if (_mlDbInitFailed || !getDuckDB()) {
+      return res.json({ tables: [], duckdbAvailable: false, hint: 'npm install duckdb を実行してください' });
+    }
+    const meta = loadMlMeta();
+    const rows = await mlQuery(`
+      SELECT table_name, estimated_size
+      FROM duckdb_tables()
+      WHERE schema_name = 'main'
+      ORDER BY table_name
+    `);
+    const tables = await Promise.all(rows.map(async (r) => {
+      const name = r.table_name;
+      let rowCount = 0;
+      try {
+        const cnt = await mlQuery(`SELECT COUNT(*) AS c FROM "${name}"`);
+        rowCount = Number(cnt[0].c) || 0;
+      } catch {}
+      return {
+        name,
+        rowCount,
+        description: meta.tables?.[name]?.description || '',
+        createdAt: meta.tables?.[name]?.createdAt || null,
+        importedFrom: meta.tables?.[name]?.importedFrom || null,
+      };
+    }));
+    res.json({ tables, duckdbAvailable: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── テーブルスキーマ ───
+app.get('/ml/datasets/:name/schema', requireAuth, requirePermission('ml:read'), async (req, res) => {
+  const name = req.params.name;
+  if (!isValidTableName(name)) return res.status(400).json({ error: '無効なテーブル名' });
+  try {
+    const cols = await mlQuery(`
+      SELECT column_name, data_type, is_nullable
+      FROM duckdb_columns()
+      WHERE schema_name = 'main' AND table_name = ?
+      ORDER BY column_index
+    `, [name]);
+    if (cols.length === 0) return res.status(404).json({ error: 'テーブルが見つかりません' });
+    const meta = loadMlMeta();
+    const tableMeta = meta.tables?.[name] || {};
+    res.json({
+      name,
+      columns: cols.map(c => ({
+        name: c.column_name,
+        type: c.data_type,
+        nullable: c.is_nullable === true || c.is_nullable === 'YES',
+      })),
+      description: tableMeta.description || '',
+      importedFrom: tableMeta.importedFrom || null,
+      apiUrl: tableMeta.apiUrl || null,
+      apiMethod: tableMeta.apiMethod || null,
+      apiJsonPath: tableMeta.apiJsonPath || null,
+      createdAt: tableMeta.createdAt || null,
+      updatedAt: tableMeta.updatedAt || null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── プレビュー (先頭N行) ───
+app.get('/ml/datasets/:name/preview', requireAuth, requirePermission('ml:read'), async (req, res) => {
+  const name = req.params.name;
+  const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 1000);
+  if (!isValidTableName(name)) return res.status(400).json({ error: '無効なテーブル名' });
+  try {
+    const rows = await mlQuery(`SELECT * FROM "${name}" LIMIT ${limit}`);
+    res.json({ rows: rows.map(serializeRow), count: rows.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DuckDB 戻り値の特殊型(BigInt等)をJSONシリアライズ可能にする
+function serializeRow(row) {
+  const out = {};
+  for (const k of Object.keys(row)) {
+    const v = row[k];
+    if (typeof v === 'bigint') out[k] = Number(v);
+    else if (v instanceof Date) out[k] = v.toISOString();
+    else if (v && typeof v === 'object' && v.constructor && v.constructor.name === 'Buffer') out[k] = `<binary ${v.length}B>`;
+    else out[k] = v;
+  }
+  return out;
+}
+
+// ─── CSVインポート ───
+// body: { tableName, csvContent, mode: 'replace'|'append', description? }
+app.post('/ml/datasets/import/csv', requireAuth, requirePermission('ml:write'), jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const { tableName, csvContent, mode = 'replace', description = '' } = req.body || {};
+  if (!isValidTableName(tableName)) {
+    return res.status(400).json({ error: 'テーブル名は英数字とアンダースコアで先頭は文字、64文字以内' });
+  }
+  if (typeof csvContent !== 'string' || !csvContent.trim()) {
+    return res.status(400).json({ error: 'csvContent が空です' });
+  }
+  // 一時CSVファイルに書き出し → DuckDBの read_csv_auto で取り込み
+  const tmpFile = path.join(ML_DIR, `_import_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.csv`);
+  try {
+    fs.writeFileSync(tmpFile, csvContent, 'utf-8');
+    if (mode === 'replace') {
+      await mlExec(`DROP TABLE IF EXISTS "${tableName}"`);
+    }
+    const exists = (await mlQuery(`
+      SELECT COUNT(*) AS c FROM duckdb_tables()
+      WHERE schema_name = 'main' AND table_name = ?
+    `, [tableName]))[0].c;
+    if (Number(exists) === 0) {
+      // 新規作成
+      await mlExec(`CREATE TABLE "${tableName}" AS SELECT * FROM read_csv_auto('${tmpFile.replace(/'/g, "''")}')`);
+    } else {
+      // 追記 (列構造が一致している前提)
+      await mlExec(`INSERT INTO "${tableName}" SELECT * FROM read_csv_auto('${tmpFile.replace(/'/g, "''")}')`);
+    }
+    const cnt = await mlQuery(`SELECT COUNT(*) AS c FROM "${tableName}"`);
+    const rowCount = Number(cnt[0].c) || 0;
+
+    // メタ情報更新
+    const meta = loadMlMeta();
+    if (!meta.tables) meta.tables = {};
+    meta.tables[tableName] = {
+      ...(meta.tables[tableName] || {}),
+      description: description || meta.tables[tableName]?.description || '',
+      createdAt: meta.tables[tableName]?.createdAt || Date.now(),
+      updatedAt: Date.now(),
+      importedFrom: 'csv',
+    };
+    saveMlMeta(meta);
+
+    log(ip, `[ML] CSV import: ${tableName} (${mode}, ${rowCount} rows)`);
+    res.json({ ok: true, tableName, rowCount });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  }
+});
+
+// ─── Web API インポート ───
+// body: {
+//   tableName, url,
+//   method?: 'GET'|'POST' (default GET),
+//   headers?: object (例: {"Authorization": "Bearer xxx"}),
+//   body?: string|object (POST時のリクエストボディ、object なら JSON.stringify する),
+//   jsonPath?: string (応答内の配列の位置、例: "data.items"。空なら応答自体を配列とみなす),
+//   mode?: 'replace'|'append' (default replace),
+//   description?: string,
+//   allowPrivateNetwork?: boolean (SSRF対策をスキップ、デフォルト false)
+// }
+// 取得した JSON 配列の各要素をフラット化して DuckDB に取り込む。
+// ネストオブジェクトはドット記法カラム名 (例: user.name)、配列はJSON文字列化。
+app.post('/ml/datasets/import/api', requireAuth, requirePermission('ml:write'), jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const {
+    tableName, url, method = 'GET', headers = {},
+    body, jsonPath = '', mode = 'replace', description = '',
+    allowPrivateNetwork = false,
+  } = req.body || {};
+
+  if (!isValidTableName(tableName)) {
+    return res.status(400).json({ error: 'テーブル名は英数字とアンダースコアで先頭は文字、64文字以内' });
+  }
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
+    return res.status(400).json({ error: 'url は http(s):// で始まる必要があります' });
+  }
+  if (!['GET', 'POST', 'PUT'].includes(String(method).toUpperCase())) {
+    return res.status(400).json({ error: 'method は GET, POST, PUT のみ' });
+  }
+
+  // SSRF対策: localhost や内部IP帯への接続をデフォルト拒否
+  let parsedUrl;
+  try { parsedUrl = new URL(url); }
+  catch { return res.status(400).json({ error: '不正なURL' }); }
+  if (!allowPrivateNetwork && isPrivateHostname(parsedUrl.hostname)) {
+    return res.status(403).json({
+      error: 'localhost や内部IP宛のリクエストはデフォルト拒否されています。許可するには allowPrivateNetwork=true を指定してください。',
+    });
+  }
+
+  // 一時CSVに書き出して DuckDB の read_csv_auto で取り込み… ではなく
+  // 直接 JSON → 配列 → CREATE TABLE AS (SELECT * FROM read_json_auto(...))
+  // で扱う。一時 JSON ファイル経由が安全。
+  const tmpFile = path.join(ML_DIR, `_import_api_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`);
+
+  try {
+    // ─── 1. HTTP 取得 ───
+    const httpModule = parsedUrl.protocol === 'https:' ? require('https') : require('http');
+    const reqOpts = {
+      method: String(method).toUpperCase(),
+      headers: {
+        'User-Agent': 'OpenGeekLLMChat-ML/1.0',
+        'Accept': 'application/json',
+        ...headers,
+      },
+      timeout: 30000,
+    };
+    let reqBody = '';
+    if (body !== undefined && body !== null) {
+      reqBody = typeof body === 'string' ? body : JSON.stringify(body);
+      if (typeof body !== 'string' && !reqOpts.headers['Content-Type']) {
+        reqOpts.headers['Content-Type'] = 'application/json';
+      }
+      reqOpts.headers['Content-Length'] = Buffer.byteLength(reqBody);
+    }
+
+    const respText = await new Promise((resolve, reject) => {
+      const r = httpModule.request(url, reqOpts, (resp) => {
+        // リダイレクト対応（簡易、1段のみ）
+        if ([301, 302, 303, 307, 308].includes(resp.statusCode) && resp.headers.location) {
+          return reject(new Error(`HTTP ${resp.statusCode}: リダイレクト先 ${resp.headers.location} を直接指定してください`));
+        }
+        if (resp.statusCode >= 400) {
+          return reject(new Error(`HTTP ${resp.statusCode}: ${resp.statusMessage}`));
+        }
+        let total = 0;
+        const MAX_SIZE = 10 * 1024 * 1024;  // 10MB
+        const chunks = [];
+        resp.on('data', (chunk) => {
+          total += chunk.length;
+          if (total > MAX_SIZE) {
+            resp.destroy();
+            return reject(new Error(`応答が大きすぎます (上限 10MB を超過)`));
+          }
+          chunks.push(chunk);
+        });
+        resp.on('end', () => {
+          try { resolve(Buffer.concat(chunks).toString('utf-8')); }
+          catch (e) { reject(e); }
+        });
+        resp.on('error', reject);
+      });
+      r.on('timeout', () => { r.destroy(); reject(new Error('タイムアウト (30秒)')); });
+      r.on('error', reject);
+      if (reqBody) r.write(reqBody);
+      r.end();
+    });
+
+    // ─── 2. JSON パース + JSON Path 適用 ───
+    let json;
+    try { json = JSON.parse(respText); }
+    catch (e) { throw new Error(`JSON パース失敗: ${e.message}`); }
+
+    let arr = json;
+    if (jsonPath && typeof jsonPath === 'string') {
+      // "data.items" や "results[0].rows" のような単純ドット記法
+      const parts = jsonPath.split('.').map(p => p.trim()).filter(Boolean);
+      for (const p of parts) {
+        // [N] 形式の配列インデックスにも対応
+        const arrMatch = p.match(/^([^\[]+)?(?:\[(\d+)\])?$/);
+        if (arrMatch[1]) arr = arr?.[arrMatch[1]];
+        if (arrMatch[2] !== undefined) arr = arr?.[parseInt(arrMatch[2])];
+        if (arr === undefined || arr === null) {
+          throw new Error(`JSON Path "${jsonPath}" の解決失敗: "${p}" が見つかりません`);
+        }
+      }
+    }
+    if (!Array.isArray(arr)) {
+      throw new Error(`JSON Path の指す値が配列ではありません (型: ${typeof arr})。jsonPath で配列の位置を指定してください。`);
+    }
+    if (arr.length === 0) {
+      throw new Error('取得した配列が空です。jsonPath や URL を確認してください。');
+    }
+
+    // ─── 3. 各オブジェクトをフラット化 ───
+    const flatRows = arr.map(item => flattenObject(item));
+
+    // ─── 4. 一時 JSON ファイル (1行1オブジェクト = NDJSON) に書き出し → DuckDB が型推論 ───
+    fs.writeFileSync(tmpFile, flatRows.map(r => JSON.stringify(r)).join('\n'), 'utf-8');
+
+    if (mode === 'replace') {
+      await mlExec(`DROP TABLE IF EXISTS "${tableName}"`);
+    }
+    const exists = (await mlQuery(`
+      SELECT COUNT(*) AS c FROM duckdb_tables()
+      WHERE schema_name = 'main' AND table_name = ?
+    `, [tableName]))[0].c;
+    if (Number(exists) === 0) {
+      await mlExec(`CREATE TABLE "${tableName}" AS SELECT * FROM read_json_auto('${tmpFile.replace(/'/g, "''")}', format='newline_delimited')`);
+    } else {
+      await mlExec(`INSERT INTO "${tableName}" SELECT * FROM read_json_auto('${tmpFile.replace(/'/g, "''")}', format='newline_delimited')`);
+    }
+    const cnt = await mlQuery(`SELECT COUNT(*) AS c FROM "${tableName}"`);
+    const rowCount = Number(cnt[0].c) || 0;
+
+    // ─── 5. メタ情報更新 (取得URLを記録) ───
+    const meta = loadMlMeta();
+    if (!meta.tables) meta.tables = {};
+    meta.tables[tableName] = {
+      ...(meta.tables[tableName] || {}),
+      description: description || meta.tables[tableName]?.description || '',
+      createdAt: meta.tables[tableName]?.createdAt || Date.now(),
+      updatedAt: Date.now(),
+      importedFrom: 'api',
+      apiUrl: url,
+      apiMethod: String(method).toUpperCase(),
+      apiJsonPath: jsonPath || '',
+      // ヘッダー内の機密情報 (Bearer等) は保存しない
+      apiHasAuth: !!(headers.Authorization || headers.authorization),
+    };
+    saveMlMeta(meta);
+
+    log(ip, `[ML] API import: ${tableName} (${mode}, ${rowCount} rows from ${url})`);
+    res.json({ ok: true, tableName, rowCount, sampleRow: flatRows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  }
+});
+
+// プライベートネットワーク判定 (SSRF対策)
+function isPrivateHostname(hostname) {
+  if (!hostname) return true;
+  const h = hostname.toLowerCase();
+  if (h === 'localhost' || h === '0.0.0.0' || h === '::1') return true;
+  // IPv4 アドレス判定
+  const ipv4 = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (ipv4) {
+    const [a, b] = [parseInt(ipv4[1]), parseInt(ipv4[2])];
+    if (a === 10) return true;                              // 10.0.0.0/8
+    if (a === 127) return true;                             // 127.0.0.0/8 (loopback)
+    if (a === 169 && b === 254) return true;                // 169.254.0.0/16 (link-local)
+    if (a === 172 && b >= 16 && b <= 31) return true;       // 172.16.0.0/12
+    if (a === 192 && b === 168) return true;                // 192.168.0.0/16
+  }
+  // IPv6 簡易判定
+  if (h.startsWith('fe80:') || h.startsWith('fc') || h.startsWith('fd')) return true;
+  return false;
+}
+
+// オブジェクトのフラット化 (ネストobject → ドット記法、配列はJSON文字列化)
+// 例: {user: {name: "Alice", age: 30}, tags: ["x"]}
+//  → {"user.name": "Alice", "user.age": 30, "tags": "[\"x\"]"}
+function flattenObject(obj, prefix = '', out = {}) {
+  if (obj === null || obj === undefined) return out;
+  if (typeof obj !== 'object' || Array.isArray(obj)) {
+    // ルートが配列または primitive の場合は単一カラム 'value' として扱う
+    out[prefix || 'value'] = Array.isArray(obj) ? JSON.stringify(obj) : obj;
+    return out;
+  }
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (v === null || v === undefined) {
+      out[key] = null;
+    } else if (Array.isArray(v)) {
+      // 配列は JSON 文字列化 (DuckDB 側で json_extract 等が使える)
+      out[key] = JSON.stringify(v);
+    } else if (typeof v === 'object') {
+      flattenObject(v, key, out);
+    } else {
+      out[key] = v;
+    }
+  }
+  return out;
+}
+
+// ─── テーブル説明文の更新 ───
+app.put('/ml/datasets/:name', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const name = req.params.name;
+  if (!isValidTableName(name)) return res.status(400).json({ error: '無効なテーブル名' });
+  const { description } = req.body || {};
+  const meta = loadMlMeta();
+  if (!meta.tables) meta.tables = {};
+  if (!meta.tables[name]) meta.tables[name] = { createdAt: Date.now() };
+  meta.tables[name].description = String(description || '');
+  meta.tables[name].updatedAt = Date.now();
+  saveMlMeta(meta);
+  res.json({ ok: true });
+});
+
+// ─── テーブル削除 ───
+app.delete('/ml/datasets/:name', requireAuth, requirePermission('ml:write'), async (req, res) => {
+  const ip = getIP(req);
+  const name = req.params.name;
+  if (!isValidTableName(name)) return res.status(400).json({ error: '無効なテーブル名' });
+  try {
+    await mlExec(`DROP TABLE IF EXISTS "${name}"`);
+    const meta = loadMlMeta();
+    if (meta.tables && meta.tables[name]) {
+      delete meta.tables[name];
+      saveMlMeta(meta);
+    }
+    log(ip, `[ML] テーブル削除: ${name}`);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── 読み取り専用SQL実行（UIから・LLMツールからも利用） ───
+// body: { sql, limit?: number }
+app.post('/ml/query', requireAuth, requirePermission('ml:read'), jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const { sql, limit = 1000 } = req.body || {};
+  if (!isSafeReadOnlySql(sql)) {
+    return res.status(400).json({
+      error: '読み取り専用SQL(SELECT/WITH)のみ許可されています。書き込み・スキーマ変更は禁止です。',
+    });
+  }
+  // LIMIT が含まれていない場合は強制付与（暴走防止）
+  const maxLimit = Math.min(Math.max(parseInt(limit) || 1000, 1), 10000);
+  let safeSql = sql.trim().replace(/;$/, '');
+  if (!/\blimit\s+\d+/i.test(safeSql)) {
+    safeSql = `${safeSql} LIMIT ${maxLimit}`;
+  }
+  try {
+    const startMs = Date.now();
+    const rows = await mlQuery(safeSql);
+    const elapsedMs = Date.now() - startMs;
+    log(ip, `[ML] query (${rows.length} rows, ${elapsedMs}ms)`);
+    res.json({
+      rows: rows.map(serializeRow),
+      count: rows.length,
+      elapsedMs,
+      truncated: rows.length >= maxLimit,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── APIトークン管理 (補助エンドポイント) ───
+// トークン文字列の生成補助 (実際の登録は config.json の apiTokens[] を editconfig.html で編集)
+// 例: ogc_<43文字の URL-safe base64> (合計47文字)
+app.get('/api-tokens/generate', requireAuth, (req, res) => {
+  const token = 'ogc_' + crypto.randomBytes(32).toString('base64url');
+  res.json({ token });
+});
+
+// 現在のAPIトークン一覧 (トークン文字列は伏せる、名前と権限のみ)
+app.get('/api-tokens', requireAuth, (req, res) => {
+  const tokens = (appConfig.ml?.apiTokens || []).map(t => ({
+    name: t.name || '',
+    permissions: t.permissions || [],
+    tokenPreview: t.token ? `${t.token.slice(0, 12)}...${t.token.slice(-4)}` : '',
+    // フルトークンはセキュリティ上返さない (config.json または editconfig.html で確認)
+  }));
+  res.json({ tokens });
+});
+
+
+// body: { tableName, rows: object[], createIfMissing?: boolean (default false), description?: string }
+// - rows: 1個以上のフラットなオブジェクト配列。ネストはドット記法カラムに、配列はJSON文字列化される
+// - createIfMissing: true なら、テーブルが無ければ最初の行からスキーマ推定して自動作成
+// 既存テーブルへの追記時は列構造の一致が必須 (DuckDBの INSERT INTO ... SELECT で確認される)
+app.post('/ml/datasets/append', requireAuth, requirePermission('ml:write'), jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const { tableName, rows, createIfMissing = false, description = '' } = req.body || {};
+  if (!isValidTableName(tableName)) {
+    return res.status(400).json({ error: 'テーブル名は英数字とアンダースコアで先頭は文字、64文字以内' });
+  }
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ error: 'rows は1個以上のオブジェクト配列が必要です' });
+  }
+  if (rows.length > 10000) {
+    return res.status(400).json({ error: '1リクエストあたり最大 10000 行までです (大量データはCSV/APIインポート推奨)' });
+  }
+  // 各行をフラット化
+  const flatRows = rows.map(r => {
+    if (r === null || typeof r !== 'object' || Array.isArray(r)) {
+      throw new Error(`rows[].要素はオブジェクトである必要があります (受信した型: ${Array.isArray(r) ? 'array' : typeof r})`);
+    }
+    return flattenObject(r);
+  });
+
+  const tmpFile = path.join(ML_DIR, `_append_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`);
+  try {
+    fs.writeFileSync(tmpFile, flatRows.map(r => JSON.stringify(r)).join('\n'), 'utf-8');
+
+    const exists = (await mlQuery(`
+      SELECT COUNT(*) AS c FROM duckdb_tables()
+      WHERE schema_name = 'main' AND table_name = ?
+    `, [tableName]))[0].c;
+
+    if (Number(exists) === 0) {
+      if (!createIfMissing) {
+        return res.status(404).json({
+          error: `テーブル "${tableName}" が存在しません。createIfMissing: true を指定するか、先にテーブルを作成してください。`,
+        });
+      }
+      // 新規作成 (最初の行からスキーマ推定)
+      await mlExec(`CREATE TABLE "${tableName}" AS SELECT * FROM read_json_auto('${tmpFile.replace(/'/g, "''")}', format='newline_delimited')`);
+    } else {
+      // 既存テーブルに追記
+      await mlExec(`INSERT INTO "${tableName}" SELECT * FROM read_json_auto('${tmpFile.replace(/'/g, "''")}', format='newline_delimited')`);
+    }
+    const cnt = await mlQuery(`SELECT COUNT(*) AS c FROM "${tableName}"`);
+    const rowCount = Number(cnt[0].c) || 0;
+
+    // メタ情報更新 (新規作成時のみ)
+    if (Number(exists) === 0) {
+      const meta = loadMlMeta();
+      if (!meta.tables) meta.tables = {};
+      meta.tables[tableName] = {
+        description: description || '',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        importedFrom: 'append',
+      };
+      saveMlMeta(meta);
+    } else if (description) {
+      // 既存テーブルでも description が指定されたら更新
+      const meta = loadMlMeta();
+      if (meta.tables && meta.tables[tableName]) {
+        meta.tables[tableName].description = description;
+        meta.tables[tableName].updatedAt = Date.now();
+        saveMlMeta(meta);
+      }
+    }
+
+    log(ip, `[ML] append: ${tableName} (+${flatRows.length} rows, total ${rowCount})`);
+    res.json({
+      ok: true,
+      tableName,
+      appended: flatRows.length,
+      totalRows: rowCount,
+      created: Number(exists) === 0,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 🧠 ML: モデル & 学習ジョブ管理 (Phase 3)
+// ═══════════════════════════════════════════════════════════════════
+// ml_runner.py で PyTorch 学習を行う。
+// モデル名 = 識別子 (英数字+_)。models/<name>/ ディレクトリに成果物を保存。
+// 現在実行中のジョブは1個まで (GPU/CPU 競合回避)。
+// currentMlJob は ML セクション先頭で宣言済み。
+
+function loadMlModels() {
+  if (!fs.existsSync(ML_MODELS_FILE)) return [];
+  try { return JSON.parse(fs.readFileSync(ML_MODELS_FILE, 'utf-8')); }
+  catch { return []; }
+}
+function saveMlModels(models) {
+  fs.writeFileSync(ML_MODELS_FILE, JSON.stringify(models, null, 2), 'utf-8');
+}
+function loadMlJobs() {
+  if (!fs.existsSync(ML_JOBS_FILE)) return [];
+  try { return JSON.parse(fs.readFileSync(ML_JOBS_FILE, 'utf-8')); }
+  catch { return []; }
+}
+function saveMlJobs(jobs) {
+  fs.writeFileSync(ML_JOBS_FILE, JSON.stringify(jobs, null, 2), 'utf-8');
+}
+
+// モデル名検証 (テーブル名と同じルール)
+const isValidModelName = isValidTableName;
+
+// ─── モデル一覧 ───
+app.get('/ml/models', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const models = loadMlModels();
+  // 学習済みかどうか (model.pt の存在) も付与
+  const enriched = models.map(m => {
+    const modelDir = path.join(ML_MODELS_DIR, m.name);
+    const trained = fs.existsSync(path.join(modelDir, 'model.pt'));
+    let metrics = null;
+    let predictHint = null;  // 推論時に必要な入力情報 (LLM/UI 向け)
+    try {
+      const mp = path.join(modelDir, 'metrics.json');
+      if (fs.existsSync(mp)) {
+        const j = JSON.parse(fs.readFileSync(mp, 'utf-8'));
+        metrics = {
+          finalTestLoss: j.finalTestLoss,
+          finalAccuracy: j.finalAccuracy,
+          finalMAE: j.finalMAE,
+          finalRMSE: j.finalRMSE,
+          trainSamples: j.trainSamples,
+          testSamples: j.testSamples,
+          elapsedSec: j.elapsedSec,
+        };
+      }
+      // 推論用ヒント: ml_predict 呼び出し時に必要な特徴量 + サンプル
+      const cfgPath = path.join(modelDir, 'config.json');
+      if (fs.existsSync(cfgPath)) {
+        const savedCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+        const originalFeatures = savedCfg.originalFeatures || savedCfg.features || [];
+        const datetimeSourceCols = savedCfg.datetimeSourceCols || [];
+        // サンプル入力を生成
+        const exampleInput = {};
+        for (const f of originalFeatures) {
+          if (datetimeSourceCols.includes(f)) {
+            exampleInput[f] = '2027-04-15';
+          } else {
+            const lf = f.toLowerCase();
+            if (/region|area|city|地域|都市/.test(lf)) exampleInput[f] = 'Tokyo';
+            else if (/product|item|商品/.test(lf)) exampleInput[f] = 'ProductA';
+            else if (/quantity|qty|count|数量|個数/.test(lf)) exampleInput[f] = 5;
+            else exampleInput[f] = '(値)';
+          }
+        }
+        predictHint = {
+          requiredFeatures: originalFeatures,
+          datetimeColumns: datetimeSourceCols,  // 自動分解される日時列
+          exampleInput,
+          note: datetimeSourceCols.length > 0
+            ? `日時列 ${datetimeSourceCols.join(',')} は元の日付文字列 (例: "2027-04-15") を渡してください。内部で自動的に year/month/day/dayofweek/dayofyear/is_weekend に分解されます。date_year のような派生列名を直接渡さないでください。`
+            : '各特徴量を学習時の元の値で渡してください。',
+        };
+      }
+    } catch {}
+    return { ...m, trained, metrics, predictHint };
+  });
+  res.json({ models: enriched, runningJob: currentMlJob ? { jobId: currentMlJob.jobId, modelName: currentMlJob.modelName } : null });
+});
+
+// ─── モデル定義の作成・更新 ───
+// body: { name, task, tableName, features, target, timeCol?, windowSize?, epochs, learningRate, ... }
+app.post('/ml/models', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const def = req.body || {};
+  if (!isValidModelName(def.name)) return res.status(400).json({ error: 'モデル名は英数字とアンダースコアで先頭は文字、64文字以内' });
+  if (!['regression', 'classification', 'timeseries'].includes(def.task)) {
+    return res.status(400).json({ error: 'task は regression/classification/timeseries' });
+  }
+  if (!isValidTableName(def.tableName)) return res.status(400).json({ error: '無効なテーブル名' });
+  if (!Array.isArray(def.features) || def.features.length === 0) {
+    return res.status(400).json({ error: 'features は1個以上の配列必須' });
+  }
+  if (typeof def.target !== 'string' || !def.target) return res.status(400).json({ error: 'target 必須' });
+  if (def.task === 'timeseries' && (!def.timeCol || typeof def.timeCol !== 'string')) {
+    return res.status(400).json({ error: '時系列タスクには timeCol が必要' });
+  }
+
+  const models = loadMlModels();
+  const idx = models.findIndex(m => m.name === def.name);
+  const now = Date.now();
+  const entry = {
+    name: def.name,
+    task: def.task,
+    tableName: def.tableName,
+    features: def.features,
+    target: def.target,
+    timeCol: def.timeCol || null,
+    windowSize: def.windowSize || (def.task === 'timeseries' ? 7 : null),
+    epochs: parseInt(def.epochs) || 300,
+    learningRate: parseFloat(def.learningRate) || 0.001,
+    batchSize: parseInt(def.batchSize) || 32,
+    hiddenSize: parseInt(def.hiddenSize) || 64,
+    numLayers: parseInt(def.numLayers) || 2,
+    testRatio: parseFloat(def.testRatio) || 0.2,
+    description: def.description || '',
+    createdAt: idx >= 0 ? models[idx].createdAt : now,
+    updatedAt: now,
+  };
+  if (idx >= 0) models[idx] = entry;
+  else models.push(entry);
+  saveMlModels(models);
+  log(ip, `[ML] モデル定義 ${idx >= 0 ? '更新' : '作成'}: ${def.name}`);
+  res.json({ ok: true, model: entry });
+});
+
+// ─── モデル削除 ───
+app.delete('/ml/models/:name', requireAuth, requirePermission('ml:write'), (req, res) => {
+  const ip = getIP(req);
+  const name = req.params.name;
+  if (!isValidModelName(name)) return res.status(400).json({ error: '無効なモデル名' });
+  const models = loadMlModels();
+  const idx = models.findIndex(m => m.name === name);
+  if (idx < 0) return res.status(404).json({ error: 'モデルが見つかりません' });
+  models.splice(idx, 1);
+  saveMlModels(models);
+  // モデルファイルも削除
+  const modelDir = path.join(ML_MODELS_DIR, name);
+  if (fs.existsSync(modelDir)) {
+    try { fs.rmSync(modelDir, { recursive: true, force: true }); } catch {}
+  }
+  log(ip, `[ML] モデル削除: ${name}`);
+  res.json({ ok: true });
+});
+
+// ─── ジョブ一覧 ───
+app.get('/ml/jobs', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const jobs = loadMlJobs();
+  // 新しい順
+  jobs.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+  res.json({ jobs: jobs.slice(0, 50), running: currentMlJob ? currentMlJob.jobId : null });
+});
+
+// ─── ジョブのログ取得 (実行中) ───
+app.get('/ml/jobs/:id/log', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const jobId = req.params.id;
+  // 実行中のログはメモリ
+  if (currentMlJob && currentMlJob.jobId === jobId) {
+    return res.json({ running: true, log: currentMlJob.log.join('') });
+  }
+  // 完了済みはファイル
+  const jobs = loadMlJobs();
+  const job = jobs.find(j => j.id === jobId);
+  if (!job) return res.status(404).json({ error: 'ジョブが見つかりません' });
+  const logFile = path.join(ML_MODELS_DIR, job.modelName, 'train.log');
+  if (fs.existsSync(logFile)) {
+    res.json({ running: false, log: fs.readFileSync(logFile, 'utf-8') });
+  } else {
+    res.json({ running: false, log: '(ログがありません)' });
+  }
+});
+
+// ─── 学習ジョブ開始 ───
+// body: { modelName }
+app.post('/ml/jobs/start', requireAuth, requirePermission('ml:write'), jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const { modelName } = req.body || {};
+  if (currentMlJob) {
+    return res.status(409).json({ error: `既に学習中: ${currentMlJob.modelName} (jobId: ${currentMlJob.jobId})` });
+  }
+  if (!isValidModelName(modelName)) return res.status(400).json({ error: '無効なモデル名' });
+  const models = loadMlModels();
+  const model = models.find(m => m.name === modelName);
+  if (!model) return res.status(404).json({ error: 'モデル定義が見つかりません' });
+
+  // 重要: DuckDB は排他ロック (https://duckdb.org/docs/stable/connect/concurrency)。
+  // Node.js が DB を開いた状態だと Python が read_only でも開けない。
+  // → 学習前に CHECKPOINT (WAL を本体にフラッシュ) してから Node 側の接続を完全クローズし、
+  //   Python 側で開いて読み込む。Python 終了後に Node 側で再オープン。
+  try {
+    if (_mlDbConn) {
+      log(ip, `[ML] CHECKPOINT 実行 + DB接続を学習用に一時クローズ`);
+      await mlExec('CHECKPOINT');
+      await new Promise((resolve) => _mlDbConn.close(resolve));
+      _mlDbConn = null;
+    }
+    if (_mlDb) {
+      await new Promise((resolve) => _mlDb.close(resolve));
+      _mlDb = null;
+    }
+  } catch (e) {
+    log(ip, `[ML] DB クローズ警告: ${e.message} (続行します)`);
+  }
+
+  const jobId = `mljob_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const modelDir = path.join(ML_MODELS_DIR, modelName);
+  if (!fs.existsSync(modelDir)) fs.mkdirSync(modelDir, { recursive: true });
+  const tmpCfg = path.join(modelDir, '_run_config.json');
+  const runConfig = {
+    ...model,
+    modelName: model.name,
+    outputDir: modelDir,
+    dbPath: ML_DB_FILE,
+  };
+  fs.writeFileSync(tmpCfg, JSON.stringify(runConfig, null, 2));
+
+  const pythonCmd = appConfig.pythonPath || 'python3';
+  const scriptPath = path.join(__dirname, 'ml_runner.py');
+  if (!fs.existsSync(scriptPath)) {
+    return res.status(500).json({ error: `ml_runner.py が見つかりません: ${scriptPath}` });
+  }
+
+  log(ip, `[ML] ジョブ開始: ${modelName} (jobId: ${jobId})`);
+
+  // ジョブ履歴に記録
+  const jobs = loadMlJobs();
+  const jobEntry = {
+    id: jobId,
+    modelName: model.name,
+    task: model.task,
+    tableName: model.tableName,
+    epochs: model.epochs,
+    status: 'running',
+    startedAt: Date.now(),
+    endedAt: null,
+    exitCode: null,
+  };
+  jobs.push(jobEntry);
+  saveMlJobs(jobs);
+
+  // 実行
+  const { spawn } = require('child_process');
+  const proc = spawn(pythonCmd, [scriptPath, tmpCfg], {
+    cwd: __dirname,
+    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+  });
+  const logFile = path.join(modelDir, 'train.log');
+  const logStream = fs.createWriteStream(logFile, { flags: 'w' });
+
+  currentMlJob = {
+    jobId,
+    modelName: model.name,
+    proc,
+    log: [],
+    startedAt: Date.now(),
+  };
+
+  const handleData = (data) => {
+    const str = data.toString();
+    currentMlJob && currentMlJob.log.push(str);
+    // メモリ消費抑制: 1000行超で先頭から削除
+    if (currentMlJob && currentMlJob.log.length > 1000) {
+      currentMlJob.log = currentMlJob.log.slice(-800);
+    }
+    logStream.write(str);
+  };
+  proc.stdout.on('data', handleData);
+  proc.stderr.on('data', handleData);
+  proc.on('close', (code) => {
+    logStream.end();
+    try { fs.unlinkSync(tmpCfg); } catch {}
+    const allJobs = loadMlJobs();
+    const j = allJobs.find(jj => jj.id === jobId);
+    if (j) {
+      j.status = code === 0 ? 'completed' : 'failed';
+      j.endedAt = Date.now();
+      j.exitCode = code;
+      // metrics.json から最終値を取り込み (UI 表示用)
+      try {
+        const mp = path.join(modelDir, 'metrics.json');
+        if (fs.existsSync(mp)) {
+          const m = JSON.parse(fs.readFileSync(mp, 'utf-8'));
+          j.finalTestLoss = m.finalTestLoss;
+          j.finalAccuracy = m.finalAccuracy;
+          j.finalMAE = m.finalMAE;
+        }
+      } catch {}
+      saveMlJobs(allJobs);
+    }
+    log('-', `[ML] ジョブ終了: ${modelName} (jobId: ${jobId}, code: ${code})`);
+    currentMlJob = null;
+    // ジョブ完了したのでNode.js側のDB接続を遅延再オープン
+    // (次のクエリで自動的に getMlDb() が呼ばれて新規接続される)
+    // → 何もしなくてOK、_mlDb/_mlDbConn は null のままなので次回アクセス時に再接続
+  });
+  proc.on('error', (err) => {
+    log('-', `[ML] ジョブ起動エラー: ${err.message}`);
+    currentMlJob = null;
+  });
+
+  res.json({ ok: true, jobId, modelName: model.name });
+});
+
+// ─── ジョブ停止 ───
+app.post('/ml/jobs/:id/stop', requireAuth, requirePermission('ml:write'), (req, res) => {
+  const ip = getIP(req);
+  const jobId = req.params.id;
+  if (!currentMlJob || currentMlJob.jobId !== jobId) {
+    return res.status(404).json({ error: '実行中のジョブが見つかりません' });
+  }
+  try {
+    currentMlJob.proc.kill('SIGTERM');
+    setTimeout(() => {
+      if (currentMlJob && currentMlJob.proc && !currentMlJob.proc.killed) {
+        try { currentMlJob.proc.kill('SIGKILL'); } catch {}
+      }
+    }, 3000);
+    log(ip, `[ML] ジョブ停止要求: ${jobId}`);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── モデルメトリクス取得 (学習履歴グラフ用) ───
+app.get('/ml/models/:name/metrics', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const name = req.params.name;
+  if (!isValidModelName(name)) return res.status(400).json({ error: '無効なモデル名' });
+  const mp = path.join(ML_MODELS_DIR, name, 'metrics.json');
+  if (!fs.existsSync(mp)) return res.status(404).json({ error: 'メトリクスが見つかりません (未学習?)' });
+  try {
+    const m = JSON.parse(fs.readFileSync(mp, 'utf-8'));
+    res.json(m);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── モデルの設定情報を取得 (特徴量カラム、カテゴリ候補値など) ───
+// UIの「予測を試す」フォームや LLM の予測呼び出し前に必要な情報
+app.get('/ml/models/:name/config', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const name = req.params.name;
+  if (!isValidModelName(name)) return res.status(400).json({ error: '無効なモデル名' });
+  const cfgPath = path.join(ML_MODELS_DIR, name, 'config.json');
+  if (!fs.existsSync(cfgPath)) return res.status(404).json({ error: 'モデル設定が見つかりません (未学習?)' });
+  try {
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+    // label_encoders から各カテゴリ列のクラス一覧を取得して同梱
+    // (UIで select の選択肢として使うため)
+    // pickleはNode.jsで直接読めないので、Python で読むのが理想だが
+    // 学習時に config.json にも書き込むようにしてもよい (今後)
+    // 現状は config 単独で返す
+    res.json(cfg);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── 推論 ───
+// body: { features: { col1: val, col2: val } | [{ ... }, { ... }] }
+//   - 単一辞書 → 1件予測
+//   - 辞書配列 → 複数件バッチ予測 (上限100件)
+//   - 時系列: features は配列の配列 [[v1,v2,v3], ...]
+app.post('/ml/models/:name/predict', requireAuth, requirePermission('ml:read'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const name = req.params.name;
+  if (!isValidModelName(name)) return res.status(400).json({ error: '無効なモデル名' });
+
+  // 学習中は推論も拒否 (Python 環境の競合は問題ないが、混乱を避けるため)
+  if (currentMlJob) {
+    return res.status(409).json({ error: `現在学習中のため推論できません: ${currentMlJob.modelName}` });
+  }
+
+  const modelDir = path.join(ML_MODELS_DIR, name);
+  if (!fs.existsSync(path.join(modelDir, 'model.pt'))) {
+    return res.status(404).json({ error: `モデルが学習されていません: ${name}` });
+  }
+
+  let { features } = req.body || {};
+  if (features === undefined) {
+    return res.status(400).json({ error: 'features (オブジェクト or 配列) が必要です' });
+  }
+  // 単一辞書を配列に変換 (Python側は常に配列前提)
+  if (!Array.isArray(features)) {
+    features = [features];
+  }
+  if (features.length === 0) {
+    return res.status(400).json({ error: 'features が空です' });
+  }
+  if (features.length > 100) {
+    return res.status(400).json({ error: 'features は100件以下にしてください (バッチ推論)' });
+  }
+
+  const pythonCmd = appConfig.pythonPath || 'python3';
+  const scriptPath = path.join(__dirname, 'ml_predict.py');
+  if (!fs.existsSync(scriptPath)) {
+    return res.status(500).json({ error: `ml_predict.py が見つかりません: ${scriptPath}` });
+  }
+
+  const { spawn } = require('child_process');
+  const proc = spawn(pythonCmd, [scriptPath, modelDir], {
+    cwd: __dirname,
+    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+  });
+
+  let stdout = '';
+  let stderr = '';
+  proc.stdout.on('data', d => { stdout += d.toString(); });
+  proc.stderr.on('data', d => { stderr += d.toString(); });
+
+  // タイムアウト 30秒
+  const timeout = setTimeout(() => {
+    try { proc.kill('SIGKILL'); } catch {}
+  }, 30000);
+
+  proc.on('close', (code) => {
+    clearTimeout(timeout);
+    if (code !== 0) {
+      // Python 側がエラー JSON を吐いた場合はそれを返す
+      try {
+        const errObj = JSON.parse(stdout || stderr);
+        return res.status(500).json(errObj);
+      } catch {
+        return res.status(500).json({ error: `推論失敗 (exit ${code}): ${stderr.slice(0, 500) || stdout.slice(0, 500)}` });
+      }
+    }
+    try {
+      const result = JSON.parse(stdout);
+      log(ip, `[ML] predict ${name}: ${result.count} 件`);
+      res.json(result);
+    } catch (e) {
+      res.status(500).json({ error: `推論結果のパース失敗: ${e.message}`, stdout: stdout.slice(0, 500) });
+    }
+  });
+  proc.on('error', (err) => {
+    clearTimeout(timeout);
+    res.status(500).json({ error: `推論プロセス起動失敗: ${err.message}` });
+  });
+
+  // 入力JSONを stdin に書き込み
+  proc.stdin.write(JSON.stringify({ features }));
+  proc.stdin.end();
+});
+
 
 // ─── フォールバック ───
 app.get('*', (req, res) => {

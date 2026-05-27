@@ -635,8 +635,8 @@ function App() {
   // ─── アプリ設定 (config.json) ───
   const [appConfig, setAppConfig] = useState({
     appName: 'OpenGeekLLMChat',
-    logoMain: 'OpenGeek',
-    logoSub: 'LLM Chat',
+    logoMain: 'OpenGeekLLM',
+    logoSub: 'Chat',
     welcomeMessage: 'ドキュメントをアップロードしてRAGベースの質問応答を行うか、自由にチャットを開始できます。',
     welcomeHints: ['ドキュメントを要約して', 'この資料の要点は？', '〇〇について教えて'],
     accentColor: '#34d399',
@@ -1267,6 +1267,175 @@ function App() {
           });
         }
 
+        // ML データテーブルツール: mlEnabled が有効ならツール提供（読み取り専用）
+        // 重要: これらのツールは、ユーザーが【明示的にテーブル名・モデル名・または
+        // 「データテーブル」「ML」「機械学習」というメタ的なキーワード】を発話した時のみ呼ぶ。
+        // 雑談、一般質問、コード生成、Web検索系では絶対に呼ばないこと。
+        if (appConfig.ml?.enabled) {
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'ml_list_datasets',
+              description: '【発動条件: ユーザーが「データテーブル」「ml の一覧」「どんなテーブルがあるか」等のメタ的な質問をした時のみ】機械学習用データテーブル(DuckDB)の一覧を取得する。\n\n❌ 呼ばないケース: ユーザーが具体的なテーブル名を既に指定している (その場合は ml_describe_dataset を直接呼ぶ)、ML と無関係な雑談、コード生成、Web検索が必要な質問。\n✅ 呼ぶケース: 「どんなデータがある?」「テーブル一覧見せて」「MLで何が登録されてる?」のような探索的な質問のみ。',
+              parameters: { type: 'object', properties: {} }
+            }
+          });
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'ml_describe_dataset',
+              description: '【発動条件: ユーザーが具体的なテーブル名を明示した時のみ】指定されたテーブルのスキーマ(カラム名・型)を取得する。\n\n❌ 呼ばないケース: ユーザーがテーブル名を一切言ってない、雑談、一般質問、テーブル名が曖昧 (「データを見せて」だけ等)。曖昧な場合はユーザーに「どのテーブル?」と聞き返すこと。\n✅ 呼ぶケース: 「data テーブルのカラム教えて」「sales_test の構造は?」のように、テーブル名が明確な質問。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  table: { type: 'string', description: 'ユーザーが明示したテーブル名 (英数字とアンダースコアのみ)。推測で勝手にテーブル名を作らないこと。' }
+                },
+                required: ['table']
+              }
+            }
+          });
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'ml_query_dataset',
+              description: '【発動条件: ユーザーが具体的なテーブル名 + データに対する分析/集計/閲覧の意図を明示した時のみ】SQLを実行する (SELECT/WITH のみ、書き込み・スキーマ変更禁止)。LIMIT が無ければ自動で1000行制限。\n\n❌ 呼ばないケース: テーブル名が分からない (まずユーザーに聞く)、雑談、一般質問、テーブル名を勝手に推測してSQL組み立て。\n✅ 呼ぶケース: 「data テーブルの東京の売上合計は?」「sales_test の月別集計を出して」のように、テーブル名が明確で集計/分析意図がある質問。必要なら先に ml_describe_dataset でスキーマ確認。DuckDB方言が使える(window関数、CTE、集約等)。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  sql: {
+                    type: 'string',
+                    description: '実行するSQL文 (SELECTまたはWITHで始まる、書き込み禁止)。例: "SELECT region, SUM(sales) FROM data GROUP BY region"'
+                  },
+                  limit: { type: 'number', description: '結果の最大行数 (デフォルト 1000、最大 10000)' }
+                },
+                required: ['sql']
+              }
+            }
+          });
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'ml_list_models',
+              description: '【発動条件: ユーザーが「どんなモデルがある?」「学習済みモデル一覧」のような探索的な質問をした時のみ】学習済みMLモデルの一覧と性能指標を取得する。\n\n❌ 呼ばないケース: ユーザーが具体的なモデル名を既に指定している (その場合は ml_predict を直接呼ぶ)、雑談、ML と無関係な質問。\n✅ 呼ぶケース: 「使えるモデル教えて」「予測モデル一覧」のようなメタ的な質問。',
+              parameters: { type: 'object', properties: {} }
+            }
+          });
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'ml_predict',
+              description:
+                '【発動条件: ユーザーが具体的なモデル名 + 予測に必要な情報を明示した時のみ】学習済みモデルで予測を実行する。\n\n' +
+                '❌ 呼ばないケース: モデル名が不明、必要情報が不足、モデル名を勝手に推測。\n' +
+                '✅ 呼ぶケース: 「sales_yosoku で東京・ProductA・5個・2027-04-15 を予測」のように、モデル名と入力値が明確。\n\n' +
+                '⚠️ 重要な使い方ルール:\n' +
+                '1. features には【元の特徴量名のみ】を使う (例: "date", "region", "product", "quantity")。\n' +
+                '   ml_list_models で返ってくる features フィールドが「使うべき列名」です。\n' +
+                '2. 日時列は元の日付文字列で渡す: ✅ "date": "2027-04-15"\n' +
+                '   ❌ "date_year": 2027, "date_month": 4, "date_day": 15 ← これは絶対にやらない\n' +
+                '   日時列は内部で自動的に year/month/day/dayofweek/dayofyear/is_weekend に分解されます。\n' +
+                '3. カテゴリ列は学習時の値 (例: "Tokyo")、数値列は数値で渡す。\n' +
+                '4. 不明な点があれば、まず ml_list_models で predictHint を確認すること (exampleInput が見られる)。\n\n' +
+                '正しい呼び出し例:\n' +
+                '  ml_predict("sales_yosoku", {"date": "2027-04-15", "region": "Tokyo", "product": "ProductA", "quantity": 5})\n\n' +
+                '間違った呼び出し例 (絶対にしない):\n' +
+                '  ❌ ml_predict("sales_yosoku", {"date_year": 2027, "date_month": 4, ...}) ← 派生列を直接渡してる\n' +
+                '  ❌ ml_predict("sales_yosoku", {"quantity": 5}) ← 必要な特徴量が欠けている',
+              parameters: {
+                type: 'object',
+                properties: {
+                  modelName: { type: 'string', description: 'ユーザーが明示したモデル名。推測で勝手にモデル名を作らないこと。' },
+                  features: {
+                    description: '特徴量。単一予測なら {col1: val1, ...} 形式の辞書、複数件なら辞書の配列。モデルの features に記載された「元の」列名のみ使う。日時列は元の日付文字列で渡す (例: "2027-04-15")。'
+                  }
+                },
+                required: ['modelName', 'features']
+              }
+            }
+          });
+        }
+
+        // ─── ML系ツールのプリフィルタ ───
+        // ユーザー発話に「具体的なテーブル名/モデル名」or「MLメタキーワード」が無い場合は
+        // ML系ツールを tools 配列から除外して、LLM が物理的に呼べないようにする。
+        // (description の指示だけだと LLM が独断で呼んでしまうことがあるため)
+        if (appConfig.ml?.enabled) {
+          // 直近のユーザー発話を結合 (今回入力 + 直前数ターンの履歴) して判定
+          const recentUserText = [
+            text,
+            ...history.slice(-4).filter(m => m.role === 'user').map(m =>
+              typeof m.content === 'string' ? m.content : ''
+            )
+          ].join(' ').toLowerCase();
+
+          // MLメタキーワード (これらを発話していたら ML 系ツール全部 OK)
+          const mlMetaKeywords = [
+            'ml', '機械学習', 'データテーブル', 'データ テーブル',
+            'duckdb', '予測モデル', '学習済みモデル',
+            'どんなテーブル', 'どんなモデル', 'テーブル一覧', 'モデル一覧',
+            'スキーマ', 'カラム', 'sql', 'select',
+            // 予測関連のキーワード
+            '予測して', '推論して', '予測する', '推論する', '予測でき',
+            'predict', 'forecast',
+          ];
+          const hasMetaKeyword = mlMetaKeywords.some(k => recentUserText.includes(k));
+
+          // 既存のテーブル名/モデル名がユーザー発話に含まれているか確認 (非同期で取得)
+          let hasSpecificName = false;
+          if (!hasMetaKeyword) {
+            try {
+              // テーブル一覧とモデル一覧を取得して、名前がユーザー発話に含まれるかチェック
+              const [tablesRes, modelsRes] = await Promise.all([
+                fetch('/ml/datasets').catch(() => null),
+                fetch('/ml/models').catch(() => null),
+              ]);
+              const knownNames = [];
+              if (tablesRes?.ok) {
+                const d = await tablesRes.json();
+                (d.tables || []).forEach(t => knownNames.push(t.name.toLowerCase()));
+              }
+              if (modelsRes?.ok) {
+                const d = await modelsRes.json();
+                (d.models || []).forEach(m => knownNames.push(m.name.toLowerCase()));
+              }
+              // 各名前についてユーザー発話に含まれるかチェック (単語境界も意識)
+              hasSpecificName = knownNames.some(name => {
+                if (!name) return false;
+                // 短すぎる名前 (3文字以下) は偶然マッチを避けるため単語境界チェック
+                if (name.length <= 3) {
+                  const re = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                  return re.test(recentUserText);
+                }
+                return recentUserText.includes(name);
+              });
+            } catch (e) {
+              console.log('[ML プリフィルタ] テーブル/モデル名取得失敗、ツール除外を見送り:', e.message);
+              // 取得失敗時は安全側 = ML ツールを残す
+              hasSpecificName = true;
+            }
+          }
+
+          if (!hasMetaKeyword && !hasSpecificName) {
+            // ML 系ツールを tools 配列から除外
+            const mlToolNames = new Set([
+              'ml_list_datasets', 'ml_describe_dataset', 'ml_query_dataset',
+              'ml_list_models', 'ml_predict',
+            ]);
+            const before = tools.length;
+            for (let i = tools.length - 1; i >= 0; i--) {
+              if (mlToolNames.has(tools[i]?.function?.name)) {
+                tools.splice(i, 1);
+              }
+            }
+            const removed = before - tools.length;
+            if (removed > 0) {
+              console.log(`[ML プリフィルタ] テーブル名/モデル名/MLキーワードがユーザー発話に無いため、ML系ツール ${removed}個を除外`);
+            }
+          } else {
+            console.log(`[ML プリフィルタ] ML系ツール有効 (hasMetaKeyword=${hasMetaKeyword}, hasSpecificName=${hasSpecificName})`);
+          }
+        }
+
         let agentSystem = systemPrompt;
         if (documents.length > 0 && sp.documents) {
           const docListText = documents.map(d => d.name).join(', ');
@@ -1330,6 +1499,14 @@ function App() {
           } else {
             toolListLines.push('- list_files/read_file: サーバーuploadsフォルダの参照');
           }
+        }
+        if (appConfig.ml?.enabled) {
+          // ML系ツールは「ユーザーがテーブル名/モデル名/メタキーワードを明示した時のみ」発動
+          toolListLines.push(
+            '- ml_*: 機械学習データテーブル/モデル系。【発動条件: ユーザーが「具体的なテーブル名」「具体的なモデル名」または「データテーブル」「ML」「機械学習」等のメタキーワードを発話した時のみ】呼ぶ。' +
+            '雑談・一般質問・コード生成では絶対に呼ばない。' +
+            'テーブル名/モデル名が不明なら、推測で勝手に名前を作らず、ユーザーに「どのテーブル/モデル?」と聞き返すこと。'
+          );
         }
         const judgeSystem = fillTemplate(sp.judge || '', { toolList: toolListLines.join('\n') });
 
@@ -1475,6 +1652,126 @@ function App() {
                 // contentは上書きで空にする（テキスト応答を破棄）
                 assistantMsg.content = '';
               }
+            }
+          }
+
+          // パターン3: ML系のテキスト形式呼び出し検出
+          // 例1: "sales_yosoku{"date_year": 2026, ...}" (Qwenで稀に発生)
+          // 例2: "ml_predict(modelName='sales_yosoku', features={...})"
+          // 例3: コードブロック内 ```json {"modelName": "...", "features": {...}} ```
+          if (appConfig.ml?.enabled && (!assistantMsg?.tool_calls || assistantMsg.tool_calls.length === 0) && assistantMsg?.content) {
+            const content = assistantMsg.content;
+            let mlCall = null;
+
+            // パターンA: <モデル名>{JSON} 形式
+            // モデル名は単語境界 + {JSON} のパターン
+            const directCallMatch = content.match(/(\b[a-zA-Z_][a-zA-Z0-9_]*\b)\s*(\{[\s\S]*?\})\s*$/m);
+            if (directCallMatch) {
+              const possibleModelName = directCallMatch[1];
+              const jsonStr = directCallMatch[2];
+              // ml_ で始まる関数名 or 既存のモデル名のいずれかなら採用
+              const isMlTool = ['ml_predict', 'ml_query_dataset', 'ml_describe_dataset'].includes(possibleModelName);
+              if (!isMlTool) {
+                // モデル名チェック (cachedModels が無いので、JSON にfeatures があれば ml_predict と判断)
+                try {
+                  const argsObj = JSON.parse(jsonStr);
+                  if (argsObj.date_year !== undefined || argsObj.date_month !== undefined ||
+                      argsObj.region !== undefined || argsObj.product !== undefined ||
+                      argsObj.quantity !== undefined || argsObj.features !== undefined) {
+                    mlCall = { name: 'ml_predict', args: { modelName: possibleModelName, features: argsObj.features || argsObj } };
+                  }
+                } catch {}
+              } else {
+                try {
+                  const argsObj = JSON.parse(jsonStr);
+                  mlCall = { name: possibleModelName, args: argsObj };
+                } catch {}
+              }
+            }
+
+            // パターンB: ml_predict(...) 形式
+            if (!mlCall) {
+              const mlFuncMatch = content.match(/ml_(predict|query_dataset|describe_dataset|list_models|list_datasets)\s*\(\s*([^)]*?)\s*\)/);
+              if (mlFuncMatch) {
+                const fname = 'ml_' + mlFuncMatch[1];
+                const argsStr = mlFuncMatch[2];
+                try {
+                  // JSON 形式の引数を試す
+                  const argsObj = JSON.parse('{' + argsStr.replace(/'/g, '"') + '}');
+                  mlCall = { name: fname, args: argsObj };
+                } catch {
+                  // key=value 形式: modelName='sales_yosoku', features={...}
+                  const args = {};
+                  const modelMatch = argsStr.match(/modelName\s*=\s*['"]([^'"]+)['"]/);
+                  if (modelMatch) args.modelName = modelMatch[1];
+                  const featuresMatch = argsStr.match(/features\s*=\s*(\{[\s\S]*\})/);
+                  if (featuresMatch) {
+                    try { args.features = JSON.parse(featuresMatch[1]); } catch {}
+                  }
+                  if (Object.keys(args).length > 0) {
+                    mlCall = { name: fname, args };
+                  }
+                }
+              }
+            }
+
+            // パターンC: JSON コードブロック内 (modelName と features を含む)
+            if (!mlCall) {
+              const jsonBlockMatch = content.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+              if (jsonBlockMatch) {
+                try {
+                  const obj = JSON.parse(jsonBlockMatch[1]);
+                  if (obj.modelName && obj.features) {
+                    mlCall = { name: 'ml_predict', args: obj };
+                  }
+                } catch {}
+              }
+            }
+
+            if (mlCall) {
+              // ⚠️ 派生列が含まれている場合は警告 (Pythonがエラーにするのでそのまま流す)
+              if (mlCall.name === 'ml_predict' && mlCall.args.features) {
+                const f = mlCall.args.features;
+                const hasDerived = Object.keys(f).some(k =>
+                  /^date_(year|month|day|dayofweek|dayofyear|is_weekend)$/i.test(k) ||
+                  /^[a-zA-Z]+_(year|month|day|dayofweek|dayofyear|is_weekend)$/i.test(k)
+                );
+                if (hasDerived) {
+                  console.warn('[ML テキスト形式検出] 派生列が含まれています、Python 側でエラー → 自動修正試行');
+                  // 派生列から元の日付を復元する試み
+                  const dateCols = new Set();
+                  for (const k of Object.keys(f)) {
+                    const m = k.match(/^([a-zA-Z]+)_(year|month|day|dayofweek|dayofyear|is_weekend)$/i);
+                    if (m) dateCols.add(m[1]);
+                  }
+                  for (const dc of dateCols) {
+                    const y = f[`${dc}_year`];
+                    const mo = f[`${dc}_month`];
+                    const d = f[`${dc}_day`];
+                    if (y && mo && d) {
+                      const dateStr = `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+                      f[dc] = dateStr;
+                      console.log(`[ML テキスト形式検出] 派生列 ${dc}_year/month/day から ${dc}="${dateStr}" を復元`);
+                    }
+                    // 派生列を削除
+                    for (const suf of ['year', 'month', 'day', 'dayofweek', 'dayofyear', 'is_weekend']) {
+                      delete f[`${dc}_${suf}`];
+                    }
+                  }
+                }
+              }
+
+              const fakeCall = {
+                id: 'call_' + Date.now(),
+                type: 'function',
+                function: {
+                  name: mlCall.name,
+                  arguments: JSON.stringify(mlCall.args),
+                },
+              };
+              console.log(`[ML テキスト形式検出] ${mlCall.name}(${JSON.stringify(mlCall.args).slice(0, 200)}) を実ツール呼び出しに変換`);
+              assistantMsg.tool_calls = [fakeCall];
+              assistantMsg.content = '';
             }
           }
 
@@ -1755,6 +2052,145 @@ function App() {
                   return copy;
                 });
               }
+            } else if (fnName === 'ml_list_datasets' || fnName === 'ml_describe_dataset' || fnName === 'ml_query_dataset'
+                       || fnName === 'ml_list_models' || fnName === 'ml_predict') {
+              // 機械学習用データテーブルへの読み取り専用アクセス + モデル推論
+              const label =
+                  fnName === 'ml_list_datasets' ? 'データテーブル一覧'
+                : fnName === 'ml_describe_dataset' ? `スキーマ: ${fnArgs.table || ''}`
+                : fnName === 'ml_query_dataset' ? `SQL: ${(fnArgs.sql || '').slice(0, 80)}`
+                : fnName === 'ml_list_models' ? 'モデル一覧'
+                : `予測: ${fnArgs.modelName || ''}`;
+              searchQueries.push({ type: 'data', query: label, resultCount: 0 });
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: `🗂️ ${label}`, searchQueries: [...searchQueries] };
+                return copy;
+              });
+
+              try {
+                let result;
+                if (fnName === 'ml_list_datasets') {
+                  const r = await fetch('/ml/datasets', { signal: controller.signal });
+                  const data = await r.json();
+                  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+                  result = data;
+                  searchQueries[searchQueries.length - 1].resultCount = data.tables?.length || 0;
+                } else if (fnName === 'ml_describe_dataset') {
+                  const table = fnArgs.table;
+                  if (!table) throw new Error('table パラメータが必要です');
+                  const r = await fetch(`/ml/datasets/${encodeURIComponent(table)}/schema`, { signal: controller.signal });
+                  const data = await r.json();
+                  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+                  result = data;
+                  searchQueries[searchQueries.length - 1].resultCount = data.columns?.length || 0;
+                } else if (fnName === 'ml_query_dataset') {
+                  if (!fnArgs.sql) throw new Error('sql パラメータが必要です');
+                  const r = await fetch('/ml/query', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sql: fnArgs.sql, limit: fnArgs.limit }),
+                    signal: controller.signal,
+                  });
+                  const data = await r.json();
+                  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+                  result = data;
+                  searchQueries[searchQueries.length - 1].resultCount = data.count || 0;
+                } else if (fnName === 'ml_list_models') {
+                  const r = await fetch('/ml/models', { signal: controller.signal });
+                  const data = await r.json();
+                  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+                  // 学習済みのみを返却 + 重要情報のみ抜き出し (LLMに渡す情報量を減らす)
+                  const trainedModels = (data.models || []).filter(m => m.trained).map(m => ({
+                    name: m.name,
+                    task: m.task,
+                    tableName: m.tableName,
+                    features: m.features,
+                    target: m.target,
+                    description: m.description,
+                    metrics: m.metrics ? {
+                      mae: m.metrics.finalMAE,
+                      accuracy: m.metrics.finalAccuracy,
+                      testLoss: m.metrics.finalTestLoss,
+                      trainSamples: m.metrics.trainSamples,
+                      testSamples: m.metrics.testSamples,
+                    } : null,
+                    // 推論時の正しい呼び方をLLMが分かるように
+                    predictHint: m.predictHint || null,
+                  }));
+                  result = { models: trainedModels, count: trainedModels.length };
+                  searchQueries[searchQueries.length - 1].resultCount = trainedModels.length;
+                } else {
+                  // ml_predict
+                  const modelName = fnArgs.modelName;
+                  if (!modelName) throw new Error('modelName が必要です');
+                  if (fnArgs.features === undefined) throw new Error('features が必要です');
+
+                  // ⚠️ LLM が派生列 (date_year, date_month, ...) を直接渡してしまう問題への対処
+                  // → 派生列を検知して元の日付文字列に自動復元
+                  // features が配列の場合も対応
+                  const sanitizeFeatures = (f) => {
+                    if (!f || typeof f !== 'object') return f;
+                    if (Array.isArray(f)) return f.map(sanitizeFeatures);
+                    const out = { ...f };
+                    // 派生列のグループを検出 (例: date_year, date_month, date_day → date)
+                    const dateCols = new Set();
+                    for (const k of Object.keys(out)) {
+                      const m = k.match(/^([a-zA-Z][a-zA-Z0-9]*)_(year|month|day|dayofweek|dayofyear|is_weekend)$/);
+                      if (m) dateCols.add(m[1]);
+                    }
+                    for (const dc of dateCols) {
+                      // 元の日時列が既にあるなら派生列削除のみ
+                      if (out[dc] !== undefined && out[dc] !== null && out[dc] !== '') {
+                        for (const suf of ['year', 'month', 'day', 'dayofweek', 'dayofyear', 'is_weekend']) {
+                          delete out[`${dc}_${suf}`];
+                        }
+                        continue;
+                      }
+                      // 派生列から日付を復元 (year + month + day が必須)
+                      const y = out[`${dc}_year`];
+                      const mo = out[`${dc}_month`];
+                      const d = out[`${dc}_day`];
+                      if (y !== undefined && mo !== undefined && d !== undefined) {
+                        const dateStr = `${parseInt(y)}-${String(parseInt(mo)).padStart(2, '0')}-${String(parseInt(d)).padStart(2, '0')}`;
+                        out[dc] = dateStr;
+                        console.log(`[ml_predict 入力修正] 派生列 ${dc}_year/${dc}_month/${dc}_day から ${dc}="${dateStr}" を復元`);
+                      }
+                      for (const suf of ['year', 'month', 'day', 'dayofweek', 'dayofyear', 'is_weekend']) {
+                        delete out[`${dc}_${suf}`];
+                      }
+                    }
+                    return out;
+                  };
+                  const sanitizedFeatures = sanitizeFeatures(fnArgs.features);
+
+                  const r = await fetch(`/ml/models/${encodeURIComponent(modelName)}/predict`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ features: sanitizedFeatures }),
+                    signal: controller.signal,
+                  });
+                  const data = await r.json();
+                  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+                  result = data;
+                  searchQueries[searchQueries.length - 1].resultCount = data.count || (data.predictions?.length || 0);
+                }
+                // ツール結果を LLM に返す。大きすぎる場合は先頭部分のみ
+                let content = JSON.stringify(result, null, 2);
+                if (content.length > 50000) {
+                  content = content.slice(0, 50000) + '\n... (結果が大きいため省略。LIMIT句で絞り込んでください)';
+                }
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content });
+              } catch (e) {
+                console.error(`[${fnName}] エラー:`, e);
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: `エラー: ${e.message}` });
+              } finally {
+                setMessages(prev => {
+                  const copy = [...prev];
+                  copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: null, searchQueries: [...searchQueries] };
+                  return copy;
+                });
+              }
             }
           }
           // ループ先頭に戻って次のツール判断を試みる
@@ -1801,6 +2237,85 @@ function App() {
 
         if (!finalRes.ok) throw new Error(`API Error: ${finalRes.status}`);
         await streamResponse(finalRes, contextInfo, searchQueries);
+
+        // ─── 空応答の救済処理 ───
+        // ツール呼び出し後の最終応答が空になることがある (Qwen3 系で稀に発生)
+        // → 「分からない場合は理由を説明してほしい」と明示プロンプト追加して再生成
+        // (LLMが回答を作れなかった = データ不足/モデル限界/質問の曖昧さ等 を率直に伝えてもらう)
+        {
+          const lastMsg = await new Promise(resolve => {
+            setMessages(prev => { resolve(prev[prev.length - 1]); return prev; });
+          });
+          const lastContent = (lastMsg?.content || '').trim();
+          const hasToolResultInHistory = apiMessages.some(m => m.role === 'tool');
+          if (hasToolResultInHistory && lastContent.length < 5) {
+            console.log('[空応答救済] ツール実行後の応答が空 → 理由説明モードで再生成');
+            // 「分からない時は分からないと言って」「データ不足なら何が必要か説明して」と明示
+            const retryMessages = [
+              ...apiMessages,
+              {
+                role: 'user',
+                content:
+                  '上記のツール実行結果をもとに回答してください。\n' +
+                  'もし以下のような状況であれば、その旨を率直にユーザーに伝えてください:\n' +
+                  '・必要なデータや情報が不足している → 何が足りないかを具体的に説明\n' +
+                  '・モデルや機能の制約で予測/回答が困難 → なぜできないかを説明\n' +
+                  '・ユーザーの質問が曖昧で複数の解釈ができる → どんな追加情報があれば答えられるかを質問\n' +
+                  '・ツール結果が予想外/エラーだった → その内容を要約して説明\n' +
+                  '推測や憶測で答えを作らず、分からないことは「分かりません」と正直に伝えてください。'
+              }
+            ];
+            const retryRes = await fetchWithRetry('/v1/chat/completions', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                model: chatModel,
+                messages: retryMessages,
+                stream: true,
+                stream_options: { include_usage: true },
+                ...llamaCommonOptions,
+              }),
+              signal: controller.signal,
+            });
+            if (retryRes.ok) {
+              // 既存の応答をクリアしてから再ストリーム
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = {
+                  ...copy[copy.length - 1],
+                  content: '',
+                  thinking: '',
+                };
+                return copy;
+              });
+              await streamResponse(retryRes, contextInfo, searchQueries);
+
+              // それでも空なら、固定メッセージにフォールバック
+              const afterMsg = await new Promise(resolve => {
+                setMessages(prev => { resolve(prev[prev.length - 1]); return prev; });
+              });
+              const afterContent = (afterMsg?.content || '').trim();
+              if (afterContent.length < 5) {
+                console.log('[空応答救済] 再生成後も空 → 固定メッセージで通知');
+                setMessages(prev => {
+                  const copy = [...prev];
+                  copy[copy.length - 1] = {
+                    ...copy[copy.length - 1],
+                    content:
+                      '申し訳ありません、適切な回答を生成できませんでした。\n\n' +
+                      'ツールの実行は完了しましたが、結果から確定的な回答を導き出せませんでした。\n' +
+                      '考えられる原因:\n' +
+                      '・必要なデータが不足している (該当する学習モデルやテーブルが無い等)\n' +
+                      '・ご質問内容に対してモデルや機能の制約がある\n' +
+                      '・ご質問が曖昧で、追加情報が必要\n\n' +
+                      'もし具体的な目的をお聞かせいただければ、別のアプローチをご提案できるかもしれません。',
+                  };
+                  return copy;
+                });
+              }
+            }
+          }
+        }
 
         // ─── ストリーミング最終応答後の救済処理 ───
         // Gemma系などが最終応答中に <|tool_call|> を出すケース
@@ -3399,9 +3914,16 @@ ${conversationText}
                 })}
               </select>
             </div>
-            <a className="tuning-link" href="/tuning.html" title="ファインチューニング管理画面を開く">
-              🧠 ファインチューニング
-            </a>
+            <div className="nav-link-row">
+              <a className="tuning-link" href="/tuning.html" title="ファインチューニング管理画面を開く">
+                🧠 ファインチューニング
+              </a>
+              {appConfig.ml?.enabled && (
+                <a className="tuning-link" href="/ml.html" title="機械学習データテーブル管理を開く">
+                  🤖 機械学習
+                </a>
+              )}
+            </div>
           </div>
         </div>
 
@@ -3713,7 +4235,7 @@ ${conversationText}
                       </div>
                       {msg.searchQueries?.map((sq, si) => (
                         <div key={si} className="agent-search-item">
-                          <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : sq.type === 'file' ? '📁' : sq.type === 'image' ? '🎨' : '🔍'}</span>
+                          <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : sq.type === 'file' ? '📁' : sq.type === 'image' ? '🎨' : sq.type === 'data' ? '🗂️' : '🔍'}</span>
                           <span className="agent-search-query">{sq.query}</span>
                           {sq.resultCount != null && (
                             <span className="agent-search-result">{sq.resultCount}件</span>
