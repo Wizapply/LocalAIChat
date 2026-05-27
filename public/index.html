@@ -2659,17 +2659,55 @@ function App() {
 
     // ─── ストリーミング完了後の救済処理 ───
     // <think>タグが閉じられないまま終わった場合、または reasoning_content だけで content が空の場合
-    // → thinking内容を最終応答にコピー
+    // → thinking内容を解析:
+    //   1. 独白行と通常テキスト行を分離
+    //   2. 通常テキスト行があれば、それを本文に昇格
+    //   3. 全部独白なら、固定メッセージにフォールバック
     setMessages(prev => {
       const copy = [...prev];
       const last = copy[copy.length - 1];
       if (last && last.role === 'assistant' && !last.content && last.thinking) {
-        console.warn('[救済] 最終応答が空、thinking内容を本文に昇格');
-        copy[copy.length - 1] = {
-          ...last,
-          content: last.thinking,
-          thinking: '',  // 重複表示を避けるためクリア
-        };
+        const thinkingLines = last.thinking.split(/\n+/);
+        const reasoningPatterns = [
+          /^\s*I (will|won't|'ll|need to|should|am going to|must|don't|do not|'m going|'m not)/i,
+          /^\s*The user('s| is| wants| needs| asked| said)/i,
+          /^\s*My (answer|response|reply|task|goal|plan) /i,
+          /^\s*This (sounds|looks|seems|is) (good|fine|correct|right|nice|okay|ok)/i,
+          /^\s*I'?ll? (just |now |proceed|make sure|keep|write|output|respond|answer)/i,
+          /^\s*(Okay|OK|Alright|So|Now|Let me)\s*,?\s+I\b/i,
+          /^\s*Let me (think|consider|check|analyze|see|write|now|just)/i,
+          /^\s*The response (will|is) /i,
+          /^\s*I (need|want|have) to /i,
+        ];
+        // 独白でない行 (実応答候補) を抽出
+        const realAnswerLines = thinkingLines.filter(l => {
+          const trimmed = l.trim();
+          if (!trimmed) return false;
+          return !reasoningPatterns.some(p => p.test(trimmed));
+        });
+        const reasoningLines = thinkingLines.filter(l => {
+          const trimmed = l.trim();
+          if (!trimmed) return false;
+          return reasoningPatterns.some(p => p.test(trimmed));
+        });
+
+        if (realAnswerLines.length > 0) {
+          // 実応答候補がある → それを本文に昇格、独白は thinking 領域に残す
+          console.warn(`[救済] thinking から実応答 ${realAnswerLines.length}行 を抽出して昇格 (独白 ${reasoningLines.length}行 は thinking 領域へ)`);
+          copy[copy.length - 1] = {
+            ...last,
+            content: realAnswerLines.join('\n').trim(),
+            thinking: reasoningLines.join('\n').trim(),
+          };
+        } else {
+          // 全部独白 → 固定メッセージ
+          console.warn(`[救済] thinkingが完全に独白 (${reasoningLines.length}行)、固定メッセージで応答`);
+          copy[copy.length - 1] = {
+            ...last,
+            content: '申し訳ありません、適切な応答を生成できませんでした。もう一度質問していただけますか?',
+            // thinking は残しておく (デバッグ用、ユーザーが展開すれば見える)
+          };
+        }
       }
       return copy;
     });
