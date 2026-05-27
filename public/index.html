@@ -2597,6 +2597,44 @@ function App() {
             displayThinking = (assistantThinking + tagThinking).trim();
             displayContent = closed ? afterThink.trim() : '';
           }
+
+          // ─── 英語独白パターンの検出 & 退避 ───
+          // Qwen3.6 35B-A3B[MoE] 等で <think> タグなしで AI の自己独白が
+          // 最終応答に混入する現象への対処
+          // 例: "I will write it now. I will not mention the date. ..."
+          //     "The user's query is short. I will keep the answer short."
+          // 検出した独白パターンの行を thinking 領域に移動
+          if (displayContent && /\bI (will|need to|should|am going to|must|won't|don't|'ll|'m)\b|\bThe user('s| is| wants| needs| asked)\b|\bMy (answer|response|reply|task)\b/.test(displayContent)) {
+            const lines = displayContent.split(/\n+/);
+            const reasoningLines = [];
+            const cleanLines = [];
+            // 既知の自己独白パターン (英語、AI の内省)
+            const reasoningPatterns = [
+              /^\s*I (will|won't|'ll|need to|should|am going to|must|don't|do not|'m going|'m not)/i,
+              /^\s*The user('s| is| wants| needs| asked| said)/i,
+              /^\s*My (answer|response|reply|task|goal|plan) (is|will|should|must)/i,
+              /^\s*This (sounds|looks|seems|is) (good|fine|correct|right|nice|okay|ok)/i,
+              /^\s*I'?ll? (just |now |proceed|make sure|keep|write|output|respond|answer)/i,
+              /^\s*(Okay|OK|Alright|So|Now|Let me)\s*,?\s+I\b/i,
+              /^\s*(Okay|OK|Alright)\s*,?\s+(the|so|let|now)\b/i,
+              /^\s*Let me (think|consider|check|analyze|see|write|now|just)/i,
+              /^\s*The response will be /i,
+              /^\s*I (need|want|have) to /i,
+            ];
+            for (const line of lines) {
+              const isReasoning = reasoningPatterns.some(p => p.test(line));
+              if (isReasoning) {
+                reasoningLines.push(line);
+              } else {
+                cleanLines.push(line);
+              }
+            }
+            if (reasoningLines.length > 0) {
+              displayThinking = (displayThinking ? displayThinking + '\n' : '') + reasoningLines.join('\n');
+              displayContent = cleanLines.join('\n').trim();
+            }
+          }
+
           setMessages(prev => {
             const copy = [...prev];
             copy[copy.length - 1] = {
