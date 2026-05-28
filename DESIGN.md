@@ -2473,6 +2473,106 @@ body, .app-layout, .chat-area {
     ```
     既存のテーブル名/モデル名を非同期取得してユーザー発話に含まれるかチェック。これで「こんにちは」「Pythonコード書いて」では ML ツールが完全に隠蔽される。
 
+97. **Qwen3.6 35B-A3B[MoE] の `<think>` タグ未閉鎖による独白リーク**
+    Qwen3 系 MoE モデルは制御トークンが時々不安定で、`<think>...</think>` の閉じタグを出し忘れて思考 (AI の自己独白) が最終応答に混入することがある。例: `"I will write it now. I will not mention the date. 50mmの場合の答えは115です。"`。**2段階で対処**:
+    - ストリーミング中: 11種類の独白パターン (`I (will|won't|need to)`, `The user`, `My (answer|response)`, `Let me think`, `This sounds good` 等) を行単位で検出し、thinking 領域に退避
+    - ストリーミング完了後: content が空 + thinking ありの場合、thinking から独白行を除外して残った行 (実応答候補) を content に昇格。全部独白なら固定メッセージ「適切な応答を生成できませんでした」にフォールバック
+    システムプロンプト (`systemPrompts.meta`) でも具体例 (❌ "I will..." / ❌ "私はこれから...") を列挙して予防。
+
+98. **外部APIサーバーのツール対応モードはモデルロード保証が必要**
+    通常モードでは llama-server を新規プロセスとして起動するため `waitForReady()` で起動完了を待つが、ツール対応モードでは **内部の llama-server を共用** する。起動時に指定モデルがロードされていない (or 別モデル) と、最初のリクエストで失敗する。対処:
+    ```javascript
+    if (agentMode && chatProcModel !== modelName) {
+      log('-', `内部モデルを ${chatProcModel || '(未ロード)'} → ${modelName} に切替`);
+      await startChatModel(modelName);  // 完了まで待つ
+    }
+    ```
+    さらにアイドルアンロード後の再リクエスト対応として、agent_proxy 側でも `ensureChatModelLoaded` をポーリングで待つロジックが必要。
+
+99. **`ensureChatModelLoaded` は非同期で起動して即 false を返す設計**
+    関数名から「await すれば確実にロード完了する」と誤解しがちだが、実装は「未起動なら起動開始してすぐ `false` を返す」設計。**ロード完了を待つには呼び出し側で 1秒ポーリングが必要**:
+    ```javascript
+    let ready = await ensureChatModelLoaded();
+    while (!ready && Date.now() - startedAt < timeoutMs) {
+      await new Promise(r => setTimeout(r, 1000));
+      ready = await ensureChatModelLoaded();
+    }
+    ```
+    元設計はチャット用 (プロキシ層で待機) なので問題なかったが、agent_proxy のような同期的に応答するエンドポイントでは明示的にポーリングする必要がある。
+
+100. **Express デフォルトのエラー応答は HTML**
+     `express.json()` のパースエラー、未知のパス (404)、未捕捉エラーは、デフォルトハンドラーが HTML を返す。これは Web ブラウザ向けには良いが、**OpenAI 互換 API を提供する場合は JSON で返す必要** がある。3層のハンドラーを明示的に登録:
+     ```javascript
+     // 1. JSON parse エラー (entity.parse.failed, entity.too.large)
+     app.use((err, req, res, next) => {
+       if (err.type === 'entity.parse.failed') {
+         return res.status(400).json({ error: { ... } });
+       }
+       next(err);
+     });
+     // 2. 404 (未知のパス)
+     app.use((req, res) => res.status(404).json({ error: { ... } }));
+     // 3. 汎用エラー
+     app.use((err, req, res, next) => res.status(err.status || 500).json({ ... }));
+     ```
+
+101. **`/health` エンドポイントは認証スキップが標準**
+     全エンドポイントに認証を適用すると、ロードバランサーや監視ツール (Kubernetes liveness probe 等) が `/health` を叩けない。**認証ミドルウェアの先頭でパススルー** する:
+     ```javascript
+     app.use((req, res, next) => {
+       if (req.path === '/health') return next();  // 認証不要
+       // ... Bearer 検証
+     });
+     ```
+     通常モード (llama-server 直接) はそもそも `/health` が無いことに注意。ツール対応モードでは明示的に `/health` を実装。
+
+102. **Windows cmd.exe はシングルクォートをエスケープしない**
+     `curl -d '{"messages":[...]}'` が Linux/macOS では動くが、Windows cmd.exe では **シングルクォートが文字列リテラルとして JSON に混入** してパースエラー。**3つの代替手段**:
+     - ダブルクォートで内部をエスケープ: `-d "{\"messages\":[...]}"`
+     - ファイル化して `@file`: `-d @req.json`
+     - PowerShell の `Invoke-RestMethod` または Python `requests` を使う
+     curl サンプルを README に載せる時は **OS別に併記** すること。
+
+103. **agent_proxy.js の循環参照を避ける deps オブジェクト**
+     `agent_proxy.js` から server.js の関数 (`ddgSearch`, `runMlPredict` 等) を呼びたいが、`require('./server')` すると循環参照で起動失敗する。**deps オブジェクト経由で関数を注入**:
+     ```javascript
+     // server.js
+     const { startAgentServer } = require('./agent_proxy');
+     function buildAgentDeps() {
+       return { ddgSearch, runMlPredict, getMlDb: () => ..., ... };
+     }
+     await startAgentServer(opts, buildAgentDeps());
+
+     // agent_proxy.js (server.js は require しない)
+     async function startAgentServer(opts, deps) {
+       const result = await deps.ddgSearch(query);  // ← deps 経由で呼ぶ
+     }
+     ```
+     これで agent_proxy.js は server.js の関数を「使える」が「依存しない」状態に。
+
+104. **embedding 不在時のRAG機能は多層で自動 OFF**
+     embedding サーバーが利用できない (config未設定 or モデルファイル不在) のに RAG ツール (`search_documents`) を有効にしてしまうと、毎回 search が失敗してユーザー体験を損なう。**4層で自動的に無効化**:
+     1. **UI**: `GET /external-servers/embedding-available` で利用可否を取得 → 不可なら RAG チェックボックスを `disabled` + 「⚠️ embedding未設定」表示 + 既に ON だったら自動 OFF
+     2. **サーバー起動時**: `startExternalServer` で `isEmbeddingAvailable()` をチェック、不可なら `enabledTools` から `rag` を自動除外し、レスポンスに warnings として通知
+     3. **API**: `POST /rag/documents`、`POST /rag/search` で事前チェック、不可なら 503 + 理由
+     4. **agent_proxy**: 起動時の `enabledTools` から既に除外されているのでツール一覧に出ない
+     これで「設定ミスに気づかず外部 API でRAGを使い続けて毎回エラー」というハマりが起こらない。
+
+105. **Python の前処理重複は ml_common.py で集約**
+     `ml_runner.py` (学習) と `ml_predict.py` (推論) で同じ前処理ロジック (`classify_dtype`, `expand_datetime_features`, `encode_value`, `parse_datetime`) を実装していると、**学習と推論で挙動がズレるバグの温床** になる。例: 学習時は `bool` をカテゴリ扱い、推論時は数値扱いといった乖離。`ml_common.py` に集約することで一箇所メンテになる:
+     ```python
+     # ml_runner.py / ml_predict.py 両方で:
+     from ml_common import classify_dtype, expand_datetime_features, encode_value, parse_datetime
+     ```
+     リファクタ後 ml_predict.py は 385行 → 290行 (95行削減)。
+
+106. **`chunkText` の `overlap >= chunkSize` で無限ループ**
+     RAG のチャンク分割で、誰かが `chunkText("...", 500, 600)` のように `overlap` を `chunkSize` より大きい値で呼ぶと、`start += chunkSize - overlap` が負になり**永久に進まずブラウザがハング**する。サーバー側も同じバグを持っていた。**ガード**:
+     ```javascript
+     const safeOverlap = Math.min(overlap, Math.floor(chunkSize / 2));
+     ```
+     ついでに `if (!text) return []` で null/空文字列ガードも入れる。ブラウザ側とサーバー側で完全に同じ実装にして挙動の乖離を防ぐ。
+
 ---
 
 ## 🎮 GPU監視バックエンドの設計
@@ -3266,6 +3366,26 @@ body: {
 
 ### 学習エンジン (ml_runner.py) の設計
 
+#### 「機械学習」の呼称と実体 (深層学習)
+
+本機能は UI・ドキュメントとも「機械学習 (ML)」と呼称しているが、学習エンジンの実体は **PyTorch によるニューラルネットワーク = 深層学習 (Deep Learning)** である。
+
+```
+機械学習 (Machine Learning) ← 本機能の呼称 (上位概念)
+  ├─ 古典的ML (決定木、SVM、線形回帰、ランダムフォレスト...) ← 未実装
+  └─ 深層学習 (Deep Learning) ← 本機能の実体
+       ├─ MLP (多層パーセプトロン)  → 回帰・分類タスクで使用
+       └─ LSTM (リカレントNN)        → 時系列タスクで使用
+```
+
+深層学習は機械学習の一分野なので「機械学習」という呼称は上位概念として正確。あえて広い呼称を選んだ理由:
+
+1. **一般ユーザーへの分かりやすさ**: 「深層学習」は技術者向けの響きが強く、「機械学習」の方が広く通じる
+2. **将来の拡張余地**: 古典的ML (scikit-learn の RandomForestRegressor 等、ニューラルネットを使わない手法) を追加しても名称を変えずに済む。小規模データ (数百行) では MLP より古典的MLが適することも多く、タスク種別に `random_forest` 等を足す余地を残している
+3. **タスク抽象化**: ユーザーは「回帰/分類/時系列」というタスクで考え、内部アルゴリズム (MLP/LSTM/RF) は実装詳細として隠蔽できる
+
+なお、現状の全タスク (回帰・分類・時系列) が深層学習で実装されている点は、データ規模が大きい場合 (数千〜数万行) には適切だが、極小データ (数十〜数百行) では過学習リスクがあるため、Dropout (0.1) と train/test 分割で対策している。
+
 #### タスク別アーキテクチャ
 
 ```python
@@ -3553,6 +3673,319 @@ app.use('/ml', (req, res, next) => {
 別オリジン (ブラウザ JS) からも利用可能。
 
 詳細手順は README.md の「🤖 機械学習 (ML)」セクションを参照。
+
+---
+
+## 🔧 外部API: ツール対応モード (agent_proxy.js)
+
+通常の外部APIは llama-server を別ポートで直接公開する「素のLLM」モードだが、ツール対応モードでは **server.js 内に専用の Express サーバーを別ポートで立てて**、Webチャットと同じツール群を外部から使えるようにする。実装は `agent_proxy.js` に集約。
+
+### 設計の動機
+
+外部APIサーバーで「素のLLM」だけを公開していると、Webチャットで自然に使える機能 (Web検索、ML予測、ファイル参照、RAG文書検索) が外部プログラムから使えなかった。Webチャット側のツール実行ロジックは **ブラウザの JavaScript と server.js に分散** しているため、外部からは直接利用できない。
+
+そこで:
+- server.js 内に **ツール実行ロジックを集約した Express サーバー** を別ポートで起動
+- OpenAI 互換の `/v1/chat/completions` を受けて、内部でエージェントループを回す
+- 内部の llama-server を素直に呼び出してツール判断 → ツール実行 → 最終応答
+
+```
+従来 (通常モード):
+  外部 → llama-server直結 (素のLLM、高速)
+
+ツール対応モード (新規):
+  外部 → agent_proxy.js (server.js 内、別ポート)
+           ↓ ツール判断 (内部 llama-server に問い合わせ)
+           ↓ tool_call が返れば実行 (ml/web/file/rag)
+           ↓ 結果を履歴に追加して再問い合わせ
+           ↓ 最終応答
+         内部 llama-server (素のLLM)
+```
+
+### ファイル構成
+
+```
+agent_proxy.js (~600行)
+├── startAgentServer(opts, deps)
+│   - Express アプリ作成
+│   - JSON parser + エラーハンドラー
+│   - Bearer トークン認証 (/health は除外)
+│   - エンドポイント定義
+│   - HTTP/HTTPS サーバー起動
+├── buildToolDefs(enabledTools, appConfig)
+│   - 有効ツールに応じて OpenAI 互換の関数定義配列を生成
+├── runAgentLoop({ messages, tools, ... })
+│   - MAX_TURNS=5 のツール実行ループ
+│   - tool_calls があれば executeTool で実行 → 履歴に追加 → 再問い合わせ
+│   - tool_calls が無くなれば最終応答
+├── executeTool(fnName, fnArgs, deps, ip)
+│   - 各ツールの実行 (ml_*, web_search, list_files, read_file, search_documents)
+│   - ml_predict は派生列を自動サニタイズ
+└── callLlama({ ... })
+    - 内部 llama-server の /v1/chat/completions を呼ぶラッパー
+```
+
+### deps オブジェクト経由の関数注入
+
+`agent_proxy.js` は server.js 内の関数 (`ddgSearch`, `getMlDb`, `runMlPredict` 等) を直接 require しない。**循環参照を避けるため**、server.js 側で `buildAgentDeps()` を呼んで必要な関数を集めた `deps` オブジェクトを作り、`startAgentServer(opts, deps)` 経由で渡す。
+
+```javascript
+// server.js
+function buildAgentDeps() {
+  return {
+    chatHost: appConfig.llamaServer.chatHost,
+    chatPort: appConfig.llamaServer.chatPort,
+    log, appConfig,
+    ensureChatModelLoaded,  // モデルロード保証
+    ddgSearch, fetchPageText,  // web検索
+    getMlDb: () => ({ allAsync: (sql, ...args) => mlQuery(sql, args) }),
+    loadMlModels, isValidTableName, isSafeReadOnlySql,
+    ML_MODELS_DIR, runMlPredict,
+    UPLOADS_DIR,
+    listUploadFiles: async () => { /* uploads再帰列挙 */ },
+    readUploadFile: async (path) => { /* safeUploadPath で安全に読む */ },
+    searchDocumentsSimple: async (query) => await ragSearch(query, 5),
+  };
+}
+
+// agent_proxy.js は deps.ddgSearch() のように使う
+```
+
+これにより agent_proxy.js は server.js を require せずに済む。
+
+### 対応ツール定義
+
+`buildToolDefs(enabledTools, appConfig)` で有効ツールに応じて関数定義を生成:
+
+| カテゴリ | ツール名 | 引数 | 用途 |
+|:--|:--|:--|:--|
+| ML | `ml_list_datasets` | (なし) | テーブル一覧 |
+| ML | `ml_describe_dataset` | `table` | スキーマ |
+| ML | `ml_query_dataset` | `sql, limit?` | 読み取り専用SQL |
+| ML | `ml_list_models` | (なし) | モデル一覧 + predictHint |
+| ML | `ml_predict` | `modelName, features` | 推論 |
+| Web | `web_search` | `query` | 検索 + 上位3件の本文取得 |
+| File | `list_files` | (なし) | uploads 一覧 |
+| File | `read_file` | `path` | uploads ファイル読み |
+| RAG | `search_documents` | `query` | 永続RAG検索 |
+
+### モデルロード保証の仕組み
+
+通常モードでは llama-server を新規プロセスとして起動するが、ツール対応モードでは **内部の llama-server を共用** する。そのため起動時に以下のチェックが必要:
+
+```javascript
+// startExternalServer の agentMode ブロック
+if (chatProcModel !== modelName) {
+  // 別モデルがロード中 or 未ロード → 切替
+  if (chatProcStarting) {
+    throw new Error('別のモデルが起動中');
+  }
+  await startChatModel(modelName);  // 完了まで待つ
+}
+```
+
+さらにアイドルアンロード後の再リクエスト対応として、agent_proxy の各リクエスト処理で `ensureChatModelLoaded` を呼ぶ:
+
+```javascript
+// agent_proxy.js: 各 /v1/chat/completions リクエスト
+let ready = await deps.ensureChatModelLoaded();
+if (!ready) {
+  // ensureChatModelLoaded は「未起動なら起動開始してすぐ false 返す」設計
+  // → ポーリングで完了まで待つ
+  const startedAt = Date.now();
+  while (!ready && Date.now() - startedAt < timeoutMs) {
+    await new Promise(r => setTimeout(r, 1000));
+    ready = await deps.ensureChatModelLoaded();
+  }
+}
+```
+
+### エラーハンドリング (OpenAI 互換)
+
+Express のデフォルトハンドラーは HTML を返すが、OpenAI 互換 API を目指すには JSON で返す必要がある。**3層のハンドラー** を仕込んで HTML 応答を完全排除:
+
+1. **JSON parser エラー**: `express.json()` の直後に `entity.parse.failed` / `entity.too.large` を捕捉
+   ```javascript
+   app.use((err, req, res, next) => {
+     if (err.type === 'entity.parse.failed') {
+       return res.status(400).json({
+         error: { message: '...', type: 'invalid_request_error',
+           hint: 'Content-Type: application/json を指定してください' }
+       });
+     }
+     next(err);
+   });
+   ```
+2. **404 ハンドラー**: 未知のパスも JSON で返す + 正規パスのヒント付き
+3. **汎用エラーハンドラー**: 予期しないエラーも JSON で返す
+
+### 認証 (`/health` は例外)
+
+Bearer トークン認証ミドルウェアで全エンドポイントを保護するが、`/health` だけは認証スキップ (ロードバランサーや監視ツール対応):
+
+```javascript
+app.use((req, res, next) => {
+  if (req.path === '/health') return next();  // ヘルスチェックは認証不要
+  // ... Bearer 検証
+});
+```
+
+### 派生列の自動復元 (ml_predict)
+
+Webチャット同様、LLM が `date_year, date_month, date_day` を直接渡してきた場合に元の日付文字列に復元するロジックを agent_proxy.js 側にも実装:
+
+```javascript
+const sanitize = (f) => {
+  const dateCols = new Set();
+  for (const k of Object.keys(f)) {
+    const m = k.match(/^([a-zA-Z][a-zA-Z0-9]*)_(year|month|day|...)$/);
+    if (m) dateCols.add(m[1]);
+  }
+  for (const dc of dateCols) {
+    if (f[dc] === undefined) {
+      const y = f[`${dc}_year`], mo = f[`${dc}_month`], d = f[`${dc}_day`];
+      if (y && mo && d) f[dc] = `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    }
+    for (const suf of ['year','month','day','dayofweek','dayofyear','is_weekend']) {
+      delete f[`${dc}_${suf}`];
+    }
+  }
+  return f;
+};
+```
+
+### 制約・設計上の割り切り
+
+- **chat タイプのみ対応**: embedding タイプは別 (RAG では内部 embedding を使う)
+- **ストリーミングは最終応答を一括返却**: 途中のツール実行はストリームに乗らない (実装複雑性のため)
+- **MAX_TURNS=5**: ツール実行ループの上限
+- **Python実行・画像生成は除外**: 任意コード実行や画像生成は外部公開のリスクが大きい
+- **ツール判断はモデル任せ**: Webチャット側にあるプリフィルタ (会話に該当キーワードが無ければ ML系ツールを除外) はシンプルさ優先で省略
+
+---
+
+## 📚 永続RAGドキュメント (外部API専用)
+
+ブラウザ側のチャット添付RAG (メモリ保持、セッション終了で消滅) とは独立した、**サーバー側の永続RAGストア**。`agent_proxy.js` の `search_documents` ツールから検索される。
+
+### 設計の選択
+
+- **uploads フォルダのファイルを流用**: 新しいアップロード機構を作らず、既存の `public/uploads/` を再利用
+- **API管理のみ**: ブラウザ UI は不要、`POST /rag/documents` で Python から登録
+- **embedding ベクトル検索**: キーワード検索ではなく、内部 embedding サーバー (mxbai-embed-large 等) で cosine 類似度検索
+
+### ストレージ
+
+```
+ml/rag/
+├── index.json          # { documents: [{ docId, filename, chunkCount, ingestedAt }] }
+└── <docId>.json        # { docId, filename, chunkCount,
+                        #   chunks: [string, ...],
+                        #   embeddings: [[float], ...],
+                        #   ingestedAt }
+```
+
+`docId` は `sha1(filename).slice(0,16)` で生成。同じファイル名を再登録すると同じ docId になるので**上書き更新**になる。
+
+### 登録フロー (POST /rag/documents)
+
+```javascript
+async function ragIngestFile(filename) {
+  // 1. uploads 内の安全なパスに変換
+  const abs = safeUploadPath(filename);
+  if (!abs) throw new Error('無効なパス');
+
+  // 2. テキスト系拡張子チェック (PDF/Word は弾く)
+  const textExts = ['.txt', '.md', '.csv', '.json', '.log', '.html', '.xml',
+                    '.yaml', '.yml', '.py', '.js', '.ts'];
+  if (!textExts.includes(path.extname(abs).toLowerCase())) {
+    throw new Error('テキスト系ファイルのみ対応');
+  }
+
+  // 3. 読み込み → チャンク分割
+  const text = fs.readFileSync(abs, 'utf-8');
+  const chunks = ragChunkText(text);  // 500文字, overlap 100
+
+  // 4. 各チャンクを embedding 化 (内部 embedding サーバーを呼ぶ)
+  const embeddings = [];
+  for (const chunk of chunks) {
+    embeddings.push(await ragGetEmbedding(chunk));
+  }
+
+  // 5. ml/rag/<docId>.json に保存 + index.json 更新
+  const docId = ragDocId(filename);
+  fs.writeFileSync(path.join(RAG_DIR, `${docId}.json`), JSON.stringify({
+    docId, filename, chunkCount: chunks.length, chunks, embeddings,
+  }));
+  // index 更新...
+}
+```
+
+### 検索フロー (search_documents ツール)
+
+```javascript
+async function ragSearch(query, topK = 5) {
+  // 1. クエリを embedding 化
+  const qVec = await ragGetEmbedding(query);
+
+  // 2. 全ドキュメントの全チャンクと cosine 類似度を計算
+  const scored = [];
+  for (const doc of loadRagIndex().documents) {
+    const data = JSON.parse(fs.readFileSync(`ml/rag/${doc.docId}.json`));
+    for (let i = 0; i < data.chunks.length; i++) {
+      const sim = ragCosineSim(qVec, data.embeddings[i]);
+      scored.push({ filename: data.filename, chunkIndex: i,
+                    text: data.chunks[i], score: sim });
+    }
+  }
+
+  // 3. スコアで降順ソート → top-K を返す
+  scored.sort((a, b) => b.score - a.score);
+  return { results: scored.slice(0, topK) };
+}
+```
+
+### embedding 未設定時の自動 OFF (4層防御)
+
+embedding サーバーが利用できない場合、RAG 関連機能は **4層で自動的に無効化** される:
+
+```javascript
+// 共通の判定関数 (config + ファイル存在チェック)
+function isEmbeddingAvailable() {
+  const em = appConfig.embeddingModel;
+  if (!em || !em.path) return { available: false, reason: 'config.embeddingModel.path が未設定' };
+  if (!fs.existsSync(em.path)) return { available: false, reason: `モデルファイル不在: ${em.path}` };
+  return { available: true };
+}
+```
+
+| 層 | チェックポイント | 動作 |
+|:--|:--|:--|
+| 1 | UI (チャット画面) | `GET /external-servers/embedding-available` をロード時に呼ぶ → RAG チェックボックスを disabled + 「⚠️ embedding未設定のため利用不可」表示 |
+| 2 | サーバー起動時 | `startExternalServer` の agentMode で `enabledTools` から `rag` を自動除外 + 警告ログ |
+| 3 | API直叩き | `POST /rag/documents`、`POST /rag/search` が 503 + 理由を返す |
+| 4 | agent_proxy 内 | ツール一覧から `search_documents` が除外される (層2の結果) |
+
+これにより、ユーザーが UI を経由しても、Python API直叩きでも、設定ミスの状態で「毎回 search_documents が失敗する」事故を防ぐ。
+
+### RAG ロジックの統一 (ブラウザ ⟷ サーバー)
+
+ブラウザ側 `chunkText` / `cosineSim` (添付ドキュメント用) とサーバー側 `ragChunkText` / `ragCosineSim` (永続RAG用) は **挙動を完全に揃える** ことで保守性を高めた:
+
+| 項目 | 統一前 | 統一後 |
+|:--|:--|:--|
+| 無限ループ | `overlap >= chunkSize` でハング | `safeOverlap = min(overlap, floor(chunkSize/2))` でガード |
+| 末尾チャンク | `chunkSize - overlap` で進む | `if (end >= text.length) break;` で確実に終了 |
+| 空入力 | `null.length` で例外 | `if (!text) return [];` でガード |
+| cosine epsilon | サーバー側 `1e-8`, ブラウザ `1e-10` | 両方 `1e-10` に統一 |
+
+### embedding サーバーの再利用
+
+新たな embedding サーバーは立てず、**既存の `ensureEmbeddingLoaded()`** をそのまま使う。これにより:
+
+- メモリ効率 (1プロセスで済む)
+- Webチャットの添付RAG と同じ embedding モデルを使えるので、後でブラウザRAGをサーバーRAGに統合する余地がある
+- アイドルアンロードも自動的に効く
 
 ---
 

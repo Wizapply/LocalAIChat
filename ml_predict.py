@@ -23,6 +23,17 @@ import pickle
 import sys
 import traceback
 
+# 共通モジュール (学習・推論で同じ前処理ロジックを共有)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ml_common import (
+    DATETIME_FEATURES,
+    classify_dtype,
+    parse_datetime,
+    expand_datetime_features,
+    encode_value,
+    example_input,
+)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -126,7 +137,7 @@ def main():
                         ),
                         'required_features_to_provide': original_features,
                         'datetime_columns_auto_expanded': list(datetime_source_cols),
-                        'example_correct_input': _example_input(original_features, datetime_source_cols),
+                        'example_correct_input': example_input(original_features, datetime_source_cols),
                     }, ensure_ascii=False))
                     sys.exit(1)
 
@@ -163,7 +174,7 @@ def main():
                         'missing': missing_originals,
                         'provided': list(sample.keys()),
                         'datetime_columns_auto_expanded': list(datetime_source_cols),
-                        'example_correct_input': _example_input(original_features, datetime_source_cols),
+                        'example_correct_input': example_input(original_features, datetime_source_cols),
                     }, ensure_ascii=False))
                     sys.exit(1)
                 X_list.append(row)
@@ -273,112 +284,6 @@ def main():
         sys.exit(1)
 
 
-def encode_value(col, val, feature_dtypes, encoders):
-    """1値を学習時と同じ方法でエンコード"""
-    dtype = feature_dtypes.get(col, 'numeric')
-    if dtype == 'category':
-        # カテゴリ: LabelEncoder の classes_ からインデックス取得
-        enc_info = encoders.get('features', {}).get(col, {})
-        classes = enc_info.get('classes', [])
-        s = str(val)
-        if s in classes:
-            return float(classes.index(s))
-        # 未知のカテゴリ → -1 (sklearn の挙動とは違うが、エラーにせず推論実行)
-        # 学習時に見たカテゴリ数より大きい値だとモデルが想定外なので、警告として記録
-        return 0.0  # 一番目のクラスにフォールバック
-    else:
-        # 数値: そのまま float
-        try:
-            return float(val)
-        except (TypeError, ValueError):
-            return 0.0
-
-
-def expand_datetime_features(sample_dict, datetime_source_cols, datetime_features):
-    """
-    入力辞書に日時列が含まれていれば、学習時と同じ派生列に展開して返す。
-    例: {"date": "2027-07-15", "region": "Tokyo"} →
-        {"date_year": 2027, "date_month": 7, "date_day": 15,
-         "date_dayofweek": 3, "date_dayofyear": 196, "date_is_weekend": 0,
-         "region": "Tokyo"}
-    元の日時列は結果に含めない (展開後の派生列で置き換える)。
-    """
-    if not datetime_source_cols:
-        return dict(sample_dict)
-    # 遅延 import (Python 標準でカバー)
-    import datetime as _dt
-    out = {}
-    for k, v in sample_dict.items():
-        if k in datetime_source_cols:
-            # 日時にパース
-            dt = _parse_datetime(v)
-            if dt is None:
-                # パース失敗 → 0埋め (学習時もここで NaN になっていた可能性)
-                for feat in datetime_features:
-                    out[f'{k}_{feat}'] = 0
-                continue
-            for feat in datetime_features:
-                if feat == 'year':         out[f'{k}_{feat}'] = dt.year
-                elif feat == 'month':      out[f'{k}_{feat}'] = dt.month
-                elif feat == 'day':        out[f'{k}_{feat}'] = dt.day
-                elif feat == 'dayofweek':  out[f'{k}_{feat}'] = dt.weekday()
-                elif feat == 'dayofyear':  out[f'{k}_{feat}'] = dt.timetuple().tm_yday
-                elif feat == 'is_weekend': out[f'{k}_{feat}'] = 1 if dt.weekday() >= 5 else 0
-        else:
-            out[k] = v
-    return out
-
-
-def _example_input(original_features, datetime_source_cols):
-    """ユーザー/LLM 向けの正しい入力例を生成"""
-    example = {}
-    for f in original_features:
-        if f in datetime_source_cols:
-            example[f] = "2027-04-15"  # 日付例
-        elif f.lower() in ('region', 'area', 'city', '地域', '都市'):
-            example[f] = "Tokyo"
-        elif f.lower() in ('product', 'item', '商品'):
-            example[f] = "ProductA"
-        elif f.lower() in ('quantity', 'qty', 'count', '数量', '個数'):
-            example[f] = 5
-        else:
-            example[f] = "(値)"
-    return example
-
-
-def _parse_datetime(v):
-    """文字列/数値/datetime から datetime オブジェクトを返す。失敗時 None"""
-    import datetime as _dt
-    if v is None:
-        return None
-    if isinstance(v, _dt.datetime):
-        return v
-    if isinstance(v, _dt.date):
-        return _dt.datetime(v.year, v.month, v.day)
-    s = str(v).strip()
-    if not s:
-        return None
-    # よくあるフォーマットを順に試す
-    formats = [
-        '%Y-%m-%d %H:%M:%S',
-        '%Y-%m-%dT%H:%M:%S',
-        '%Y-%m-%dT%H:%M:%S.%f',
-        '%Y-%m-%d',
-        '%Y/%m/%d %H:%M:%S',
-        '%Y/%m/%d',
-        '%Y%m%d',
-    ]
-    for fmt in formats:
-        try:
-            return _dt.datetime.strptime(s, fmt)
-        except ValueError:
-            continue
-    # ISO 形式 fallback (Python 3.11+ なら fromisoformat が緩い)
-    try:
-        # 末尾の Z (UTC) を +00:00 に変換
-        return _dt.datetime.fromisoformat(s.replace('Z', '+00:00'))
-    except (ValueError, AttributeError):
-        return None
 
 
 if __name__ == '__main__':

@@ -1,0 +1,584 @@
+/**
+ * agent_proxy.js — ツール対応 OpenAI 互換エンドポイント
+ *
+ * 外部APIサーバーを「ツール対応モード」で起動した時に使われる。
+ * 通常の外部APIは llama-server を直接公開するだけだが、こちらは
+ * server.js 内に Express アプリを立てて別ポートで listen し、
+ * /v1/chat/completions を受けてエージェントループ (ツール判断→実行→最終応答) を回す。
+ *
+ * 対応ツール: ml_* (5), web_search, read_file, list_files, search_documents(簡易RAG)
+ * 非対応: generate_image, python実行 (セキュリティ・複雑性のため外部公開しない)
+ *
+ * server.js から提供される deps オブジェクト経由で内部関数を呼ぶ (循環参照回避)。
+ */
+
+const express = require('express');
+const https = require('https');
+const http = require('http');
+const fs = require('fs');
+
+/**
+ * ツール対応エージェントサーバーを起動
+ * @param {object} opts { port, host, apiKey, modelName, useHttps, certPath, keyPath, tools }
+ * @param {object} deps server.js から渡す内部関数群
+ * @returns {Promise<{server, close}>}
+ */
+async function startAgentServer(opts, deps) {
+  const {
+    port, host = '0.0.0.0', apiKey, modelName,
+    useHttps = false, certPath, keyPath,
+    tools: enabledTools = ['ml', 'web_search', 'file'],
+  } = opts;
+
+  const {
+    chatHost, chatPort,          // 内部 llama-server
+    log,                          // ログ関数 log(ip, msg)
+    appConfig,
+    ddgSearch, fetchPageText,     // web検索
+    getMlDb, loadMlModels, isValidTableName, isSafeReadOnlySql,  // ML
+    ML_MODELS_DIR,
+    runMlPredict,                 // ML推論 (server.jsのspawn処理をラップ)
+    UPLOADS_DIR,                  // ファイル操作
+    listUploadFiles, readUploadFile,
+  } = deps;
+
+  const app = express();
+
+  // JSON ボディパーサー (上限 32MB)
+  // パースエラー時は OpenAI 互換のJSONエラーレスポンスを返す (デフォルトはHTML)
+  app.use(express.json({ limit: '32mb' }));
+  app.use((err, req, res, next) => {
+    if (err && (err.type === 'entity.parse.failed' || err.type === 'entity.too.large')) {
+      return res.status(400).json({
+        error: {
+          message: `リクエストボディのJSON解析に失敗しました: ${err.message}`,
+          type: 'invalid_request_error',
+          hint: 'Content-Type: application/json を指定し、有効なJSONを送信してください',
+        },
+      });
+    }
+    next(err);
+  });
+
+  // API キー認証 (Bearer)
+  // /health はパブリック (生存確認用、認証スキップ)
+  app.use((req, res, next) => {
+    if (req.path === '/health') return next();  // ヘルスチェックは認証不要
+    if (!apiKey) return next();  // キー未設定なら認証なし
+    const auth = req.headers.authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+    if (token !== apiKey) {
+      return res.status(401).json({ error: { message: 'Invalid API key', type: 'invalid_request_error' } });
+    }
+    next();
+  });
+
+  // モデル一覧 (OpenAI互換)
+  app.get('/v1/models', (req, res) => {
+    res.json({
+      object: 'list',
+      data: [{ id: modelName, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'opengeek-llm' }],
+    });
+  });
+
+  // メインのチャット補完エンドポイント
+  app.post('/v1/chat/completions', async (req, res) => {
+    const ip = req.ip || req.socket?.remoteAddress || '-';
+    const body = req.body || {};
+    const userMessages = body.messages || [];
+    const stream = !!body.stream;
+    const temperature = body.temperature;
+    const maxTokens = body.max_tokens;
+
+    if (!Array.isArray(userMessages) || userMessages.length === 0) {
+      return res.status(400).json({ error: { message: 'messages is required', type: 'invalid_request_error' } });
+    }
+
+    log(ip, `[エージェントAPI] chat/completions (stream=${stream}, tools=${enabledTools.join(',')})`);
+
+    try {
+      // モデルがロード済みか確認 (アイドルアンロード後の再ロード対応)
+      // ensureChatModelLoaded は「未起動なら起動開始して false を返す」設計のため、
+      // ready=false の場合は起動完了までポーリングで待つ (最大 readyTimeoutMs)
+      if (deps.ensureChatModelLoaded) {
+        let ready = await deps.ensureChatModelLoaded();
+        if (!ready) {
+          const startedAt = Date.now();
+          const timeoutMs = (deps.appConfig?.llamaServer?.readyTimeoutMs) || 300000;
+          while (!ready && Date.now() - startedAt < timeoutMs) {
+            await new Promise(r => setTimeout(r, 1000));
+            ready = await deps.ensureChatModelLoaded();
+          }
+          if (!ready) {
+            return res.status(503).json({
+              error: { message: 'チャットモデルのロードがタイムアウトしました', type: 'service_unavailable' }
+            });
+          }
+        }
+      }
+
+      // ツール定義を構築
+      const tools = buildToolDefs(enabledTools, appConfig);
+
+      // エージェントループ
+      const result = await runAgentLoop({
+        messages: userMessages,
+        tools,
+        temperature,
+        maxTokens,
+        chatHost, chatPort, modelName,
+        deps,
+        ip,
+      });
+
+      if (stream) {
+        // ストリーミング: 最終応答を1チャンクで送る (簡易実装)
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        const id = 'chatcmpl-' + Date.now();
+        const created = Math.floor(Date.now() / 1000);
+        // content を 1 チャンクで
+        res.write('data: ' + JSON.stringify({
+          id, object: 'chat.completion.chunk', created, model: modelName,
+          choices: [{ index: 0, delta: { role: 'assistant', content: result.content }, finish_reason: null }],
+        }) + '\n\n');
+        res.write('data: ' + JSON.stringify({
+          id, object: 'chat.completion.chunk', created, model: modelName,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        }) + '\n\n');
+        res.write('data: [DONE]\n\n');
+        res.end();
+      } else {
+        res.json({
+          id: 'chatcmpl-' + Date.now(),
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: modelName,
+          choices: [{
+            index: 0,
+            message: { role: 'assistant', content: result.content },
+            finish_reason: 'stop',
+          }],
+          usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          // デバッグ用: 実行したツール
+          x_tools_used: result.toolsUsed,
+        });
+      }
+    } catch (e) {
+      log(ip, `[エージェントAPI] エラー: ${e.message}`);
+      if (!res.headersSent) {
+        res.status(500).json({ error: { message: e.message, type: 'server_error' } });
+      }
+    }
+  });
+
+  // ヘルスチェック
+  app.get('/health', (req, res) => res.json({ status: 'ok', mode: 'agent', model: modelName }));
+
+  // 404: 全ての未知のパスを JSON で返す (Express デフォルトの HTML を抑制)
+  app.use((req, res) => {
+    res.status(404).json({
+      error: {
+        message: `エンドポイントが見つかりません: ${req.method} ${req.path}`,
+        type: 'not_found',
+        hint: 'OpenAI互換: POST /v1/chat/completions、GET /v1/models、GET /health',
+      },
+    });
+  });
+
+  // 汎用エラーハンドラー (HTMLを返さずJSONで応答)
+  app.use((err, req, res, next) => {
+    log('-', `[エージェントAPI] 未捕捉エラー: ${err.message}`);
+    if (!res.headersSent) {
+      res.status(err.status || 500).json({
+        error: { message: err.message || 'Internal server error', type: err.type || 'server_error' },
+      });
+    }
+  });
+
+  // サーバー起動
+  return new Promise((resolve, reject) => {
+    let server;
+    try {
+      if (useHttps) {
+        const creds = { cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) };
+        server = https.createServer(creds, app);
+      } else {
+        server = http.createServer(app);
+      }
+      server.on('error', reject);
+      server.listen(port, host, () => {
+        resolve({
+          server,
+          close: () => new Promise(r => server.close(r)),
+        });
+      });
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+/**
+ * ツール定義を構築 (OpenAI function calling 形式)
+ */
+function buildToolDefs(enabledTools, appConfig) {
+  const tools = [];
+
+  if (enabledTools.includes('web_search')) {
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'web_search',
+        description: 'インターネットを検索して最新情報を取得する。最新ニュース、現在の出来事、リアルタイムデータ (株価/天気/価格等) が必要な時に使う。',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string', description: '検索クエリ' } },
+          required: ['query'],
+        },
+      },
+    });
+  }
+
+  if (enabledTools.includes('file')) {
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'list_files',
+        description: 'サーバーの uploads フォルダにあるファイル一覧を取得する。',
+        parameters: { type: 'object', properties: {} },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'read_file',
+        description: 'サーバーの uploads フォルダのファイルを読む。',
+        parameters: {
+          type: 'object',
+          properties: { path: { type: 'string', description: 'ファイル名 (uploads配下、プレフィックス不要)' } },
+          required: ['path'],
+        },
+      },
+    });
+  }
+
+  if (enabledTools.includes('ml') && appConfig.ml?.enabled) {
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'ml_list_datasets',
+        description: '機械学習用データテーブル(DuckDB)の一覧を取得する。',
+        parameters: { type: 'object', properties: {} },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'ml_describe_dataset',
+        description: '指定テーブルのスキーマ(カラム名・型)を取得する。',
+        parameters: {
+          type: 'object',
+          properties: { table: { type: 'string' } },
+          required: ['table'],
+        },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'ml_query_dataset',
+        description: '読み取り専用SQL (SELECT/WITH) を実行する。書き込み禁止。',
+        parameters: {
+          type: 'object',
+          properties: {
+            sql: { type: 'string' },
+            limit: { type: 'number' },
+          },
+          required: ['sql'],
+        },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'ml_list_models',
+        description: '学習済みMLモデル一覧と性能指標、predictHint (正しい入力例) を取得する。',
+        parameters: { type: 'object', properties: {} },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'ml_predict',
+        description: '学習済みモデルで予測。features はモデルの元の特徴量名で渡す。日時列は "2027-04-15" のような文字列で渡せば自動分解される。',
+        parameters: {
+          type: 'object',
+          properties: {
+            modelName: { type: 'string' },
+            features: { description: '辞書 or 辞書配列' },
+          },
+          required: ['modelName', 'features'],
+        },
+      },
+    });
+  }
+
+  if (enabledTools.includes('rag')) {
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'search_documents',
+        description: 'サーバーに登録済みのRAGドキュメントから、embedding ベクトル類似度で関連箇所を検索する。ユーザーの質問に答えるための参考資料・社内文書・マニュアル等を探す時に使う。',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string', description: '検索したい内容・質問' } },
+          required: ['query'],
+        },
+      },
+    });
+  }
+
+  return tools;
+}
+
+/**
+ * エージェントループ: ツール判断 → 実行 → 最終応答
+ */
+async function runAgentLoop({ messages, tools, temperature, maxTokens, chatHost, chatPort, modelName, deps, ip }) {
+  const { log } = deps;
+  const MAX_TURNS = 5;
+  const apiMessages = [...messages];
+  const toolsUsed = [];
+  let totalPromptTokens = 0;
+  let totalCompletionTokens = 0;
+
+  for (let turn = 0; turn < MAX_TURNS; turn++) {
+    // llama-server にツール付きで問い合わせ
+    const llamaResp = await callLlama({
+      chatHost, chatPort, modelName,
+      messages: apiMessages,
+      tools: tools.length > 0 ? tools : undefined,
+      temperature, maxTokens,
+      stream: false,
+    });
+
+    const choice = llamaResp.choices?.[0];
+    const msg = choice?.message || {};
+    if (llamaResp.usage) {
+      totalPromptTokens += llamaResp.usage.prompt_tokens || 0;
+      totalCompletionTokens += llamaResp.usage.completion_tokens || 0;
+    }
+
+    const toolCalls = msg.tool_calls || [];
+    if (toolCalls.length === 0) {
+      // ツール呼び出しなし = 最終応答
+      return {
+        content: (msg.content || '').trim(),
+        toolsUsed,
+        usage: {
+          prompt_tokens: totalPromptTokens,
+          completion_tokens: totalCompletionTokens,
+          total_tokens: totalPromptTokens + totalCompletionTokens,
+        },
+      };
+    }
+
+    // assistant のツール呼び出しメッセージを履歴に追加
+    apiMessages.push({ role: 'assistant', content: msg.content || '', tool_calls: toolCalls });
+
+    // 各ツールを実行
+    for (const tc of toolCalls) {
+      const fnName = tc.function?.name;
+      let fnArgs = {};
+      try { fnArgs = JSON.parse(tc.function?.arguments || '{}'); } catch {}
+      log(ip, `[エージェントAPI] tool: ${fnName}(${JSON.stringify(fnArgs).slice(0, 100)})`);
+      toolsUsed.push(fnName);
+
+      let toolResult;
+      try {
+        toolResult = await executeTool(fnName, fnArgs, deps, ip);
+      } catch (e) {
+        toolResult = `エラー: ${e.message}`;
+      }
+      let content = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult, null, 2);
+      if (content.length > 50000) content = content.slice(0, 50000) + '\n... (省略)';
+
+      apiMessages.push({ role: 'tool', tool_call_id: tc.id, content });
+    }
+  }
+
+  // MAX_TURNS 到達: ツールなしで最終応答を強制
+  const finalResp = await callLlama({
+    chatHost, chatPort, modelName,
+    messages: apiMessages,
+    temperature, maxTokens,
+    stream: false,
+  });
+  const finalMsg = finalResp.choices?.[0]?.message || {};
+  return {
+    content: (finalMsg.content || '回答を生成できませんでした。').trim(),
+    toolsUsed,
+    usage: {
+      prompt_tokens: totalPromptTokens,
+      completion_tokens: totalCompletionTokens,
+      total_tokens: totalPromptTokens + totalCompletionTokens,
+    },
+  };
+}
+
+/**
+ * 個別ツールの実行
+ */
+async function executeTool(fnName, fnArgs, deps, ip) {
+  const {
+    ddgSearch, fetchPageText,
+    getMlDb, loadMlModels, isValidTableName, isSafeReadOnlySql, ML_MODELS_DIR,
+    runMlPredict,
+    listUploadFiles, readUploadFile,
+    searchDocumentsSimple,
+  } = deps;
+
+  switch (fnName) {
+    case 'web_search': {
+      const results = await ddgSearch(fnArgs.query, 5);
+      // 上位3件の本文取得
+      const targets = results.slice(0, 3);
+      await Promise.all(targets.map(async r => {
+        try { r.body = await fetchPageText(r.url, 2000); } catch {}
+      }));
+      return { results };
+    }
+
+    case 'list_files':
+      return await listUploadFiles();
+
+    case 'read_file':
+      return await readUploadFile(fnArgs.path);
+
+    case 'ml_list_datasets': {
+      const db = getMlDb();
+      const rows = await db.allAsync(
+        `SELECT table_name FROM information_schema.tables WHERE table_schema='main'`
+      );
+      return { tables: rows.map(r => r.table_name) };
+    }
+
+    case 'ml_describe_dataset': {
+      if (!isValidTableName(fnArgs.table)) throw new Error('無効なテーブル名');
+      const db = getMlDb();
+      const cols = await db.allAsync(
+        `SELECT column_name, data_type FROM information_schema.columns WHERE table_name=? ORDER BY ordinal_position`,
+        fnArgs.table
+      );
+      return { table: fnArgs.table, columns: cols };
+    }
+
+    case 'ml_query_dataset': {
+      if (!isSafeReadOnlySql(fnArgs.sql)) throw new Error('読み取り専用SQL (SELECT/WITH) のみ許可');
+      let sql = fnArgs.sql.trim().replace(/;+\s*$/, '');
+      const limit = Math.min(fnArgs.limit || 1000, 10000);
+      if (!/\blimit\b/i.test(sql)) sql += ` LIMIT ${limit}`;
+      const db = getMlDb();
+      const rows = await db.allAsync(sql);
+      return { rows, count: rows.length };
+    }
+
+    case 'ml_list_models': {
+      const models = loadMlModels();
+      const fsLocal = require('fs');
+      const pathLocal = require('path');
+      const trained = models.filter(m => {
+        return fsLocal.existsSync(pathLocal.join(ML_MODELS_DIR, m.name, 'model.pt'));
+      }).map(m => {
+        const info = { name: m.name, task: m.task, tableName: m.tableName, features: m.features, target: m.target };
+        try {
+          const cfgPath = pathLocal.join(ML_MODELS_DIR, m.name, 'config.json');
+          if (fsLocal.existsSync(cfgPath)) {
+            const cfg = JSON.parse(fsLocal.readFileSync(cfgPath, 'utf-8'));
+            const origFeatures = cfg.originalFeatures || cfg.features || [];
+            const dtCols = cfg.datetimeSourceCols || [];
+            const example = {};
+            for (const f of origFeatures) {
+              if (dtCols.includes(f)) example[f] = '2027-04-15';
+              else if (/region|area|city/i.test(f)) example[f] = 'Tokyo';
+              else if (/product|item/i.test(f)) example[f] = 'ProductA';
+              else if (/quantity|qty|count/i.test(f)) example[f] = 5;
+              else example[f] = '(値)';
+            }
+            info.predictHint = { requiredFeatures: origFeatures, datetimeColumns: dtCols, exampleInput: example };
+          }
+          const mpath = pathLocal.join(ML_MODELS_DIR, m.name, 'metrics.json');
+          if (fsLocal.existsSync(mpath)) {
+            const mt = JSON.parse(fsLocal.readFileSync(mpath, 'utf-8'));
+            info.metrics = { mae: mt.finalMAE, accuracy: mt.finalAccuracy, testLoss: mt.finalTestLoss };
+          }
+        } catch {}
+        return info;
+      });
+      return { models: trained, count: trained.length };
+    }
+
+    case 'ml_predict': {
+      // 派生列の自動復元
+      const sanitize = (f) => {
+        if (Array.isArray(f)) return f.map(sanitize);
+        if (!f || typeof f !== 'object') return f;
+        const out = { ...f };
+        const dateCols = new Set();
+        for (const k of Object.keys(out)) {
+          const m = k.match(/^([a-zA-Z][a-zA-Z0-9]*)_(year|month|day|dayofweek|dayofyear|is_weekend)$/);
+          if (m) dateCols.add(m[1]);
+        }
+        for (const dc of dateCols) {
+          if (out[dc] === undefined) {
+            const y = out[`${dc}_year`], mo = out[`${dc}_month`], d = out[`${dc}_day`];
+            if (y && mo && d) out[dc] = `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+          }
+          for (const suf of ['year','month','day','dayofweek','dayofyear','is_weekend']) delete out[`${dc}_${suf}`];
+        }
+        return out;
+      };
+      const features = sanitize(fnArgs.features);
+      return await runMlPredict(fnArgs.modelName, features);
+    }
+
+    case 'search_documents': {
+      if (searchDocumentsSimple) return await searchDocumentsSimple(fnArgs.query);
+      return { error: 'ドキュメント検索は利用できません (サーバーにアップロード済みドキュメントが必要)' };
+    }
+
+    default:
+      throw new Error(`未知のツール: ${fnName}`);
+  }
+}
+
+/**
+ * 内部 llama-server を呼ぶ
+ */
+async function callLlama({ chatHost, chatPort, modelName, messages, tools, temperature, maxTokens, stream }) {
+  const useHttps = false;  // 内部通信は常にHTTP (localhost)
+  const url = `http://${chatHost}:${chatPort}/v1/chat/completions`;
+  const payload = {
+    model: modelName,
+    messages,
+    stream: false,
+  };
+  if (tools) payload.tools = tools;
+  if (temperature !== undefined) payload.temperature = temperature;
+  if (maxTokens !== undefined) payload.max_tokens = maxTokens;
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`llama-server エラー (${resp.status}): ${text.slice(0, 200)}`);
+  }
+  return await resp.json();
+}
+
+module.exports = { startAgentServer };

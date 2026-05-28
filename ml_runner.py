@@ -46,6 +46,10 @@ import time
 import traceback
 from pathlib import Path
 
+# 共通モジュール (学習・推論で同じ前処理ロジックを共有)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ml_common import classify_dtype, DATETIME_FEATURES
+
 # 進捗を逐次標準出力に流す (Node.js が拾う)
 def log(msg):
     print(msg, flush=True)
@@ -127,24 +131,12 @@ def main():
         # データ型情報を表示 (デバッグに便利)
         log(f"  カラム型: {dict(df.dtypes.astype(str))}")
 
-        # カテゴリ/数値/日時 カラムの判定
-        # pandas dtype として現れうる文字列系:
-        #   object, category, str (pandas 2.0+ StringDtype), string
-        # 日時系:
-        #   datetime64, datetime, timestamp, date
-        # それ以外は数値とみなす
-        def classify_dtype(col_dtype):
-            name = str(col_dtype).lower()
-            if 'datetime' in name or 'timestamp' in name or 'date' in name:
-                return 'datetime'
-            if name in ('object', 'category', 'str', 'string', 'bool', 'boolean'):
-                return 'category'
-            return 'numeric'
+        # カテゴリ/数値/日時 カラムの判定は ml_common.classify_dtype に集約
+        # (DuckDB Node binding が pandas 2.0+ で 'str' を返す等の互換性は ml_common 側で対応)
 
         # 日時列が特徴量に含まれている場合、複数の派生特徴に展開
-        # date → year, month, day, dayofweek, dayofyear, is_weekend (6列)
+        # date → year, month, day, dayofweek, dayofyear, is_weekend (6列、ml_common.DATETIME_FEATURES と同じ)
         # 学習時に展開された列名を記憶 (推論時にも同じ展開を行う)
-        DATETIME_FEATURES = ['year', 'month', 'day', 'dayofweek', 'dayofyear', 'is_weekend']
         datetime_source_cols = {}  # {'date': True} のように記録 (推論時に再現)
         expanded_features = []     # 展開後の最終的な特徴量カラム名リスト
         for col in cfg['features']:

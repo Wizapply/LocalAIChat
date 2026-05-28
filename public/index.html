@@ -31,18 +31,24 @@ function formatBytes(bytes) {
 }
 
 // ─── Utility: テキストをチャンクに分割 ───
+// (サーバー側 ragChunkText と挙動を揃える: 末尾チャンク到達で break、overlap 不正値もガード)
 function chunkText(text, chunkSize = 500, overlap = 100) {
   const chunks = [];
+  if (!text) return chunks;
+  // overlap >= chunkSize だと進まなくなる → 強制的に半分まで抑える
+  const safeOverlap = Math.min(overlap, Math.floor(chunkSize / 2));
   let start = 0;
   while (start < text.length) {
     const end = Math.min(start + chunkSize, text.length);
     chunks.push(text.slice(start, end));
-    start += chunkSize - overlap;
+    if (end >= text.length) break;
+    start += chunkSize - safeOverlap;
   }
   return chunks;
 }
 
 // ─── Utility: コサイン類似度 ───
+// サーバー側 ragCosineSim と挙動を揃える
 function cosineSim(a, b) {
   if (!a || !b || a.length !== b.length) return 0;
   let dot = 0, na = 0, nb = 0;
@@ -692,9 +698,15 @@ function App() {
   const [apiFormHost, setApiFormHost] = useState('0.0.0.0');
   const [apiFormPort, setApiFormPort] = useState(11434);
   const [apiFormKey, setApiFormKey] = useState('');
+  // ツール対応モード (agent_proxy 経由でツール群を使えるようにする)
+  const [apiFormAgentMode, setApiFormAgentMode] = useState(false);
+  const [apiFormTools, setApiFormTools] = useState(['ml', 'web_search', 'file']);
   // HTTPSデフォルト: 現在ブラウザでHTTPSアクセス中ならtrue（同じ証明書を使う想定）
   const [apiFormHttps, setApiFormHttps] = useState(typeof window !== 'undefined' && window.location.protocol === 'https:');
   const [apiHttpsAvailable, setApiHttpsAvailable] = useState(false);
+  // embedding (RAG用) が利用可能か
+  const [apiEmbeddingAvailable, setApiEmbeddingAvailable] = useState(true);
+  const [apiEmbeddingReason, setApiEmbeddingReason] = useState('');
   const [apiBusy, setApiBusy] = useState(false);
   const [tokenSpeed, setTokenSpeed] = useState(null); // { tokPerSec, totalTokens }
   const tokenHistoryRef = useRef([]); // [{ tokens, durationNs }]
@@ -2932,9 +2944,10 @@ function App() {
   // ─── 外部APIサーバー管理 ───
   async function loadExternalServers() {
     try {
-      const [r1, r2] = await Promise.all([
+      const [r1, r2, r3] = await Promise.all([
         fetch('/external-servers'),
         fetch('/external-servers/https-available'),
+        fetch('/external-servers/embedding-available'),
       ]);
       if (r1.ok) {
         const data = await r1.json();
@@ -2943,6 +2956,15 @@ function App() {
       if (r2.ok) {
         const data = await r2.json();
         setApiHttpsAvailable(!!data.available);
+      }
+      if (r3.ok) {
+        const data = await r3.json();
+        setApiEmbeddingAvailable(!!data.available);
+        setApiEmbeddingReason(data.reason || '');
+        // 利用不可ならツール選択から rag を自動的に外す
+        if (!data.available) {
+          setApiFormTools(prev => prev.filter(t => t !== 'rag'));
+        }
       }
     } catch {}
   }
@@ -2971,11 +2993,17 @@ function App() {
           apiKey: apiFormKey || undefined,
           type: 'chat',
           https: apiFormHttps,
+          agentMode: apiFormAgentMode,
+          tools: apiFormAgentMode ? apiFormTools : undefined,
         }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       setApiFormKey(''); // 入力フォームのAPIキーをクリア（自動生成されたものは一覧に表示される）
+      // サーバー側で一部ツールが無効化された場合は警告表示
+      if (data.warnings && data.warnings.length > 0) {
+        setError(`⚠️ ${data.warnings.join('\n')}`);
+      }
       await loadExternalServers();
     } catch (e) {
       setError(`外部APIサーバー起動失敗: ${e.message}`);
@@ -4731,6 +4759,62 @@ ${conversationText}
                       ? 'OpenGeekLLMChat本体と同じ cert.pem/key.pem を使用します。'
                       : '⚠️ cert.pem / key.pem が見つからないためHTTPSは利用できません。`./generate-cert.sh` で生成するか、正規証明書を配置してください。'}
                   </span>
+
+                  <label className="api-form-checkbox-label" style={{ marginTop: 4 }}>
+                    <input
+                      type="checkbox"
+                      checked={apiFormAgentMode}
+                      onChange={e => setApiFormAgentMode(e.target.checked)}
+                    />
+                    <span>🔧 ツール対応モード</span>
+                  </label>
+                  <span className="api-form-hint" style={{ marginTop: -4 }}>
+                    Webチャットと同様に、LLMがツール (ML予測/Web検索/ファイル参照) を自律的に呼び出せるようになります。
+                    OFFの場合は素のLLM推論のみ (高速)。
+                  </span>
+                  {apiFormAgentMode && (
+                    <div style={{ paddingLeft: 12, display: 'flex', flexDirection: 'column', gap: 4, marginTop: 2 }}>
+                      {[
+                        { id: 'ml', label: '🤖 機械学習 (ml_predict 等5ツール)' },
+                        { id: 'web_search', label: '🌐 Web検索 (web_search)' },
+                        { id: 'file', label: '📁 ファイル参照 (list_files / read_file)' },
+                        {
+                          id: 'rag',
+                          label: '📚 RAG文書検索 (search_documents)',
+                          disabled: !apiEmbeddingAvailable,
+                          disabledReason: apiEmbeddingReason,
+                        },
+                      ].map(t => (
+                        <label key={t.id} className="api-form-checkbox-label" style={{
+                          fontSize: 12,
+                          opacity: t.disabled ? 0.5 : 1,
+                          cursor: t.disabled ? 'not-allowed' : 'pointer',
+                        }}
+                          title={t.disabled ? `利用不可: ${t.disabledReason || ''}` : ''}>
+                          <input
+                            type="checkbox"
+                            checked={apiFormTools.includes(t.id)}
+                            disabled={t.disabled}
+                            onChange={e => {
+                              if (e.target.checked) setApiFormTools([...apiFormTools, t.id]);
+                              else setApiFormTools(apiFormTools.filter(x => x !== t.id));
+                            }}
+                          />
+                          <span>
+                            {t.label}
+                            {t.disabled && <span style={{ color: 'var(--orange)', marginLeft: 6, fontSize: 10 }}>
+                              ⚠️ embedding未設定のため利用不可
+                            </span>}
+                          </span>
+                        </label>
+                      ))}
+                      <span className="api-form-hint">
+                        ※ ツール対応モードは llama.cpp の関数呼び出し対応モデル (Qwen, Gemma等) が必要です。
+                        ストリーミングは最終応答を一括返却します。
+                      </span>
+                    </div>
+                  )}
+
                   <button className="api-form-submit" onClick={startApiServer} disabled={apiBusy}>
                     {apiBusy ? '処理中...' : '🚀 起動'}
                   </button>
@@ -4760,6 +4844,12 @@ ${conversationText}
                         <span className={`api-server-proto ${s.https ? 'https' : 'http'}`}>
                           {s.https ? '🔒 HTTPS' : '🔓 HTTP'}
                         </span>
+                        {s.agentMode && (
+                          <span className="api-server-proto" style={{ background: 'var(--accent-dim)', color: 'var(--accent)' }}
+                            title={`ツール対応モード: ${(s.tools || []).join(', ')}`}>
+                            🔧 ツール対応
+                          </span>
+                        )}
                         <button
                           className="api-server-stop"
                           onClick={() => stopApiServer(s.id)}
