@@ -669,8 +669,15 @@ function JobsView({ jobs, currentJobId, reload, showToast }) {
     setExpandedJobs(p => ({ ...p, [jobId]: true }));
     try {
       const r = await fetch(`/tuning/jobs/${jobId}/log`);
-      const text = await r.text();
-      setJobLogs(p => ({ ...p, [jobId]: text }));
+      if (r.status === 404) {
+        // ログファイルがまだ作られていない (学習開始直後等)
+        setJobLogs(p => ({ ...p, [jobId]: '' }));
+      } else if (r.ok) {
+        const text = await r.text();
+        setJobLogs(p => ({ ...p, [jobId]: text }));
+      } else {
+        setJobLogs(p => ({ ...p, [jobId]: `ログ取得エラー: HTTP ${r.status}` }));
+      }
     } catch (e) {
       setJobLogs(p => ({ ...p, [jobId]: `ログ取得エラー: ${e.message}` }));
     }
@@ -689,8 +696,12 @@ function JobsView({ jobs, currentJobId, reload, showToast }) {
     const t = setInterval(async () => {
       try {
         const r = await fetch(`/tuning/jobs/${currentJobId}/log`);
-        const text = await r.text();
-        setJobLogs(p => ({ ...p, [currentJobId]: text }));
+        if (r.status === 404) {
+          setJobLogs(p => ({ ...p, [currentJobId]: '' }));
+        } else if (r.ok) {
+          const text = await r.text();
+          setJobLogs(p => ({ ...p, [currentJobId]: text }));
+        }
       } catch {}
     }, 3000);
     return () => clearInterval(t);
@@ -763,7 +774,11 @@ function JobsView({ jobs, currentJobId, reload, showToast }) {
           )}
           {expandedJobs[j.id] && (
             <>
-              <div className="job-log">{jobLogs[j.id] || 'ログ読み込み中...'}</div>
+              <div className="job-log">{
+                jobLogs[j.id] === undefined
+                  ? 'ログ読み込み中...'
+                  : (jobLogs[j.id] || '(ログはまだ空です。学習の出力が始まるまでお待ちください)')
+              }</div>
               {artifacts[j.id] && artifacts[j.id].length > 0 && (
                 <div className="artifact-list">
                   <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>出力ファイル:</div>

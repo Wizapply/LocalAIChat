@@ -2826,11 +2826,12 @@
       position: fixed;
       top: 0; left: 0; bottom: 0;
       width: 320px;
-      max-width: 85vw;
+      max-width: 88vw;
       z-index: 100;
       transform: translateX(-100%);
       transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
       box-shadow: none;
+      box-sizing: border-box;
     }
 
     .sidebar.open {
@@ -2850,6 +2851,32 @@
     /* logoの左にスペース確保（×ボタンとの被り防止） */
     .sidebar-header {
       padding-right: 56px;
+    }
+
+    /* スマホではファインチューニング・機械学習ボタンを隠す
+       (これらは管理者向けの別画面で、スマホからの操作には不向きなため) */
+    .nav-link-row {
+      display: none;
+    }
+
+    /* サイドバー内の要素がはみ出さないよう box-sizing と幅を保証 */
+    .sidebar * {
+      box-sizing: border-box;
+    }
+    .sidebar select,
+    .sidebar .setting-input,
+    .sidebar .chat-model-select,
+    .sidebar .model-select {
+      max-width: 100%;
+      width: 100%;
+    }
+    /* モバイルではヘッダー左右paddingを少し詰める */
+    .sidebar-header {
+      padding-left: 14px;
+    }
+    .settings-group {
+      padding-left: 0;
+      padding-right: 0;
     }
 
     /* ── ヘッダー: 2行レイアウト（上: タイトル系 / 下: アクション） ── */

@@ -2573,6 +2573,45 @@ body, .app-layout, .chat-area {
      ```
      ついでに `if (!text) return []` で null/空文字列ガードも入れる。ブラウザ側とサーバー側で完全に同じ実装にして挙動の乖離を防ぐ。
 
+107. **torchvision の物体検出は追加パッケージ不要・COCO weight 付属**
+     物体検出に YOLO (ultralytics) を使うと AGPL ライセンス + 追加依存になる。`torchvision.models.detection` (Faster R-CNN / RetinaNet / SSD) なら **torch/torchvision だけで動き、COCO事前学習 weight も付属**、ライセンスも BSD。少クラスのカスタム学習も `FastRCNNPredictor` でヘッドを付け替えるだけ。本プロジェクトの「依存最小」方針に合致する。
+
+108. **torch のモデルキャッシュ・MIOpenキャッシュは `import torch` より前に環境変数で設定**
+     本番が systemd の `ProtectHome` 等で `~/.cache` が読み取り専用だと、torch の weight ダウンロードや AMD ROCm の MIOpen カーネルキャッシュ書き込みが失敗する (`miopenStatusUnknownError`)。`TORCH_HOME` / `MIOPEN_USER_DB_PATH` / `MIOPEN_CUSTOM_CACHE_DIR` をアプリ内の書き込み可能ディレクトリ (`ml/torch_cache`) に、**必ず `import torch` より前**に設定する。gfx1201(RDNA4) でもこれで cuda 動作する。
+
+109. **torch の `Downloading:` メッセージが stdout を汚染して JSON パース失敗**
+     torch は weight 初回ダウンロード時に `Downloading: "https://..."` を **stdout に直接 print** する (バージョン依存)。これが検出結果 JSON と混ざり、Node 側のパースが失敗する。「最初だけ」失敗するのが特徴 (2回目以降はキャッシュ済み)。`progress=False` だけでは不足。対策は **処理中の stdout を stderr に退避し、最終結果だけ本物の stdout に書く**:
+     ```python
+     real_stdout = sys.stdout
+     sys.stdout = sys.stderr
+     def emit(obj): real_stdout.write(json.dumps(obj)); real_stdout.flush()
+     ```
+     学習側 (`image_train.py`) は `RESULT_JSON:` プレフィックスで結果行を識別する設計なので、この汚染の影響を受けない。
+
+110. **学習プロセスの停止は `detached:true` + プロセスグループ kill**
+     PyTorch 学習は内部でワーカー子プロセスを生成するため、`proc.kill()` で親だけ殺しても子が GPU を握ったまま残る。spawn 時に `detached: true` でプロセスグループを作り、停止時に `process.kill(-pid, signal)` (負の pid) で**グループ全体を kill** する。ファインチューニングと画像学習の両方に適用。
+
+111. **停止時の status 上書き競合 (cancelled → failed)**
+     ジョブ停止で `status='cancelled'` にした直後、SIGKILL されたプロセスの `proc.on('exit')` が非0 exit code で発火し、`cancelled` を `failed` に上書きしてしまう。意図的な中断が「失敗」と記録される。`if (j.status !== 'cancelled')` でガードする。画像学習側は `currentImageJob.cancelled` フラグで区別。
+
+112. **サーバー再起動で running ジョブが幽霊化**
+     学習中にサーバーが落ちる/再起動すると jobs.json に `status:'running'` が残り、実プロセスは死んでいるのに UI で永遠に「実行中」表示。起動時に `reconcileStaleJobs()` で `running` → `interrupted` に補正する。
+
+113. **全 `spawn` に `proc.on('error')` が必須 (サーバークラッシュ防止)**
+     Python のパスが間違っている等で spawn が失敗すると、Node は unhandled 'error' イベントで**プロセス全体をクラッシュ**させる (`ERR_CONNECTION_REFUSED` の原因)。学習・後処理・推論・ログstream のすべての `spawn` に `error` ハンドラを付け、ジョブを 'failed' 記録に留めてサーバーは生かす。
+
+114. **tqdm の `\r` でログが読めなくなる**
+     学習ログは tqdm 等が `\r` (キャリッジリターン) で同じ行を上書きするため、そのままファイルに溜めると `\r` が大量に連なって1行が異常に長くなる。書き込み時に `\r\n`→`\n` 統一 + `\r` 上書きは最終セグメントだけ採用、で正規化する。チャンク境界をまたぐ進捗行はバッファ (`logTail`) に残して次チャンクと連結。
+
+115. **アノテーション画像送りで前の矩形が残る (React state)**
+     画像切替の useEffect が `currentImage` オブジェクト参照を依存にし、`if (currentImage)` ガードで `setBoxes` をスキップすると、前の画像の矩形が残留する (別画像にアノテーションが混入する危険)。対策は **(1) `gotoImage` で移動先の boxes を即座にセット (useEffectを待たない)、(2) 依存を `currentImageId` (画像ID) にし無条件で setBoxes**。矩形は `{...b}` でコピーし参照共有も防ぐ。
+
+116. **隠しファイル除外は `safeUploadPath` に集約**
+     uploads の隠しファイル (`.env` 等) を一覧から消すだけでなく、読み書きも遮断する。一覧の `walk` で `name.startsWith('.')` をスキップし、**`safeUploadPath` でパスの各セグメントが `.` 始まりなら null を返す**。後者がread/write/RAG登録など全経路を一元的にカバーするので、ブラウザ・外部API・LLMツールすべてに自動適用される。
+
+117. **自前 ZIP 生成 (外部 `zip` コマンド非依存)**
+     モデルダウンロードで外部 `zip` コマンドに依存すると、本番に未インストールだと 500 エラー。Node 標準の `zlib.deflateRawSync` だけで ZIP を手書き生成する (`buildZipBuffer`)。CRC32 テーブル + ローカルファイルヘッダ + セントラルディレクトリ + EOCD を構築。DEFLATE/STORE 自動選択、UTF-8 ファイル名 (bit11)。一時ファイルも不要でメモリ上で完結するため `/tmp` 制限の影響も受けない。
+
 ---
 
 ## 🎮 GPU監視バックエンドの設計
@@ -3986,6 +4025,57 @@ function isEmbeddingAvailable() {
 - メモリ効率 (1プロセスで済む)
 - Webチャットの添付RAG と同じ embedding モデルを使えるので、後でブラウザRAGをサーバーRAGに統合する余地がある
 - アイドルアンロードも自動的に効く
+
+---
+
+## 🖼️ 画像物体検出 (torchvision)
+
+`/ml.html` の「画像」タブで、COCO事前学習モデルでの検出と、独自クラスのカスタムモデル学習を行う。
+
+### なぜ torchvision か (YOLO を避けた理由)
+
+- **依存最小**: `torch` / `torchvision` だけで動く。ultralytics(YOLO) は追加依存 + **AGPL ライセンス** (商用で注意)
+- **weight 付属**: COCO 事前学習済み weight が torchvision に付属。初回だけ自動ダウンロード
+- **ライセンス**: torchvision は BSD で本プロジェクトの方針に合う
+- 採用モデル: `fasterrcnn_resnet50_fpn` / `fasterrcnn_mobilenet_v3_large_fpn` / `retinanet_resnet50_fpn` / `ssd300_vgg16` / `ssdlite320_mobilenet_v3_large`
+
+### ファイル構成
+
+```
+image_detect.py   推論 (COCO + カスタムモデル両対応)
+image_train.py    カスタム学習 (Faster R-CNN ファインチューニング)
+ml/torch_cache/   torch weight + MIOpen カーネルキャッシュ (書き込み可能な場所)
+ml/image_datasets/<name>/   データセット (dataset.json + images/)
+ml/image_models/<name>/     学習済みモデル (model.pt + config.json + metrics.json)
+ml/image_jobs.json          画像学習ジョブ履歴
+```
+
+### データ構造とアノテーション
+
+- アノテーションは **natural 座標 (絶対ピクセル) で保存**。表示スケールに依存しないので、学習時もそのまま使える
+- 入力方式は2つ: ドラッグで矩形、クリックで固定サイズ矩形 (点モード、4〜300px)
+- torchvision の物体検出は **背景 = label 0**。学習時は `classIndex + 1`、推論時は `labelId - 1` で変換する
+- YOLO (正規化 cx,cy,w,h → ピクセル) と COCO ([x,y,w,h] → [x1,y1,x2,y2]) のインポートに対応
+
+### 学習 (転移学習)
+
+- 事前学習済みの特徴抽出器を活かし、分類ヘッド (`FastRCNNPredictor`) だけを `クラス数 + 1` に付け替える → 少量データで実用的
+- `scratch` (事前学習なし) も選択可能。`weights=None, weights_backbone=None, num_classes=N` でゼロから。ただし大量データ・多エポックが必要
+- 学習ジョブは表データ学習 (`currentMlJob`) とは**別系統 (`currentImageJob`)**。DuckDB を使わないので排他制御の干渉がない
+- `config.json` に `baseModel` を保存し、推論時に同じ構造を復元して `model.pt` をロードする
+
+### LLM チャット連携 (detect_objects)
+
+画像を添付かつ ML 有効時のみ `detect_objects` ツールを LLM に提供。LLM がツールを呼ぶ → ブラウザが添付画像の base64 を `/ml/image/detect` に送る → クラス別集計を LLM に返す → LLM が自然言語で回答。Vision 対応モデルなら検出結果と画像の両方を見て誤認識を訂正することもある。
+
+### 外部API・ダウンロード
+
+- `POST /ml/image/detect` (Bearer, `ml:read`): COCO は `model`、カスタムは `customModel` を指定
+- `GET /ml/image/custom-models/:name/download`: model.pt + config.json + 推論サンプル + README を zip 化。自前 ZIP 生成 (罠117) で外部コマンド不要
+
+### 主な罠
+
+罠 107〜117 を参照 (キャッシュパス、stdout汚染、プロセスグループkill、status競合、幽霊ジョブ、`\r`正規化、矩形残留、隠しファイル、自前zip)。
 
 ---
 

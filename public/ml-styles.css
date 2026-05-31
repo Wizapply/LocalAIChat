@@ -289,3 +289,273 @@
     max-height: 250px;
   }
 }
+
+/* ─── 画像物体検出ビュー ─── */
+.image-detect-view {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 4px;
+}
+.image-detect-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  background: var(--surface, #1a1a2e);
+  border: 1px solid var(--border, #2a2a3e);
+  border-radius: 10px;
+  padding: 16px;
+}
+.image-detect-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.image-detect-label {
+  font-size: 13px;
+  color: var(--text-secondary, #aaa);
+  min-width: 140px;
+}
+.image-detect-select {
+  flex: 1;
+  min-width: 200px;
+  padding: 8px 10px;
+  background: var(--bg, #12121e);
+  border: 1px solid var(--border, #2a2a3e);
+  border-radius: 6px;
+  color: var(--text, #eee);
+  font-size: 13px;
+}
+.image-detect-slider {
+  flex: 1;
+  min-width: 200px;
+}
+.image-detect-file {
+  flex: 1;
+  min-width: 200px;
+  color: var(--text-secondary, #aaa);
+  font-size: 13px;
+}
+.image-detect-hint {
+  font-size: 12px;
+  color: var(--text-secondary, #888);
+  line-height: 1.5;
+}
+.image-detect-canvas-wrap {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 200px;
+  background: var(--bg, #12121e);
+  border: 1px solid var(--border, #2a2a3e);
+  border-radius: 10px;
+  padding: 12px;
+  overflow: auto;
+}
+.image-detect-canvas {
+  max-width: 100%;
+  height: auto;
+  border-radius: 6px;
+}
+.image-detect-result {
+  background: var(--surface, #1a1a2e);
+  border: 1px solid var(--border, #2a2a3e);
+  border-radius: 10px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.image-detect-summary {
+  font-size: 13px;
+  color: var(--text-secondary, #aaa);
+}
+.image-detect-summary strong {
+  color: var(--accent, #7c4dff);
+  font-size: 15px;
+}
+.image-detect-classes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.image-detect-class-badge {
+  background: var(--accent-dim, rgba(124,77,255,0.15));
+  color: var(--accent, #7c4dff);
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.image-detect-details {
+  font-size: 12px;
+}
+.image-detect-details summary {
+  cursor: pointer;
+  color: var(--text-secondary, #aaa);
+  padding: 6px 0;
+}
+.image-detect-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+  font-size: 12px;
+}
+.image-detect-table th,
+.image-detect-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border, #2a2a3e);
+}
+.image-detect-table th {
+  color: var(--text-secondary, #888);
+  font-weight: 600;
+}
+
+/* ─── 画像学習 (Phase 2) ─── */
+.image-train-view { display: flex; flex-direction: column; gap: 16px; padding: 4px; }
+.image-train-subtabs { display: flex; gap: 8px; border-bottom: 1px solid var(--border, #2a2a3e); padding-bottom: 8px; }
+.subtab {
+  padding: 8px 16px; background: transparent; border: none; border-radius: 6px 6px 0 0;
+  color: var(--text-secondary, #aaa); cursor: pointer; font-size: 13px;
+}
+.subtab.active { background: var(--accent-dim, rgba(124,77,255,0.15)); color: var(--accent, #7c4dff); font-weight: 600; }
+.subtab:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.dataset-manager, .image-train-runner { display: flex; flex-direction: column; gap: 20px; }
+.dataset-create, .train-config, .train-running, .train-models, .train-jobs {
+  background: var(--surface, #1a1a2e); border: 1px solid var(--border, #2a2a3e);
+  border-radius: 10px; padding: 16px;
+}
+.dataset-create h3, .train-config h3, .train-models h3, .train-jobs h3, .dataset-list h3 {
+  margin: 0 0 12px; font-size: 14px; color: var(--text, #eee);
+}
+.dataset-create-row, .train-row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+.ml-input {
+  flex: 1; min-width: 160px; padding: 8px 10px; background: var(--bg, #12121e);
+  border: 1px solid var(--border, #2a2a3e); border-radius: 6px; color: var(--text, #eee); font-size: 13px;
+}
+.dataset-list { display: flex; flex-direction: column; gap: 10px; }
+.dataset-card {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  background: var(--surface, #1a1a2e); border: 1px solid var(--border, #2a2a3e);
+  border-radius: 8px; padding: 12px 14px;
+}
+.dataset-card-name { font-weight: 600; color: var(--text, #eee); font-size: 14px; }
+.dataset-card-meta { font-size: 12px; color: var(--text-secondary, #888); margin-top: 3px; }
+.dataset-card-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.btn.small { padding: 5px 10px; font-size: 12px; }
+.btn.danger { background: #ff3b30; color: #fff; }
+.btn.small.danger { background: rgba(255,59,48,0.15); color: #ff6b60; }
+
+/* アノテーション */
+.annotate-view { display: flex; flex-direction: column; gap: 12px; }
+.annotate-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+.annotate-classes { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.annotate-label { font-size: 13px; color: var(--text-secondary, #aaa); }
+.annotate-class-btn {
+  padding: 5px 12px; background: transparent; border: 2px solid; border-radius: 14px;
+  cursor: pointer; font-size: 12px; font-weight: 600; color: var(--text, #eee);
+}
+.annotate-nav { display: flex; align-items: center; gap: 10px; }
+.annotate-counter { font-size: 13px; color: var(--text-secondary, #aaa); min-width: 60px; text-align: center; }
+.annotate-hint, .train-hint {
+  font-size: 12px; color: var(--text-secondary, #888); background: var(--bg, #12121e);
+  padding: 8px 12px; border-radius: 6px;
+}
+.annotate-canvas-wrap {
+  display: flex; justify-content: center; background: var(--bg, #12121e);
+  border: 1px solid var(--border, #2a2a3e); border-radius: 10px; padding: 12px; overflow: auto;
+}
+.annotate-canvas { cursor: crosshair; border-radius: 4px; }
+.annotate-boxes {
+  background: var(--surface, #1a1a2e); border: 1px solid var(--border, #2a2a3e);
+  border-radius: 10px; padding: 12px;
+}
+.annotate-boxes-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 13px; color: var(--text-secondary, #aaa); }
+.annotate-box-item { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 12px; border-bottom: 1px solid var(--border, #2a2a3e); }
+.annotate-box-class { font-weight: 600; min-width: 80px; }
+.annotate-box-coord { color: var(--text-secondary, #888); flex: 1; }
+.annotate-box-remove { background: rgba(255,59,48,0.15); color: #ff6b60; border: none; border-radius: 4px; width: 22px; height: 22px; cursor: pointer; }
+
+/* 学習実行 */
+.train-running-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.train-spinner { font-size: 14px; color: var(--accent, #7c4dff); font-weight: 600; }
+.train-log {
+  background: #0a0a14; border: 1px solid var(--border, #2a2a3e); border-radius: 6px;
+  padding: 12px; font-family: monospace; font-size: 12px; color: #b0e0b0;
+  max-height: 400px; overflow-y: auto; white-space: pre-wrap; margin: 0;
+}
+.train-job-item { display: flex; justify-content: space-between; padding: 6px 0; font-size: 12px; border-bottom: 1px solid var(--border, #2a2a3e); }
+.train-job-meta { color: var(--text-secondary, #888); }
+
+/* アノテーション画面の戻るバー */
+.annotate-back-bar {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 4px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--border, #2a2a3e);
+}
+.annotate-dataset-name { font-size: 13px; font-weight: 600; color: var(--accent, #7c4dff); }
+
+/* アノテーション画像一覧 (サムネイルグリッド) */
+.annotate-gallery {
+  background: var(--surface, #1a1a2e); border: 1px solid var(--border, #2a2a3e);
+  border-radius: 10px; padding: 12px; margin-top: 12px;
+}
+.annotate-gallery-header {
+  font-size: 13px; color: var(--text-secondary, #aaa); margin-bottom: 10px;
+}
+.annotate-gallery-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+  gap: 8px; max-height: 320px; overflow-y: auto;
+}
+.annotate-thumb {
+  position: relative; aspect-ratio: 1; border-radius: 6px; overflow: hidden;
+  cursor: pointer; border: 2px solid transparent; background: var(--bg, #12121e);
+}
+.annotate-thumb:hover { border-color: var(--text-secondary, #888); }
+.annotate-thumb.active { border-color: var(--accent, #7c4dff); }
+.annotate-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.annotate-thumb-badge {
+  position: absolute; top: 3px; right: 3px; min-width: 18px; height: 18px;
+  padding: 0 5px; border-radius: 9px; font-size: 11px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.6); color: #fff;
+}
+.annotate-thumb-badge.has-box { background: var(--accent, #7c4dff); }
+.annotate-thumb-idx {
+  position: absolute; bottom: 3px; left: 3px;
+  padding: 1px 5px; border-radius: 4px; font-size: 10px;
+  background: rgba(0,0,0,0.6); color: #fff;
+}
+
+/* カスタムモデル API ヘルプ */
+.api-help-box {
+  background: var(--bg, #12121e); border: 1px solid var(--accent, #7c4dff);
+  border-radius: 8px; padding: 12px; margin: 8px 0;
+}
+.api-help-title { font-size: 13px; font-weight: 600; color: var(--accent, #7c4dff); margin-bottom: 6px; }
+.api-help-note { font-size: 12px; color: var(--text-secondary, #888); margin-bottom: 8px; }
+.api-help-code {
+  background: #0a0a14; border: 1px solid var(--border, #2a2a3e); border-radius: 6px;
+  padding: 12px; font-family: monospace; font-size: 12px; color: #b0e0b0;
+  overflow-x: auto; margin: 0; white-space: pre;
+}
+
+/* アノテーション 入力方式切替バー */
+.annotate-modebar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 6px 0;
+}
+.annotate-mode-btn {
+  padding: 5px 12px; background: var(--bg, #12121e);
+  border: 1px solid var(--border, #2a2a3e); border-radius: 6px;
+  color: var(--text-secondary, #aaa); cursor: pointer; font-size: 12px;
+}
+.annotate-mode-btn.active {
+  background: var(--accent-dim, rgba(124,77,255,0.15));
+  border-color: var(--accent, #7c4dff); color: var(--accent, #7c4dff); font-weight: 600;
+}
+.annotate-pointsize {
+  font-size: 12px; color: var(--text-secondary, #aaa); margin-left: 8px;
+}

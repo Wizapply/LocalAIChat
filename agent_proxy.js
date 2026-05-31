@@ -329,11 +329,11 @@ function buildToolDefs(enabledTools, appConfig) {
     tools.push({
       type: 'function',
       function: {
-        name: 'search_documents',
-        description: 'サーバーに登録済みのRAGドキュメントから、embedding ベクトル類似度で関連箇所を検索する。ユーザーの質問に答えるための参考資料・社内文書・マニュアル等を探す時に使う。',
+        name: 'search_persistent_documents',
+        description: 'サーバーに恒久的に登録済みのRAGドキュメントから、embedding ベクトル類似度で関連箇所を検索する。社内文書・マニュアル・ポリシー・FAQ等を参照するためのツール。',
         parameters: {
           type: 'object',
-          properties: { query: { type: 'string', description: '検索したい内容・質問' } },
+          properties: { query: { type: 'string', description: '検索したい内容・キーワード' } },
           required: ['query'],
         },
       },
@@ -544,6 +544,8 @@ async function executeTool(fnName, fnArgs, deps, ip) {
       return await runMlPredict(fnArgs.modelName, features);
     }
 
+    // 新名 + 後方互換 (search_documents) の両方を受ける
+    case 'search_persistent_documents':
     case 'search_documents': {
       if (searchDocumentsSimple) return await searchDocumentsSimple(fnArgs.query);
       return { error: 'ドキュメント検索は利用できません (サーバーにアップロード済みドキュメントが必要)' };

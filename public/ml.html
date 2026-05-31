@@ -169,6 +169,7 @@ function App() {
           <button className={`tab ${activeTab === 'tables' ? 'active' : ''}`} onClick={() => setActiveTab('tables')}>🗂️ データテーブル</button>
           <button className={`tab ${activeTab === 'query' ? 'active' : ''}`} onClick={() => setActiveTab('query')}>🔍 SQL クエリ</button>
           <button className={`tab ${activeTab === 'models' ? 'active' : ''}`} onClick={() => setActiveTab('models')}>🧠 モデル (学習)</button>
+          <button className={`tab ${activeTab === 'imagetrain' ? 'active' : ''}`} onClick={() => setActiveTab('imagetrain')}>🖼️ 画像 (検出・学習)</button>
           <button className={`tab ${activeTab === 'api' ? 'active' : ''}`} onClick={() => setActiveTab('api')}>📡 API (外部連携)</button>
         </div>
         <div className="main-body">
@@ -240,6 +241,9 @@ function App() {
           )}
           {activeTab === 'models' && (
             <ModelsView tables={tables} showToast={showToast} />
+          )}
+          {activeTab === 'imagetrain' && (
+            <ImageTrainView showToast={showToast} />
           )}
           {activeTab === 'api' && (
             <ApiUsageView showToast={showToast} />
@@ -352,6 +356,1004 @@ function formatCell(v) {
   if (typeof v === 'boolean') return v ? 'true' : 'false';
   if (typeof v === 'number') return v.toLocaleString();
   return String(v);
+}
+
+// ─── 画像物体検出ビュー (torchvision COCO事前学習) ───
+// ─── 画像学習ビュー (Phase 2: データセット + アノテーション + 学習) ───
+function ImageTrainView({ showToast }) {
+  const [subTab, setSubTab] = useState('detect');  // detect | datasets | annotate(ボタンからのみ) | train
+  const [datasets, setDatasets] = useState([]);
+  const [selectedDataset, setSelectedDataset] = useState(null);  // データセット名
+  const [datasetDetail, setDatasetDetail] = useState(null);      // 詳細 (画像一覧含む)
+
+  function loadDatasets() {
+    fetch('/ml/image/datasets')
+      .then(r => r.ok ? r.json() : { datasets: [] })
+      .then(d => setDatasets(d.datasets || []))
+      .catch(() => {});
+  }
+  useEffect(() => { loadDatasets(); }, []);
+
+  function loadDatasetDetail(name) {
+    return fetch(`/ml/image/datasets/${name}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d) { setDatasetDetail(d.dataset); setSelectedDataset(name); } })
+      .catch(() => {});
+  }
+
+  // データセット一覧と、選択中データセットの詳細を両方リロード
+  // (画像追加・削除の後に呼ぶ。アノテーション画面が古い情報を表示しないように)
+  function reloadAll(name) {
+    loadDatasets();
+    const target = name || selectedDataset;
+    if (target) loadDatasetDetail(target);
+  }
+
+  return (
+    <div className="image-train-view">
+      <div className="image-train-subtabs">
+        <button className={`subtab ${subTab === 'detect' ? 'active' : ''}`} onClick={() => setSubTab('detect')}>🔍 検出</button>
+        <button className={`subtab ${subTab === 'datasets' ? 'active' : ''}`} onClick={() => setSubTab('datasets')}>📊 データセット</button>
+        <button className={`subtab ${subTab === 'train' ? 'active' : ''}`} onClick={() => setSubTab('train')}>🚀 学習</button>
+      </div>
+
+      {subTab === 'detect' && (
+        <ImageDetectView showToast={showToast} />
+      )}
+      {subTab === 'datasets' && (
+        <DatasetManager
+          datasets={datasets}
+          onReload={loadDatasets}
+          onReloadDataset={(name) => reloadAll(name)}
+          onSelect={(name) => { loadDatasetDetail(name); setSubTab('annotate'); }}
+          showToast={showToast}
+        />
+      )}
+      {subTab === 'annotate' && selectedDataset && datasetDetail && (
+        <AnnotateView
+          datasetName={selectedDataset}
+          dataset={datasetDetail}
+          onReload={() => reloadAll(selectedDataset)}
+          onBack={() => setSubTab('datasets')}
+          showToast={showToast}
+        />
+      )}
+      {subTab === 'train' && (
+        <ImageTrainRunner datasets={datasets} onReload={loadDatasets} showToast={showToast} />
+      )}
+    </div>
+  );
+}
+
+// データセット管理 (一覧・作成・削除・画像追加)
+function DatasetManager({ datasets, onReload, onReloadDataset, onSelect, showToast }) {
+  const [newName, setNewName] = useState('');
+  const [newClasses, setNewClasses] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState('');
+
+  async function createDataset() {
+    const classes = newClasses.split(',').map(c => c.trim()).filter(Boolean);
+    if (!newName.trim()) { setError('データセット名を入力してください'); return; }
+    if (classes.length === 0) { setError('クラス名を最低1つ (カンマ区切り)'); return; }
+    setCreating(true);
+    setError('');
+    try {
+      const res = await fetch('/ml/image/datasets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newName.trim(), classes }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      showToast(`データセット「${newName}」を作成しました`);
+      setNewName(''); setNewClasses('');
+      onReload();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function deleteDataset(name) {
+    if (!confirm(`データセット「${name}」を削除しますか? (画像・アノテーションも全て削除されます)`)) return;
+    try {
+      const res = await fetch(`/ml/image/datasets/${name}`, { method: 'DELETE' });
+      if (!res.ok) { const d = await res.json(); throw new Error(d.error); }
+      showToast('削除しました');
+      onReload();
+    } catch (e) {
+      showToast(`削除失敗: ${e.message}`);
+    }
+  }
+
+  async function addImages(name, files) {
+    if (!files || files.length === 0) return;
+    const images = [];
+    for (const file of files) {
+      if (!file.type.startsWith('image/')) continue;
+      const data = await new Promise(resolve => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.readAsDataURL(file);
+      });
+      images.push({ name: file.name, data });
+    }
+    if (images.length === 0) { showToast('画像ファイルがありません'); return; }
+    try {
+      const res = await fetch(`/ml/image/datasets/${name}/images`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ images }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error);
+      const addedCount = (d.added || []).length;
+      const errCount = (d.errors || []).length;
+      if (addedCount > 0) {
+        showToast(`${addedCount}枚の画像を追加しました${errCount ? ` (${errCount}件失敗)` : ''}`);
+      } else {
+        showToast(`画像追加に失敗しました${errCount ? `: ${d.errors[0].error}` : ''}`);
+      }
+      // 一覧 + 選択中データセットの詳細を両方更新
+      if (onReloadDataset) onReloadDataset(name);
+      else onReload();
+    } catch (e) {
+      showToast(`画像追加失敗: ${e.message}`);
+    }
+  }
+
+  return (
+    <div className="dataset-manager">
+      <div className="dataset-create">
+        <h3>新規データセット作成</h3>
+        <div className="dataset-create-row">
+          <input className="ml-input" placeholder="データセット名 (英数字)" value={newName} onChange={e => setNewName(e.target.value)} />
+          <input className="ml-input" placeholder="クラス名 (カンマ区切り: cat, dog, bird)" value={newClasses} onChange={e => setNewClasses(e.target.value)} style={{ flex: 2 }} />
+          <button className="btn primary" onClick={createDataset} disabled={creating}>作成</button>
+        </div>
+        {error && <div className="warn-banner">{error}</div>}
+      </div>
+
+      <div className="dataset-list">
+        <h3>データセット一覧 ({datasets.length})</h3>
+        {datasets.length === 0 && <div className="empty-state">データセットがありません。上で作成してください。</div>}
+        {datasets.map(ds => (
+          <div key={ds.name} className="dataset-card">
+            <div className="dataset-card-info">
+              <div className="dataset-card-name">{ds.name}</div>
+              <div className="dataset-card-meta">
+                クラス: {ds.classes.join(', ')} · 画像 {ds.imageCount}枚 · アノテーション済 {ds.annotatedCount}枚
+              </div>
+            </div>
+            <div className="dataset-card-actions">
+              <label className="btn small">
+                画像追加
+                <input type="file" accept="image/*" multiple style={{ display: 'none' }}
+                  onChange={e => addImages(ds.name, Array.from(e.target.files))} />
+              </label>
+              <button className="btn small primary" onClick={() => onSelect(ds.name)}>✏️ アノテーション</button>
+              <button className="btn small danger" onClick={() => deleteDataset(ds.name)}>削除</button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// アノテーションビュー (矩形ドラッグ描画 + ラベル付け + インポート)
+function AnnotateView({ datasetName, dataset, onReload, onBack, showToast }) {
+  const [currentIdx, setCurrentIdx] = useState(0);
+  const [boxes, setBoxes] = useState([]);       // 現在の画像の矩形 [{classIndex,x1,y1,x2,y2}]
+  const [activeClass, setActiveClass] = useState(0);
+  const [drawing, setDrawing] = useState(null);  // ドラッグ中 {x1,y1,x2,y2}
+  const [imgSize, setImgSize] = useState({ w: 0, h: 0 });
+  const [saving, setSaving] = useState(false);
+  const [drawMode, setDrawMode] = useState('drag');  // 'drag' | 'point'
+  const [pointSize, setPointSize] = useState(60);    // 点モードで生成する矩形の一辺(px)
+  const canvasRef = useRef(null);
+  const imgRef = useRef(null);
+  const wrapRef = useRef(null);
+
+  const COLORS = ['#ff3b30', '#34c759', '#007aff', '#ff9500', '#af52de', '#ff2d55', '#5ac8fa', '#ffcc00'];
+  const images = dataset.images || [];
+  const currentImage = images[currentIdx];
+
+  // 画像が変わったら既存のboxを読み込む (前の画像の矩形が残らないよう必ずリセット)
+  // 依存は currentIdx と画像ID。currentImage オブジェクトの参照変化ではなく
+  // 「実際に別の画像になったか」で判定し、未保存の編集が混入しないようにする。
+  const currentImageId = currentImage ? currentImage.id : null;
+  useEffect(() => {
+    if (currentImage) {
+      setBoxes(currentImage.boxes ? currentImage.boxes.map(b => ({ ...b })) : []);
+    } else {
+      setBoxes([]);
+    }
+    setDrawing(null);  // 描きかけも破棄
+  }, [currentIdx, currentImageId]);
+
+  // canvas 描画 (画像 + 矩形 + ドラッグ中の矩形)
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const img = imgRef.current;
+    if (!canvas || !img) return;
+    const draw = () => {
+      const naturalW = img.naturalWidth, naturalH = img.naturalHeight;
+      if (!naturalW) return;
+      // 表示幅は最大800px
+      const dispW = Math.min(naturalW, 800);
+      const scale = dispW / naturalW;
+      canvas.width = naturalW;
+      canvas.height = naturalH;
+      canvas.style.width = dispW + 'px';
+      canvas.style.height = (naturalH * scale) + 'px';
+      setImgSize({ w: naturalW, h: naturalH });
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0);
+      // 確定した矩形
+      boxes.forEach(b => {
+        const color = COLORS[b.classIndex % COLORS.length];
+        ctx.strokeStyle = color;
+        ctx.lineWidth = Math.max(2, naturalW / 300);
+        ctx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
+        const label = dataset.classes[b.classIndex] || `class${b.classIndex}`;
+        const fs2 = Math.max(14, naturalW / 45);
+        ctx.font = `bold ${fs2}px sans-serif`;
+        ctx.fillStyle = color;
+        const tw = ctx.measureText(label).width;
+        ctx.fillRect(b.x1, Math.max(0, b.y1 - fs2 - 4), tw + 8, fs2 + 4);
+        ctx.fillStyle = '#fff';
+        ctx.fillText(label, b.x1 + 4, Math.max(fs2, b.y1 - 3));
+      });
+      // ドラッグ中の矩形
+      if (drawing) {
+        ctx.strokeStyle = COLORS[activeClass % COLORS.length];
+        ctx.lineWidth = Math.max(2, naturalW / 300);
+        ctx.setLineDash([6, 4]);
+        ctx.strokeRect(drawing.x1, drawing.y1, drawing.x2 - drawing.x1, drawing.y2 - drawing.y1);
+        ctx.setLineDash([]);
+      }
+    };
+    if (img.complete) draw();
+    else img.onload = draw;
+  }, [boxes, drawing, currentIdx, activeClass, dataset.classes]);
+
+  // canvas 座標をnatural座標に変換
+  function toCanvasCoord(e) {
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY,
+    };
+  }
+
+  // クリック位置を中心に、pointSize 四方の矩形を生成 (画像範囲内にクランプ)
+  function addPointBox(cx, cy) {
+    const half = pointSize / 2;
+    const W = imgSize.w || (canvasRef.current ? canvasRef.current.width : 0);
+    const H = imgSize.h || (canvasRef.current ? canvasRef.current.height : 0);
+    let x1 = cx - half, y1 = cy - half, x2 = cx + half, y2 = cy + half;
+    // 画像範囲内に収める
+    if (W) { x1 = Math.max(0, x1); x2 = Math.min(W, x2); }
+    if (H) { y1 = Math.max(0, y1); y2 = Math.min(H, y2); }
+    setBoxes(prev => [...prev, { classIndex: activeClass, x1, y1, x2, y2 }]);
+  }
+
+  function onMouseDown(e) {
+    const { x, y } = toCanvasCoord(e);
+    if (drawMode === 'point') {
+      // 点モード: クリックした位置に固定サイズの矩形を即生成
+      addPointBox(x, y);
+      return;
+    }
+    setDrawing({ x1: x, y1: y, x2: x, y2: y });
+  }
+  function onMouseMove(e) {
+    if (drawMode === 'point') return;  // 点モードはドラッグしない
+    if (!drawing) return;
+    const { x, y } = toCanvasCoord(e);
+    setDrawing(prev => ({ ...prev, x2: x, y2: y }));
+  }
+  function onMouseUp() {
+    if (drawMode === 'point') return;
+    if (!drawing) return;
+    const b = drawing;
+    // 最小サイズチェック
+    if (Math.abs(b.x2 - b.x1) > 5 && Math.abs(b.y2 - b.y1) > 5) {
+      setBoxes(prev => [...prev, {
+        classIndex: activeClass,
+        x1: Math.min(b.x1, b.x2), y1: Math.min(b.y1, b.y2),
+        x2: Math.max(b.x1, b.x2), y2: Math.max(b.y1, b.y2),
+      }]);
+    }
+    setDrawing(null);
+  }
+
+  function removeBox(i) {
+    setBoxes(prev => prev.filter((_, j) => j !== i));
+  }
+
+  async function saveBoxes() {
+    if (!currentImage) return;
+    setSaving(true);
+    try {
+      const res = await fetch(`/ml/image/datasets/${datasetName}/annotations/${currentImage.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ boxes }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error);
+      showToast(`保存しました (${d.boxCount}個の矩形)`);
+      onReload();
+    } catch (e) {
+      showToast(`保存失敗: ${e.message}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function gotoImage(idx) {
+    if (idx < 0 || idx >= images.length) return;
+    // 移動先の画像の矩形を即座にセット (useEffect を待たず確実に切り替える)
+    const next = images[idx];
+    setBoxes(next && next.boxes ? next.boxes.map(b => ({ ...b })) : []);
+    setCurrentIdx(idx);
+    setDrawing(null);
+  }
+
+  // キーボードショートカット: ← → で画像送り、S で保存
+  // テキスト入力中やドラッグ中は無効。依存する値が変わるたびにリスナーを貼り直す
+  useEffect(() => {
+    function onKeyDown(e) {
+      // input/textarea/select にフォーカスがある時は無視 (誤発火防止)
+      const tag = (e.target.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable) return;
+      // 修飾キー併用は無視 (ブラウザのショートカットを邪魔しない)
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      // 矩形ドラッグ中は無視
+      if (drawing) return;
+
+      if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        gotoImage(currentIdx + 1);
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        gotoImage(currentIdx - 1);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (!saving) saveBoxes();
+      }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [currentIdx, images.length, drawing, saving, boxes]);
+
+  // アノテーション画面から直接画像を追加 (空データセットでもここで足せる)
+  async function addImagesHere(files) {
+    if (!files || files.length === 0) return;
+    const imgs = [];
+    for (const file of files) {
+      if (!file.type.startsWith('image/')) continue;
+      const data = await new Promise(resolve => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.readAsDataURL(file);
+      });
+      imgs.push({ name: file.name, data });
+    }
+    if (imgs.length === 0) { showToast('画像ファイルがありません'); return; }
+    try {
+      const res = await fetch(`/ml/image/datasets/${datasetName}/images`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ images: imgs }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error);
+      showToast(`${(d.added || []).length}枚の画像を追加しました`);
+      onReload();  // datasetDetail を再取得 → images が増える
+    } catch (e) {
+      showToast(`画像追加失敗: ${e.message}`);
+    }
+  }
+
+  if (images.length === 0) {
+    return (
+      <div className="annotate-view">
+        <div className="annotate-back-bar">
+          <button className="btn small" onClick={onBack}>← データセット一覧へ</button>
+          <span className="annotate-dataset-name">{datasetName}</span>
+        </div>
+        <div className="empty-state" style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center' }}>
+          <div>このデータセットには画像がありません。</div>
+          <label className="btn primary">
+            📁 画像を追加
+            <input type="file" accept="image/*" multiple style={{ display: 'none' }}
+              onChange={e => addImagesHere(Array.from(e.target.files))} />
+          </label>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="annotate-view">
+      <div className="annotate-back-bar">
+        <button className="btn small" onClick={onBack}>← データセット一覧へ</button>
+        <span className="annotate-dataset-name">{datasetName} ({dataset.classes.length}クラス)</span>
+      </div>
+      <div className="annotate-toolbar">
+        <div className="annotate-classes">
+          <span className="annotate-label">ラベル:</span>
+          {dataset.classes.map((cls, i) => (
+            <button key={i}
+              className={`annotate-class-btn ${activeClass === i ? 'active' : ''}`}
+              style={{ borderColor: COLORS[i % COLORS.length], ...(activeClass === i ? { background: COLORS[i % COLORS.length], color: '#fff' } : {}) }}
+              onClick={() => setActiveClass(i)}>
+              {cls}
+            </button>
+          ))}
+        </div>
+        <div className="annotate-nav">
+          <button className="btn small" onClick={() => gotoImage(currentIdx - 1)} disabled={currentIdx === 0}>◀ 前</button>
+          <span className="annotate-counter">{currentIdx + 1} / {images.length}</span>
+          <button className="btn small" onClick={() => gotoImage(currentIdx + 1)} disabled={currentIdx === images.length - 1}>次 ▶</button>
+          <label className="btn small">
+            ＋画像
+            <input type="file" accept="image/*" multiple style={{ display: 'none' }}
+              onChange={e => addImagesHere(Array.from(e.target.files))} />
+          </label>
+        </div>
+      </div>
+
+      <div className="annotate-modebar">
+        <span className="annotate-label">入力方式:</span>
+        <button className={`annotate-mode-btn ${drawMode === 'drag' ? 'active' : ''}`} onClick={() => setDrawMode('drag')}>
+          ⬚ ドラッグで矩形
+        </button>
+        <button className={`annotate-mode-btn ${drawMode === 'point' ? 'active' : ''}`} onClick={() => setDrawMode('point')}>
+          ⊙ 点で矩形
+        </button>
+        {drawMode === 'point' && (
+          <span className="annotate-pointsize">
+            サイズ:
+            <input type="number" min="4" max="300" value={pointSize}
+              onChange={e => {
+                const v = parseInt(e.target.value);
+                if (Number.isFinite(v)) setPointSize(Math.min(300, Math.max(4, v)));
+              }}
+              style={{ width: 56, margin: '0 4px', padding: '2px 4px' }} className="ml-input" />
+            px
+            <input type="range" min="4" max="300" step="1" value={pointSize}
+              onChange={e => setPointSize(parseInt(e.target.value))} style={{ verticalAlign: 'middle', marginLeft: 6 }} />
+          </span>
+        )}
+      </div>
+
+      <div className="annotate-hint">
+        {drawMode === 'drag'
+          ? <>画像上でドラッグして矩形を描画 → 選択中のラベル「{dataset.classes[activeClass]}」が付きます。</>
+          : <>画像上をクリックすると、その位置に {pointSize}px 四方の矩形 (ラベル「{dataset.classes[activeClass]}」) を生成します。サイズは下のリストから後で調整も可能。</>
+        }
+        <strong> ショートカット: ← → 画像送り / ↑ で保存</strong>
+      </div>
+
+      <div className="annotate-canvas-wrap" ref={wrapRef}>
+        <img ref={imgRef} src={`/ml/image/datasets/${datasetName}/images/${currentImage.file}`} style={{ display: 'none' }} alt="annotate" crossOrigin="anonymous" />
+        <canvas ref={canvasRef} className="annotate-canvas"
+          style={{ cursor: drawMode === 'point' ? 'cell' : 'crosshair' }}
+          onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp} />
+      </div>
+
+      <div className="annotate-boxes">
+        <div className="annotate-boxes-header">
+          <span>矩形 ({boxes.length}個)</span>
+          <button className="btn small primary" onClick={saveBoxes} disabled={saving}>{saving ? '保存中...' : '💾 保存'}</button>
+        </div>
+        {boxes.map((b, i) => (
+          <div key={i} className="annotate-box-item">
+            <span className="annotate-box-class" style={{ color: COLORS[b.classIndex % COLORS.length] }}>
+              {dataset.classes[b.classIndex]}
+            </span>
+            <span className="annotate-box-coord">[{Math.round(b.x1)},{Math.round(b.y1)}]-[{Math.round(b.x2)},{Math.round(b.y2)}]</span>
+            <button className="annotate-box-remove" onClick={() => removeBox(i)}>×</button>
+          </div>
+        ))}
+      </div>
+
+      <div className="annotate-gallery">
+        <div className="annotate-gallery-header">
+          画像一覧 ({images.length}枚 · アノテーション済 {images.filter((im, i) => i === currentIdx ? boxes.length > 0 : (im.boxes || []).length > 0).length}枚)
+        </div>
+        <div className="annotate-gallery-grid">
+          {images.map((im, i) => {
+            // 現在編集中の画像は未保存の boxes を反映、それ以外は保存済みの boxes
+            const boxCount = i === currentIdx ? boxes.length : (im.boxes || []).length;
+            return (
+              <div key={im.id}
+                className={`annotate-thumb ${i === currentIdx ? 'active' : ''}`}
+                onClick={() => gotoImage(i)}
+                title={`${im.originalName || im.file} (矩形 ${boxCount}個)`}>
+                <img src={`/ml/image/datasets/${datasetName}/images/${im.file}`} alt={`img${i}`} loading="lazy" />
+                <span className={`annotate-thumb-badge ${boxCount > 0 ? 'has-box' : ''}`}>{boxCount}</span>
+                <span className="annotate-thumb-idx">{i + 1}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 学習実行ビュー
+// カスタムモデルを外部APIで使う方法を表示 (APIタブで使用)
+function CustomModelApiHelp({ host, token }) {
+  const origin = host || window.location.origin;
+  const tk = token || '<APIトークン>';
+  const pyExample = `import requests, base64
+
+# 画像を base64 に変換
+with open("test.jpg", "rb") as f:
+    img_b64 = base64.b64encode(f.read()).decode()
+
+resp = requests.post(
+    "${origin}/ml/image/detect",
+    headers={
+        "Content-Type": "application/json",
+        "Authorization": "Bearer ${tk}",  # ml:read 権限
+    },
+    verify=False,  # 自己署名証明書の場合
+    json={
+        "image": img_b64,
+        "customModel": "my_detector",  # カスタムモデル名 (COCOなら "model" を使う)
+        "threshold": 0.5,
+    },
+)
+print(resp.json())
+# → {"detections": [{"label": "...", "score": 0.9, "box": {...}}], "count": N, "device": "cuda"}`;
+
+  return (
+    <div className="api-help-box">
+      <div className="api-help-title">📡 Python から画像検出を呼ぶ</div>
+      <pre className="api-help-code">{pyExample}</pre>
+    </div>
+  );
+}
+
+function ImageTrainRunner({ datasets, onReload, showToast }) {
+  const [baseModels, setBaseModels] = useState([]);
+  const [datasetName, setDatasetName] = useState('');
+  const [modelName, setModelName] = useState('');
+  const [baseModel, setBaseModel] = useState('fasterrcnn_resnet50_fpn');
+  const [epochs, setEpochs] = useState(10);
+  const [batchSize, setBatchSize] = useState(2);
+  const [running, setRunning] = useState(false);
+  const [trainLog, setTrainLog] = useState('');
+  const [recentJobs, setRecentJobs] = useState([]);
+  const [customModels, setCustomModels] = useState([]);
+  const pollRef = useRef(null);
+
+  useEffect(() => {
+    fetch('/ml/image/train/models').then(r => r.json()).then(d => setBaseModels(d.baseModels || [])).catch(() => {});
+    loadStatus();
+    loadCustomModels();
+    if (onReload) onReload();  // 学習タブを開いたら最新のデータセット一覧 (annotatedCount) を取得
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
+
+  function loadCustomModels() {
+    fetch('/ml/image/custom-models').then(r => r.json()).then(d => setCustomModels(d.models || [])).catch(() => {});
+  }
+
+  function loadStatus() {
+    fetch('/ml/image/train/status').then(r => r.json()).then(d => {
+      if (d.running) {
+        setRunning(true);
+        setTrainLog(d.log || '');
+        startPolling();
+      } else {
+        setRunning(false);
+        setRecentJobs(d.recentJobs || []);
+      }
+    }).catch(() => {});
+  }
+
+  function startPolling() {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      const d = await fetch('/ml/image/train/status').then(r => r.json()).catch(() => null);
+      if (!d) return;
+      if (d.running) {
+        setTrainLog(d.log || '');
+      } else {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+        setRunning(false);
+        setRecentJobs(d.recentJobs || []);
+        loadCustomModels();
+        onReload();
+        showToast('学習が完了しました');
+      }
+    }, 2000);
+  }
+
+  async function startTrain() {
+    if (!datasetName) { showToast('データセットを選択してください'); return; }
+    if (!modelName.trim()) { showToast('モデル名を入力してください'); return; }
+    try {
+      const res = await fetch('/ml/image/train', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ datasetName, modelName: modelName.trim(), baseModel, epochs, batchSize }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error);
+      setRunning(true);
+      setTrainLog('学習を開始しました...\n');
+      startPolling();
+    } catch (e) {
+      showToast(`学習開始失敗: ${e.message}`);
+    }
+  }
+
+  async function cancelTrain() {
+    if (!confirm('学習を中止しますか?')) return;
+    await fetch('/ml/image/train/cancel', { method: 'POST' }).catch(() => {});
+  }
+
+  async function deleteModel(name) {
+    if (!confirm(`モデル「${name}」を削除しますか?`)) return;
+    await fetch(`/ml/image/custom-models/${name}`, { method: 'DELETE' }).catch(() => {});
+    loadCustomModels();
+    showToast('削除しました');
+  }
+
+  // モデルを zip でダウンロード (認証付き fetch → blob → 保存)
+  async function downloadModel(name) {
+    showToast('ダウンロードを準備中...');
+    try {
+      const res = await fetch(`/ml/image/custom-models/${name}/download`);
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.error || `HTTP ${res.status}`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${name}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast('ダウンロードしました');
+    } catch (e) {
+      showToast(`ダウンロード失敗: ${e.message}`);
+    }
+  }
+
+  const annotatedReady = datasets.filter(d => d.annotatedCount > 0);
+
+  return (
+    <div className="image-train-runner">
+      {!running && (
+        <div className="train-config">
+          <h3>カスタムモデルを学習</h3>
+          <div className="train-row">
+            <label className="image-detect-label">データセット:</label>
+            <select className="image-detect-select" value={datasetName} onChange={e => setDatasetName(e.target.value)}>
+              <option value="">選択してください</option>
+              {annotatedReady.map(d => (
+                <option key={d.name} value={d.name}>{d.name} (アノテーション済 {d.annotatedCount}枚, クラス: {d.classes.join('/')})</option>
+              ))}
+            </select>
+          </div>
+          {annotatedReady.length === 0 && (
+            <div className="warn-banner">アノテーション済みのデータセットがありません。先にデータセットを作成し、画像に矩形を描画してください。</div>
+          )}
+          <div className="train-row">
+            <label className="image-detect-label">モデル名:</label>
+            <input className="ml-input" placeholder="my_detector (英数字)" value={modelName} onChange={e => setModelName(e.target.value)} />
+          </div>
+          <div className="train-row">
+            <label className="image-detect-label">ベースモデル:</label>
+            <select className="image-detect-select" value={baseModel} onChange={e => setBaseModel(e.target.value)}>
+              {baseModels.map(m => <option key={m.name} value={m.name}>{m.label} ({m.note})</option>)}
+            </select>
+          </div>
+          {baseModel === 'scratch' && (
+            <div className="warn-banner" style={{ marginTop: -4 }}>
+              ⚠️ <strong>事前学習なし (ゼロから学習)</strong> を選択中です。
+              転移学習を使わないため、少量データ (数十枚) ではほとんど精度が出ません。
+              数千枚以上の画像と、多数のエポック (数十〜数百) が必要になります。
+              まず試す場合は「Faster R-CNN (MobileNetV3)」など事前学習ありを推奨します。
+            </div>
+          )}
+          <div className="train-row">
+            <label className="image-detect-label">エポック: {epochs}</label>
+            <input type="range" min="1" max="50" value={epochs} onChange={e => setEpochs(parseInt(e.target.value))} className="image-detect-slider" />
+            <label className="image-detect-label">バッチ: {batchSize}</label>
+            <input type="range" min="1" max="8" value={batchSize} onChange={e => setBatchSize(parseInt(e.target.value))} className="image-detect-slider" />
+          </div>
+          <button className="btn primary" onClick={startTrain} disabled={annotatedReady.length === 0}>🚀 学習開始</button>
+        </div>
+      )}
+
+      {running && (
+        <div className="train-running">
+          <div className="train-running-header">
+            <span className="train-spinner">⏳ 学習中...</span>
+            <button className="btn small danger" onClick={cancelTrain}>中止</button>
+          </div>
+          <pre className="train-log">{trainLog}</pre>
+        </div>
+      )}
+
+      {!running && customModels.length > 0 && (
+        <div className="train-models">
+          <h3>学習済みカスタムモデル ({customModels.length})</h3>
+          {customModels.map(m => (
+            <div key={m.name} className="dataset-card">
+              <div className="dataset-card-info">
+                <div className="dataset-card-name">🎓 {m.name}</div>
+                <div className="dataset-card-meta">
+                  クラス: {(m.classes || []).join(', ')} · ベース: {m.baseModel} · loss: {m.finalLoss ?? '-'}
+                </div>
+              </div>
+              <div className="dataset-card-actions">
+                <button className="btn small" onClick={() => downloadModel(m.name)}>⬇ ダウンロード</button>
+                <button className="btn small danger" onClick={() => deleteModel(m.name)}>削除</button>
+              </div>
+            </div>
+          ))}
+          <div className="train-hint">学習済みモデルは「🔍 検出」サブタブから選んで使えます。ダウンロードすればPythonで単体利用も、「📡 API (外部連携)」タブの方法で外部から呼び出すこともできます。</div>
+        </div>
+      )}
+
+      {!running && recentJobs.length > 0 && (
+        <div className="train-jobs">
+          <h3>学習履歴</h3>
+          {recentJobs.slice(0, 5).map(j => (
+            <div key={j.jobId} className={`train-job-item ${j.status}`}>
+              <span>{j.status === 'completed' ? '✅' : '❌'} {j.modelName}</span>
+              <span className="train-job-meta">
+                {j.status === 'completed' ? `loss: ${j.finalLoss}, ${j.device}` : `エラー: ${j.error || '不明'}`}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ImageDetectView({ showToast }) {
+  const [models, setModels] = useState([]);
+  const [customModels, setCustomModels] = useState([]);
+  // selectedModel は "coco:<name>" または "custom:<name>" の形式
+  const [selectedModel, setSelectedModel] = useState('coco:fasterrcnn_resnet50_fpn');
+  const [threshold, setThreshold] = useState(0.5);
+  const [imageDataUrl, setImageDataUrl] = useState(null);
+  const [detecting, setDetecting] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState('');
+  const canvasRef = useRef(null);
+  const imgRef = useRef(null);
+
+  // 検出結果のクラスごとに色を割り当て
+  const COLORS = ['#ff3b30', '#34c759', '#007aff', '#ff9500', '#af52de', '#ff2d55', '#5ac8fa', '#ffcc00'];
+
+  useEffect(() => {
+    fetch('/ml/image/models')
+      .then(r => r.ok ? r.json() : { models: [] })
+      .then(d => setModels(d.models || []))
+      .catch(() => {});
+    // カスタム学習済みモデルも取得
+    fetch('/ml/image/custom-models')
+      .then(r => r.ok ? r.json() : { models: [] })
+      .then(d => setCustomModels(d.models || []))
+      .catch(() => {});
+  }, []);
+
+  function onFileSelect(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setError('画像ファイルを選択してください');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      setImageDataUrl(reader.result);
+      setResult(null);
+      setError('');
+    };
+    reader.readAsDataURL(file);
+  }
+
+  // 検出結果を canvas に矩形描画
+  useEffect(() => {
+    if (!result || !imageDataUrl || !canvasRef.current || !imgRef.current) return;
+    const img = imgRef.current;
+    const draw = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      // 画像の実サイズで canvas を設定
+      canvas.width = result.imageWidth;
+      canvas.height = result.imageHeight;
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+      const classColors = {};
+      let colorIdx = 0;
+      result.detections.forEach(det => {
+        if (!(det.label in classColors)) {
+          classColors[det.label] = COLORS[colorIdx % COLORS.length];
+          colorIdx++;
+        }
+        const color = classColors[det.label];
+        const { x1, y1, x2, y2 } = det.box;
+        const w = x2 - x1, h = y2 - y1;
+        // 矩形
+        ctx.strokeStyle = color;
+        ctx.lineWidth = Math.max(2, canvas.width / 400);
+        ctx.strokeRect(x1, y1, w, h);
+        // ラベル背景
+        const label = `${det.label} ${(det.score * 100).toFixed(0)}%`;
+        const fontSize = Math.max(14, canvas.width / 50);
+        ctx.font = `bold ${fontSize}px sans-serif`;
+        const textW = ctx.measureText(label).width;
+        ctx.fillStyle = color;
+        ctx.fillRect(x1, Math.max(0, y1 - fontSize - 6), textW + 10, fontSize + 6);
+        // ラベル文字
+        ctx.fillStyle = '#fff';
+        ctx.fillText(label, x1 + 5, Math.max(fontSize, y1 - 4));
+      });
+    };
+    if (img.complete) draw();
+    else img.onload = draw;
+  }, [result, imageDataUrl]);
+
+  async function runDetect() {
+    if (!imageDataUrl) {
+      setError('画像を選択してください');
+      return;
+    }
+    setDetecting(true);
+    setError('');
+    setResult(null);
+    try {
+      // selectedModel は "coco:<name>" または "custom:<name>"
+      const [kind, mname] = selectedModel.split(':');
+      const body = kind === 'custom'
+        ? { image: imageDataUrl, customModel: mname, threshold }
+        : { image: imageDataUrl, model: mname, threshold };
+      const res = await fetch('/ml/image/detect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      setResult(data);
+      if (data.count === 0) showToast('物体が検出されませんでした (しきい値を下げてみてください)');
+      else showToast(`${data.count}個の物体を検出しました`);
+    } catch (e) {
+      setError(`検出失敗: ${e.message}`);
+    } finally {
+      setDetecting(false);
+    }
+  }
+
+  // 検出サマリー (クラスごとの個数)
+  const classSummary = {};
+  if (result) {
+    result.detections.forEach(d => { classSummary[d.label] = (classSummary[d.label] || 0) + 1; });
+  }
+
+  return (
+    <div className="image-detect-view">
+      <div className="image-detect-controls">
+        <div className="image-detect-row">
+          <label className="image-detect-label">モデル:</label>
+          <select value={selectedModel} onChange={e => setSelectedModel(e.target.value)} className="image-detect-select">
+            <optgroup label="COCO 事前学習 (80クラス)">
+              {models.map(m => (
+                <option key={m.name} value={`coco:${m.name}`}>{m.label} ({m.note}, 速度:{m.speed})</option>
+              ))}
+            </optgroup>
+            {customModels.length > 0 && (
+              <optgroup label="カスタム学習済みモデル">
+                {customModels.map(m => (
+                  <option key={m.name} value={`custom:${m.name}`}>
+                    🎓 {m.name} ({(m.classes || []).join(', ')})
+                  </option>
+                ))}
+              </optgroup>
+            )}
+          </select>
+        </div>
+        <div className="image-detect-row">
+          <label className="image-detect-label">信頼度しきい値: {threshold.toFixed(2)}</label>
+          <input type="range" min="0.05" max="0.95" step="0.05" value={threshold}
+            onChange={e => setThreshold(parseFloat(e.target.value))} className="image-detect-slider" />
+        </div>
+        <div className="image-detect-row">
+          <input type="file" accept="image/*" onChange={onFileSelect} className="image-detect-file" />
+          <button className="btn primary" onClick={runDetect} disabled={!imageDataUrl || detecting}>
+            {detecting ? '🔍 検出中...' : '🔍 物体検出を実行'}
+          </button>
+        </div>
+        <div className="image-detect-hint">
+          torchvision の COCO 事前学習モデル (80クラス: 人・車・犬・椅子・ボトル等) で物体を検出します。
+          初回はモデルのダウンロードに時間がかかることがあります。
+        </div>
+      </div>
+
+      {error && <div className="warn-banner">{error}</div>}
+
+      <div className="image-detect-canvas-wrap">
+        {imageDataUrl && (
+          <>
+            {/* 元画像 (canvasへの描画ソース、非表示) */}
+            <img ref={imgRef} src={imageDataUrl} style={{ display: 'none' }} alt="source" />
+            <canvas ref={canvasRef} className="image-detect-canvas" />
+          </>
+        )}
+        {!imageDataUrl && (
+          <div className="empty-state">画像ファイルを選択してください</div>
+        )}
+      </div>
+
+      {result && (
+        <div className="image-detect-result">
+          <div className="image-detect-summary">
+            <strong>{result.count}個</strong> 検出 ·
+            モデル: {result.model} ·
+            デバイス: {result.device} ·
+            画像: {result.imageWidth}×{result.imageHeight}
+          </div>
+          {result.note && (
+            <div className="image-detect-summary" style={{ color: 'var(--orange, #ff9500)' }}>
+              ⚠️ {result.note}
+            </div>
+          )}
+          {result.count > 0 && (
+            <div className="image-detect-classes">
+              {Object.entries(classSummary).map(([cls, n]) => (
+                <span key={cls} className="image-detect-class-badge">{cls}: {n}</span>
+              ))}
+            </div>
+          )}
+          <details className="image-detect-details">
+            <summary>検出の詳細 ({result.count}件)</summary>
+            <table className="image-detect-table">
+              <thead><tr><th>#</th><th>ラベル</th><th>信頼度</th><th>位置 (x1,y1,x2,y2)</th></tr></thead>
+              <tbody>
+                {result.detections.map((d, i) => (
+                  <tr key={i}>
+                    <td>{i + 1}</td>
+                    <td>{d.label}</td>
+                    <td>{(d.score * 100).toFixed(1)}%</td>
+                    <td>{d.box.x1}, {d.box.y1}, {d.box.x2}, {d.box.y2}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </details>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ─── クエリビュー ───
@@ -1175,7 +2177,30 @@ r = requests.post(f"{BASE}/ml/models/sales_yosoku/predict", headers=HEADERS, ver
         {"region": "Nagoya", "product": "ProductC", "quantity": 10},
     ]
 })
-print(r.json())  # → {"predictions": [15234.56, 8765.43, 23456.78], "count": 3, ...}`;
+print(r.json())  # → {"predictions": [15234.56, 8765.43, 23456.78], "count": 3, ...}
+
+# 8. 画像の物体検出 (COCO事前学習モデル)
+import base64
+with open("photo.jpg", "rb") as f:
+    img_b64 = base64.b64encode(f.read()).decode()
+r = requests.post(f"{BASE}/ml/image/detect", headers=HEADERS, verify=False, json={
+    "image": img_b64,
+    "model": "fasterrcnn_resnet50_fpn",  # 省略可
+    "threshold": 0.5
+})
+print(r.json())  # → {"detections": [{"label": "person", "score": 0.99, "box": {...}}], "count": N}
+
+# 9. カスタム学習済みモデルで物体検出
+r = requests.post(f"{BASE}/ml/image/detect", headers=HEADERS, verify=False, json={
+    "image": img_b64,
+    "customModel": "my_detector",  # 学習タブで作ったモデル名
+    "threshold": 0.5
+})
+print(r.json())
+
+# 10. 利用可能なモデル一覧 (COCO + カスタム)
+print(requests.get(f"{BASE}/ml/image/models", headers=HEADERS, verify=False).json())       # COCO事前学習
+print(requests.get(f"{BASE}/ml/image/custom-models", headers=HEADERS, verify=False).json()) # カスタム学習済み`;
 
   const curlExample = `# テーブル一覧
 curl -H "Authorization: Bearer ${sampleToken}" \\
@@ -1198,9 +2223,9 @@ curl -H "Authorization: Bearer ${sampleToken}" \\
       <div className="ml-section">
         <h3>📡 外部APIとして使う</h3>
         <p style={{color: 'var(--text-secondary)', fontSize: 13, lineHeight: 1.6}}>
-          Python スクリプトや他のアプリから ML データテーブルに直接アクセスできます。<br />
+          Python スクリプトや他のアプリから ML データテーブル・学習済みモデル・画像物体検出に直接アクセスできます。<br />
           認証は <code>Authorization: Bearer &lt;token&gt;</code> ヘッダー方式。
-          センサーログ、IoTデータ収集、定期的なETL処理などに活用してください。
+          センサーログ、IoTデータ収集、定期的なETL処理、画像の自動検出などに活用してください。
         </p>
       </div>
 
@@ -1359,8 +2384,30 @@ curl -H "Authorization: Bearer ${sampleToken}" \\
             <tr><td colSpan={4} style={{textAlign: 'center', background: 'var(--bg-tertiary)', padding: '4px', fontSize: 11}}>— 🎯 推論 (Phase 4) —</td></tr>
             <tr><td className="mono">GET</td><td className="mono">/ml/models/:name/config</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>モデル設定取得</td></tr>
             <tr><td className="mono">POST</td><td className="mono">/ml/models/:name/predict</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>推論実行 (単発/バッチ)</td></tr>
+            <tr><td colSpan={4} style={{textAlign: 'center', background: 'var(--bg-tertiary)', padding: '4px', fontSize: 11}}>— 🖼️ 画像物体検出 —</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/image/models</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>COCO事前学習モデル一覧</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/image/custom-models</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>カスタム学習済みモデル一覧</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/image/detect</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>物体検出 (COCO/カスタム)</td></tr>
           </tbody>
         </table>
+      </div>
+
+      <div className="ml-section">
+        <h3>🖼️ 画像物体検出 API の詳細</h3>
+        <p style={{color: 'var(--text-secondary)', fontSize: 13, lineHeight: 1.6}}>
+          画像を base64 で <code>POST /ml/image/detect</code> に送ると、検出された物体 (ラベル・位置・信頼度) が JSON で返ります。
+          COCO事前学習モデル (80クラス) と、学習タブで作ったカスタムモデルの両方が使えます。
+        </p>
+        <table className="ml-schema-table">
+          <thead><tr><th>パラメータ</th><th>必須</th><th>説明</th></tr></thead>
+          <tbody>
+            <tr><td className="mono">image</td><td>必須</td><td>base64文字列 (data URL可)</td></tr>
+            <tr><td className="mono">model</td><td>任意</td><td>COCOモデル名 (既定: fasterrcnn_resnet50_fpn)</td></tr>
+            <tr><td className="mono">customModel</td><td>任意</td><td>カスタムモデル名 (指定時は model より優先)</td></tr>
+            <tr><td className="mono">threshold</td><td>任意</td><td>信頼度しきい値 0〜1 (既定: 0.5)</td></tr>
+          </tbody>
+        </table>
+        <CustomModelApiHelp host={exampleHost} token={sampleToken} />
       </div>
     </div>
   );

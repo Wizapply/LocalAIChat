@@ -311,6 +311,8 @@ function buildAgentDeps() {
       const walk = (dir, base = '') => {
         const items = [];
         for (const name of fs.readdirSync(dir)) {
+          // 隠しファイル・隠しディレクトリ (.で始まる) は除外
+          if (name.startsWith('.')) continue;
           const full = path.join(dir, name);
           const rel = base ? `${base}/${name}` : name;
           try {
@@ -324,6 +326,10 @@ function buildAgentDeps() {
       return { files: walk(UPLOADS_DIR) };
     },
     readUploadFile: async (relPath) => {
+      // 隠しファイル (パス中のどこかが . で始まる) は読み取り拒否
+      if (String(relPath).split('/').some(seg => seg.startsWith('.'))) {
+        throw new Error('隠しファイルにはアクセスできません');
+      }
       const abs = safeUploadPath(relPath);
       if (!abs) throw new Error('無効なパス');
       if (!fs.existsSync(abs)) throw new Error('ファイルが見つかりません');
@@ -1821,8 +1827,16 @@ const ML_JOBS_FILE = path.join(ML_DIR, 'jobs.json');   // 学習ジョブ履歴
 const RAG_DIR = path.join(__dirname, 'ml', 'rag');     // RAGドキュメント保存先
 const RAG_INDEX_FILE = path.join(RAG_DIR, 'index.json'); // 登録ドキュメント一覧
 
+// 画像検出 (torchvision) のモデルweightキャッシュ先
+// 本番環境では ~/.cache が読み取り専用のことがあるため、アプリ内に明示
+const TORCH_CACHE_DIR = path.join(ML_DIR, 'torch_cache');
+
+// 画像物体検出のカスタム学習 (Phase 2)
+const IMAGE_DATASETS_DIR = path.join(ML_DIR, 'image_datasets'); // データセット (画像+アノテーション)
+const IMAGE_MODELS_DIR = path.join(ML_DIR, 'image_models');     // 学習済みカスタムモデル
+
 // ディレクトリ作成
-for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR, ML_DIR, ML_MODELS_DIR, RAG_DIR]) {
+for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR, ML_DIR, ML_MODELS_DIR, RAG_DIR, TORCH_CACHE_DIR, IMAGE_DATASETS_DIR, IMAGE_MODELS_DIR]) {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 }
 
@@ -2059,6 +2073,26 @@ function saveJobs(jobs) {
   fs.writeFileSync(TUNING_JOBS_FILE, JSON.stringify(jobs, null, 2));
 }
 
+// サーバー起動時に呼ぶ: 前回の実行中にサーバーが落ちた場合、jobs.json には
+// status:'running' のジョブが残るが実プロセスは死んでいる。これを 'interrupted'
+// に補正して、UIで永遠に「実行中」と表示され続けるのを防ぐ。
+function reconcileStaleJobs() {
+  try {
+    const jobs = loadJobs();
+    let changed = false;
+    for (const j of jobs) {
+      if (j.status === 'running') {
+        j.status = 'interrupted';
+        j.endedAt = j.endedAt || Date.now();
+        changed = true;
+      }
+    }
+    if (changed) { saveJobs(jobs); log('-', '[起動] 中断されたファインチューニングジョブを補正しました'); }
+  } catch {}
+  // 画像学習ジョブ側は実行中を履歴に入れない設計なので補正不要
+}
+reconcileStaleJobs();
+
 function generateJobId() {
   return 'j_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
@@ -2139,6 +2173,8 @@ app.post('/tuning/jobs', requireAuth, jsonParser, async (req, res) => {
   log(ip, `TUNING START: ${jobId} baseModel=${baseModel} samples=${samples.length}`);
   const logPath = path.join(jobDir, 'training.log');
   const logStream = fs.createWriteStream(logPath);
+  // ログstreamのエラー (ディスク不足・権限等) でクラッシュしないように
+  logStream.on('error', (err) => { log('-', `[tuning ${jobId}] ログ書き込みエラー: ${err.message}`); });
   // 環境変数: AMD Radeon AI PRO R9700 (gfx1201) 安定化対策
   // config.json の tuning.env で上書き可能（旧 tuningEnv も互換維持）
   const tuningEnv = {
@@ -2150,20 +2186,56 @@ app.post('/tuning/jobs', requireAuth, jsonParser, async (req, res) => {
   const proc = spawn(pythonPath, [tuneScript, jobDir], {
     cwd: __dirname,
     env: { ...process.env, ...tuningEnv, JOB_DIR: jobDir },
+    detached: true,  // プロセスグループを作り、停止時に子プロセスごとkillできるように
   });
-  proc.stdout.on('data', d => logStream.write(d));
-  proc.stderr.on('data', d => logStream.write(d));
+  // spawn 自体の失敗 (実行ファイルが無い等)。error を捕捉しないと
+  // unhandled 'error' イベントで Node プロセス全体がクラッシュする。
+  proc.on('error', (err) => {
+    try { logStream.write(`\n[プロセス起動エラー] ${err.message}\n`); logStream.end(); } catch {}
+    const jobs = loadJobs();
+    const j = jobs.find(j => j.id === jobId);
+    if (j) { j.status = 'failed'; j.error = err.message; j.endedAt = Date.now(); saveJobs(jobs); }
+    log('-', `[tuning ${jobId}] プロセス起動失敗: ${err.message}`);
+    currentTuningJob = null;
+  });
+  // tqdm 等の進捗バーは \r で同じ行を上書きする。そのままログに溜めると
+  // \r が大量に連なって読めなくなるため、\r を改行に正規化して書き込む。
+  // チャンク境界をまたぐ進捗行に備えて、未確定の末尾だけバッファに残す。
+  let logTail = '';
+  const writeNormalized = (chunk) => {
+    let s = logTail + chunk.toString();
+    // \r\n は \n に統一
+    s = s.replace(/\r\n/g, '\n');
+    // 行を確定する: \n または \r で分割
+    // \r は「行の上書き」なので、直前の未確定行を捨てて新しい行にする
+    const parts = s.split('\n');
+    logTail = parts.pop();  // 最後の要素は未確定 (改行待ち)
+    for (const line of parts) {
+      // 行内に \r があれば最後のセグメントだけ採用 (進捗の最終状態)
+      const finalSeg = line.includes('\r') ? line.split('\r').pop() : line;
+      try { logStream.write(finalSeg + '\n'); } catch {}
+    }
+    // 未確定行に \r が含まれる (進捗更新中) なら最後のセグメントだけ保持
+    if (logTail.includes('\r')) logTail = logTail.split('\r').pop();
+  };
+  proc.stdout.on('data', writeNormalized);
+  proc.stderr.on('data', writeNormalized);
   proc.on('exit', (code) => {
+    if (logTail) { try { logStream.write(logTail + '\n'); } catch {} logTail = ''; }
     logStream.end();
     const jobs = loadJobs();
     const j = jobs.find(j => j.id === jobId);
     if (j) {
-      j.status = code === 0 ? 'completed' : 'failed';
+      // ユーザーが停止した (cancelled) 場合は、kill による非0 exit で
+      // 'failed' に上書きしない。意図的な中断と異常終了を区別する。
+      if (j.status !== 'cancelled') {
+        j.status = code === 0 ? 'completed' : 'failed';
+      }
       j.exitCode = code;
       j.endedAt = Date.now();
       saveJobs(jobs);
     }
-    log('-', `[tuning ${jobId}] 終了 code=${code}`);
+    log('-', `[tuning ${jobId}] 終了 code=${code} (status=${j ? j.status : '?'})`);
     currentTuningJob = null;
   });
 
@@ -2183,9 +2255,13 @@ app.post('/tuning/jobs', requireAuth, jsonParser, async (req, res) => {
 // ジョブログ取得
 app.get('/tuning/jobs/:id/log', requireAuth, (req, res) => {
   const jobId = req.params.id;
+  // jobId のバリデーション (パストラバーサル防止)
+  if (!/^[a-zA-Z0-9_-]+$/.test(jobId)) return res.status(400).json({ error: '無効なジョブID' });
   const logPath = path.join(TUNING_RUNS_DIR, jobId, 'training.log');
-  if (!fs.existsSync(logPath)) return res.status(404).json({ error: 'ログがありません' });
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  // ログファイルがまだ作られていない (学習開始直後等) は空文字を返す
+  // 404にするとフロント側が「ログ読み込み中」のまま固まるため
+  if (!fs.existsSync(logPath)) return res.status(200).send('');
   fs.createReadStream(logPath).pipe(res);
 });
 
@@ -2194,10 +2270,19 @@ app.post('/tuning/jobs/:id/stop', requireAuth, (req, res) => {
   if (!currentTuningJob || currentTuningJob.id !== req.params.id) {
     return res.status(404).json({ error: '実行中ジョブではありません' });
   }
-  try { currentTuningJob.proc.kill('SIGTERM'); } catch {}
+  const proc = currentTuningJob.proc;
+  const pid = proc && proc.pid;
+  // detached で起動しているので、プロセスグループ全体 (-pid) に送ると
+  // PyTorch が生成した子プロセスごと止められる。
+  const killGroup = (sig) => {
+    if (!pid) return;
+    try { process.kill(-pid, sig); }      // プロセスグループ
+    catch { try { proc.kill(sig); } catch {} }  // 失敗時は親だけ
+  };
+  killGroup('SIGTERM');
   setTimeout(() => {
-    if (currentTuningJob && currentTuningJob.proc) {
-      try { currentTuningJob.proc.kill('SIGKILL'); } catch {}
+    if (currentTuningJob && currentTuningJob.proc && currentTuningJob.proc.pid === pid) {
+      killGroup('SIGKILL');
     }
   }, 5000);
   const jobs = loadJobs();
@@ -2278,9 +2363,17 @@ app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => 
     postLog.write(`$ ${cmd} ${args.join(' ')}\n`);
     const p = spawn(cmd, args, { cwd, env: { ...process.env } });
     currentPostprocess = { jobId, proc: p, step: label };
+    let errored = false;
+    p.on('error', (err) => {
+      // 実行ファイルが無い等。捕捉しないとサーバーがクラッシュする
+      errored = true;
+      postLog.write(`\n[${label}] プロセス起動エラー: ${err.message}\n`);
+      onDone(-1);
+    });
     p.stdout.on('data', d => postLog.write(d));
     p.stderr.on('data', d => postLog.write(d));
     p.on('exit', (code) => {
+      if (errored) return;  // error後のexitは二重処理しない
       postLog.write(`\n[${label}] exit code=${code}\n`);
       onDone(code);
     });
@@ -3114,6 +3207,9 @@ function safeUploadPath(relativePath) {
   clean = clean.replace(/^(public\/)?uploads[\/\\]/, '');
   // nullバイト拒否
   if (clean.includes('\0')) return null;
+  // 隠しファイル・隠しディレクトリ (パス中のどこかのセグメントが . で始まる) を拒否
+  // 一覧に出さないものは読み書きもさせない (整合性とセキュリティのため)
+  if (clean.split(/[\/\\]/).some(seg => seg.startsWith('.'))) return null;
   // 絶対パスに解決
   const abs = path.resolve(UPLOADS_DIR, clean);
   // UPLOADS_DIR配下であることを確認
@@ -3127,6 +3223,8 @@ app.get('/files', requireAuth, (req, res) => {
     const walk = (dir, base = '') => {
       const items = [];
       for (const name of fs.readdirSync(dir)) {
+        // 隠しファイル・隠しディレクトリ (.で始まる) は除外
+        if (name.startsWith('.')) continue;
         const full = path.join(dir, name);
         const rel = base ? `${base}/${name}` : name;
         try {
@@ -4351,6 +4449,16 @@ app.post('/ml/jobs/start', requireAuth, requirePermission('ml:write'), jsonParse
   };
   proc.stdout.on('data', handleData);
   proc.stderr.on('data', handleData);
+  proc.on('error', (err) => {
+    // spawn失敗 (python不在等)。捕捉しないとサーバーがクラッシュする
+    try { logStream.write(`\n[プロセス起動エラー] ${err.message}\n`); logStream.end(); } catch {}
+    try { fs.unlinkSync(tmpCfg); } catch {}
+    const allJobs = loadMlJobs();
+    const j = allJobs.find(jj => jj.id === jobId);
+    if (j) { j.status = 'failed'; j.error = err.message; j.endedAt = Date.now(); saveMlJobs(allJobs); }
+    log('-', `[ML学習 ${jobId}] プロセス起動失敗: ${err.message}`);
+    currentMlJob = null;
+  });
   proc.on('close', (code) => {
     logStream.end();
     try { fs.unlinkSync(tmpCfg); } catch {}
@@ -4448,6 +4556,838 @@ app.get('/ml/models/:name/config', requireAuth, requirePermission('ml:read'), (r
 //   - 時系列: features は配列の配列 [[v1,v2,v3], ...]
 // ─── ML推論 共通関数 (エンドポイントと agent_proxy から共用) ───
 // modelName とfeatures (辞書 or 配列) を受けて ml_predict.py を実行、結果JSONを返す
+// ════════════════════════════════════════════════
+// 画像物体検出 (torchvision, COCO事前学習)
+// ════════════════════════════════════════════════
+// /ml.html の「画像」タブから利用。base64画像を受けて image_detect.py で検出。
+
+// 外部コマンド (zip) に依存せず、Node標準の zlib だけで ZIP ファイルを生成する。
+// files: [{ name: 'model.pt', data: Buffer }] を受け取り、ZIP の Buffer を返す。
+// STORE (無圧縮) と DEFLATE (圧縮) を自動選択。本番に zip コマンドが無くても動く。
+function buildZipBuffer(files) {
+  const zlib = require('zlib');
+  const chunks = [];           // ローカルファイルレコード
+  const central = [];          // セントラルディレクトリ
+  let offset = 0;
+
+  // CRC32 計算 (テーブル方式)
+  const crcTable = buildZipBuffer._crcTable || (buildZipBuffer._crcTable = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[n] = c >>> 0;
+    }
+    return t;
+  })());
+  const crc32 = (buf) => {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < buf.length; i++) c = crcTable[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  };
+
+  const dosTime = 0, dosDate = 0x21;  // 1980-01-01 固定 (zip仕様の最小値)
+
+  for (const f of files) {
+    const nameBuf = Buffer.from(f.name, 'utf-8');
+    const raw = Buffer.isBuffer(f.data) ? f.data : Buffer.from(f.data, 'utf-8');
+    const crc = crc32(raw);
+    // 圧縮を試みて、縮まらなければ STORE
+    let comp = zlib.deflateRawSync(raw);
+    let method = 8;  // DEFLATE
+    if (comp.length >= raw.length) { comp = raw; method = 0; }  // STORE
+
+    // ローカルファイルヘッダ
+    const lh = Buffer.alloc(30);
+    lh.writeUInt32LE(0x04034b50, 0);   // signature
+    lh.writeUInt16LE(20, 4);           // version needed
+    lh.writeUInt16LE(0x0800, 6);       // flags (bit11: UTF-8 ファイル名)
+    lh.writeUInt16LE(method, 8);       // 圧縮方式
+    lh.writeUInt16LE(dosTime, 10);
+    lh.writeUInt16LE(dosDate, 12);
+    lh.writeUInt32LE(crc, 14);
+    lh.writeUInt32LE(comp.length, 18); // 圧縮後サイズ
+    lh.writeUInt32LE(raw.length, 22);  // 元サイズ
+    lh.writeUInt16LE(nameBuf.length, 26);
+    lh.writeUInt16LE(0, 28);           // extra field length
+    chunks.push(lh, nameBuf, comp);
+
+    // セントラルディレクトリレコード
+    const ch = Buffer.alloc(46);
+    ch.writeUInt32LE(0x02014b50, 0);   // signature
+    ch.writeUInt16LE(20, 4);           // version made by
+    ch.writeUInt16LE(20, 6);           // version needed
+    ch.writeUInt16LE(0x0800, 8);       // flags
+    ch.writeUInt16LE(method, 10);
+    ch.writeUInt16LE(dosTime, 12);
+    ch.writeUInt16LE(dosDate, 14);
+    ch.writeUInt32LE(crc, 16);
+    ch.writeUInt32LE(comp.length, 20);
+    ch.writeUInt32LE(raw.length, 24);
+    ch.writeUInt16LE(nameBuf.length, 28);
+    ch.writeUInt16LE(0, 30);           // extra
+    ch.writeUInt16LE(0, 32);           // comment
+    ch.writeUInt16LE(0, 34);           // disk number
+    ch.writeUInt16LE(0, 36);           // internal attrs
+    ch.writeUInt32LE(0, 38);           // external attrs
+    ch.writeUInt32LE(offset, 42);      // ローカルヘッダのオフセット
+    central.push(Buffer.concat([ch, nameBuf]));
+
+    offset += lh.length + nameBuf.length + comp.length;
+  }
+
+  const centralBuf = Buffer.concat(central);
+  const centralOffset = offset;
+
+  // End of Central Directory
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(files.length, 8);
+  eocd.writeUInt16LE(files.length, 10);
+  eocd.writeUInt32LE(centralBuf.length, 12);
+  eocd.writeUInt32LE(centralOffset, 16);
+  eocd.writeUInt16LE(0, 20);
+
+  return Buffer.concat([...chunks, centralBuf, eocd]);
+}
+
+
+// 対応モデル (image_detect.py の SUPPORTED_MODELS と揃える)
+const IMAGE_DETECT_MODELS = [
+  { name: 'fasterrcnn_resnet50_fpn', label: 'Faster R-CNN (ResNet50)', note: '高精度・標準', speed: '中' },
+  { name: 'fasterrcnn_mobilenet_v3_large_fpn', label: 'Faster R-CNN (MobileNetV3)', note: '軽量・高速', speed: '速' },
+  { name: 'retinanet_resnet50_fpn', label: 'RetinaNet (ResNet50)', note: '1段検出', speed: '中' },
+  { name: 'ssd300_vgg16', label: 'SSD300 (VGG16)', note: '軽量', speed: '速' },
+  { name: 'ssdlite320_mobilenet_v3_large', label: 'SSDLite320 (MobileNetV3)', note: '最軽量', speed: '最速' },
+];
+const IMAGE_DETECT_MODEL_NAMES = IMAGE_DETECT_MODELS.map(m => m.name);
+
+// 画像物体検出を実行 (base64画像 → 一時ファイル → image_detect.py)
+function runImageDetect(imageBase64, modelName, threshold, customModelName) {
+  return new Promise((resolve, reject) => {
+    const isCustom = !!customModelName;
+    if (isCustom) {
+      if (!isValidDatasetName(customModelName)) {
+        return reject(new Error('無効なカスタムモデル名'));
+      }
+      const cfgPath = path.join(IMAGE_MODELS_DIR, customModelName, 'config.json');
+      if (!fs.existsSync(cfgPath)) {
+        return reject(new Error(`カスタムモデルが見つかりません: ${customModelName}`));
+      }
+    } else if (modelName && !IMAGE_DETECT_MODEL_NAMES.includes(modelName)) {
+      return reject(new Error(`未対応のモデル: ${modelName}`));
+    }
+    if (!imageBase64 || typeof imageBase64 !== 'string') {
+      return reject(new Error('image (base64) が必要です'));
+    }
+    // data URL プレフィックスを除去
+    const b64 = imageBase64.replace(/^data:image\/[a-zA-Z+]+;base64,/, '');
+    let buf;
+    try {
+      buf = Buffer.from(b64, 'base64');
+    } catch {
+      return reject(new Error('base64 のデコードに失敗しました'));
+    }
+    if (buf.length === 0) return reject(new Error('画像データが空です'));
+    if (buf.length > MAX_FILE_SIZE) return reject(new Error('画像が大きすぎます'));
+
+    // 一時ファイルに保存 (拡張子はpngで固定、torchvision read_image が判別)
+    const tmpPath = path.join(os.tmpdir(), `imgdetect_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.img`);
+    try {
+      fs.writeFileSync(tmpPath, buf);
+    } catch (e) {
+      return reject(new Error(`一時ファイル書き込み失敗: ${e.message}`));
+    }
+
+    const pythonCmd = appConfig.pythonPath || 'python3';
+    const scriptPath = path.join(__dirname, 'image_detect.py');
+    if (!fs.existsSync(scriptPath)) {
+      try { fs.unlinkSync(tmpPath); } catch {}
+      return reject(new Error('image_detect.py が見つかりません'));
+    }
+
+    const argv = [
+      scriptPath,
+      '--image', tmpPath,
+      '--threshold', String(threshold ?? 0.5),
+      '--cache-dir', TORCH_CACHE_DIR,
+    ];
+    if (isCustom) {
+      argv.push('--custom-model-dir', path.join(IMAGE_MODELS_DIR, customModelName));
+    } else {
+      argv.push('--model', modelName || 'fasterrcnn_resnet50_fpn');
+    }
+    const { spawn } = require('child_process');
+    const proc = spawn(pythonCmd, argv, {
+      cwd: __dirname,
+      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    });
+
+    let stdout = '', stderr = '';
+    proc.stdout.on('data', d => { stdout += d.toString(); });
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+
+    // 初回はモデルweightダウンロードがあるので長めの120秒
+    const timeout = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 120000);
+
+    const cleanup = () => { try { fs.unlinkSync(tmpPath); } catch {} };
+
+    proc.on('close', (code) => {
+      clearTimeout(timeout);
+      cleanup();
+      // stdout から JSON を抽出 (進捗バーが混ざる可能性に備え、最後の { から } までを試す)
+      const tryParseJson = (s) => {
+        if (!s) return null;
+        try { return JSON.parse(s.trim()); } catch {}
+        // 末尾の JSON オブジェクトを抽出 (前に余計な出力がある場合)
+        const start = s.lastIndexOf('{');
+        const end = s.lastIndexOf('}');
+        if (start !== -1 && end > start) {
+          try { return JSON.parse(s.slice(start, end + 1)); } catch {}
+        }
+        return null;
+      };
+
+      const parsed = tryParseJson(stdout);
+      if (code !== 0) {
+        // Python が吐いたエラーJSON を最優先
+        if (parsed && parsed.error) {
+          return reject(new Error(parsed.error));
+        }
+        // stderr から進捗バー (\r を含む行) を除去して本当のエラーだけ残す
+        const cleanErr = stderr
+          .split('\n')
+          .map(line => line.split('\r').pop())  // \r で上書きされる進捗は最後だけ残る
+          .filter(line => !/^\s*\d+%\|/.test(line) && line.trim())  // 進捗バー行を除外
+          .join('\n')
+          .trim();
+        return reject(new Error(`検出失敗 (exit ${code}): ${cleanErr.slice(0, 400) || '詳細不明'}`));
+      }
+      // 成功時
+      if (parsed) return resolve(parsed);
+      reject(new Error(`検出結果のパース失敗: ${stdout.slice(0, 200)}`));
+    });
+    proc.on('error', (err) => { clearTimeout(timeout); cleanup(); reject(new Error(`検出プロセス起動失敗: ${err.message}`)); });
+  });
+}
+
+// 画像検出: 対応モデル一覧
+app.get('/ml/image/models', requireAuth, requirePermission('ml:read'), (req, res) => {
+  res.json({ models: IMAGE_DETECT_MODELS });
+});
+
+// 画像検出: 推論実行
+// body: { image: "<base64 or data URL>", model?: "fasterrcnn_resnet50_fpn", threshold?: 0.5 }
+app.post('/ml/image/detect', requireAuth, requirePermission('ml:read'), jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const { image, model, threshold, customModel } = req.body || {};
+  try {
+    const th = typeof threshold === 'number' ? Math.min(Math.max(threshold, 0), 1) : 0.5;
+    const result = await runImageDetect(image, model, th, customModel);
+    log(ip, `[画像検出] ${result.model}: ${result.count}個検出 (${result.device})`);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════
+// 画像物体検出 カスタム学習 (Phase 2)
+// ════════════════════════════════════════════════
+// データセット (画像+アノテーション) を管理し、torchvision fasterrcnn を
+// ファインチューニングして独自クラスの検出モデルを作る。
+
+// データセット名のバリデーション (英数字・ハイフン・アンダースコア)
+function isValidDatasetName(name) {
+  return typeof name === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(name);
+}
+
+// データセットのメタ情報をロード
+function loadImageDataset(name) {
+  const metaPath = path.join(IMAGE_DATASETS_DIR, name, 'dataset.json');
+  if (!fs.existsSync(metaPath)) return null;
+  try { return JSON.parse(fs.readFileSync(metaPath, 'utf-8')); }
+  catch { return null; }
+}
+
+// データセットのメタ情報を保存
+function saveImageDataset(name, meta) {
+  const dir = path.join(IMAGE_DATASETS_DIR, name);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(path.join(dir, 'images'))) fs.mkdirSync(path.join(dir, 'images'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'dataset.json'), JSON.stringify(meta, null, 2), 'utf-8');
+}
+
+// データセット一覧
+app.get('/ml/image/datasets', requireAuth, requirePermission('ml:read'), (req, res) => {
+  try {
+    const datasets = [];
+    for (const name of fs.readdirSync(IMAGE_DATASETS_DIR)) {
+      const meta = loadImageDataset(name);
+      if (meta) {
+        datasets.push({
+          name,
+          classes: meta.classes || [],
+          imageCount: (meta.images || []).length,
+          annotatedCount: (meta.images || []).filter(im => (im.boxes || []).length > 0).length,
+          createdAt: meta.createdAt,
+          updatedAt: meta.updatedAt,
+        });
+      }
+    }
+    datasets.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    res.json({ datasets });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// データセット作成
+app.post('/ml/image/datasets', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const { name, classes } = req.body || {};
+  if (!isValidDatasetName(name)) {
+    return res.status(400).json({ error: 'データセット名は英数字・ハイフン・アンダースコア (1-64文字)' });
+  }
+  if (loadImageDataset(name)) {
+    return res.status(409).json({ error: `データセット「${name}」は既に存在します` });
+  }
+  if (!Array.isArray(classes) || classes.length === 0) {
+    return res.status(400).json({ error: '最低1つのクラス名が必要です' });
+  }
+  const cleanClasses = classes.map(c => String(c).trim()).filter(Boolean);
+  if (cleanClasses.length === 0) {
+    return res.status(400).json({ error: '有効なクラス名がありません' });
+  }
+  const meta = {
+    name,
+    classes: cleanClasses,
+    images: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  saveImageDataset(name, meta);
+  log(ip, `[画像学習] データセット作成: ${name} (クラス: ${cleanClasses.join(', ')})`);
+  res.json({ ok: true, dataset: meta });
+});
+
+// データセット詳細 (画像一覧 + アノテーション)
+app.get('/ml/image/datasets/:name', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const { name } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なデータセット名' });
+  const meta = loadImageDataset(name);
+  if (!meta) return res.status(404).json({ error: 'データセットが見つかりません' });
+  res.json({ dataset: meta });
+});
+
+// データセット削除
+app.delete('/ml/image/datasets/:name', requireAuth, requirePermission('ml:write'), (req, res) => {
+  const ip = getIP(req);
+  const { name } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なデータセット名' });
+  const dir = path.join(IMAGE_DATASETS_DIR, name);
+  if (!fs.existsSync(dir)) return res.status(404).json({ error: 'データセットが見つかりません' });
+  fs.rmSync(dir, { recursive: true, force: true });
+  log(ip, `[画像学習] データセット削除: ${name}`);
+  res.json({ ok: true });
+});
+
+// データセットに画像を追加 (base64)
+// body: { images: [{ name, data }] }  data は base64 or data URL
+app.post('/ml/image/datasets/:name/images', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const { name } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なデータセット名' });
+  const meta = loadImageDataset(name);
+  if (!meta) return res.status(404).json({ error: 'データセットが見つかりません' });
+
+  const { images } = req.body || {};
+  if (!Array.isArray(images) || images.length === 0) {
+    return res.status(400).json({ error: 'images が必要です' });
+  }
+  const imagesDir = path.join(IMAGE_DATASETS_DIR, name, 'images');
+  if (!fs.existsSync(imagesDir)) fs.mkdirSync(imagesDir, { recursive: true });
+  const added = [];
+  const errors = [];
+  for (const im of images) {
+    try {
+      const b64 = String(im.data || '').replace(/^data:image\/[a-zA-Z+]+;base64,/, '');
+      const buf = Buffer.from(b64, 'base64');
+      if (buf.length === 0) throw new Error('画像データが空');
+      if (buf.length > MAX_FILE_SIZE) throw new Error('画像が大きすぎます');
+      // 安全なファイル名生成
+      const ext = (im.name && path.extname(im.name).toLowerCase().match(/\.(jpg|jpeg|png|bmp|webp)/)) ? path.extname(im.name).toLowerCase() : '.jpg';
+      const imgId = `img_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      const fileName = `${imgId}${ext}`;
+      fs.writeFileSync(path.join(imagesDir, fileName), buf);
+      const imgEntry = { id: imgId, file: fileName, originalName: im.name || fileName, boxes: [], addedAt: Date.now() };
+      meta.images.push(imgEntry);
+      added.push(imgEntry);
+    } catch (e) {
+      errors.push({ name: im.name, error: e.message });
+    }
+  }
+  meta.updatedAt = Date.now();
+  saveImageDataset(name, meta);
+  log(ip, `[画像学習] ${name} に画像追加: ${added.length}件`);
+  res.json({ ok: true, added, errors });
+});
+
+// データセットの画像ファイルを返す (アノテーション画面の表示用)
+app.get('/ml/image/datasets/:name/images/:file', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const { name, file } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なデータセット名' });
+  // ファイル名のトラバーサル防止
+  if (!/^[a-zA-Z0-9_.-]+$/.test(file)) return res.status(400).json({ error: '無効なファイル名' });
+  const filePath = path.join(IMAGE_DATASETS_DIR, name, 'images', file);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: '画像が見つかりません' });
+  res.sendFile(filePath);
+});
+
+// 画像のアノテーション (矩形) を保存
+// body: { imageId, boxes: [{ classIndex, x1, y1, x2, y2 }] }
+app.put('/ml/image/datasets/:name/annotations/:imageId', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const { name, imageId } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なデータセット名' });
+  const meta = loadImageDataset(name);
+  if (!meta) return res.status(404).json({ error: 'データセットが見つかりません' });
+  const img = (meta.images || []).find(im => im.id === imageId);
+  if (!img) return res.status(404).json({ error: '画像が見つかりません' });
+
+  const { boxes } = req.body || {};
+  if (!Array.isArray(boxes)) return res.status(400).json({ error: 'boxes が必要です' });
+  // バリデーション: classIndex が範囲内、座標が数値
+  const clean = [];
+  for (const b of boxes) {
+    const ci = Number(b.classIndex);
+    if (!Number.isInteger(ci) || ci < 0 || ci >= meta.classes.length) continue;
+    const x1 = Number(b.x1), y1 = Number(b.y1), x2 = Number(b.x2), y2 = Number(b.y2);
+    if ([x1, y1, x2, y2].some(v => !Number.isFinite(v))) continue;
+    clean.push({
+      classIndex: ci,
+      x1: Math.min(x1, x2), y1: Math.min(y1, y2),
+      x2: Math.max(x1, x2), y2: Math.max(y1, y2),
+    });
+  }
+  img.boxes = clean;
+  meta.updatedAt = Date.now();
+  saveImageDataset(name, meta);
+  res.json({ ok: true, boxCount: clean.length });
+});
+
+// データセットから画像を削除
+app.delete('/ml/image/datasets/:name/images/:imageId', requireAuth, requirePermission('ml:write'), (req, res) => {
+  const { name, imageId } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なデータセット名' });
+  const meta = loadImageDataset(name);
+  if (!meta) return res.status(404).json({ error: 'データセットが見つかりません' });
+  const idx = (meta.images || []).findIndex(im => im.id === imageId);
+  if (idx === -1) return res.status(404).json({ error: '画像が見つかりません' });
+  const [removed] = meta.images.splice(idx, 1);
+  // ファイル削除
+  try { fs.unlinkSync(path.join(IMAGE_DATASETS_DIR, name, 'images', removed.file)); } catch {}
+  meta.updatedAt = Date.now();
+  saveImageDataset(name, meta);
+  res.json({ ok: true });
+});
+
+// YOLO/COCO 形式のアノテーションをインポート
+// body: { format: 'yolo'|'coco', data: <文字列 or オブジェクト>, imageId? }
+// yolo: "classIndex cx cy w h" (正規化座標、1行1box) を imageId に適用
+// coco: COCOフォーマットJSON (images/annotations/categories) を一括適用
+app.post('/ml/image/datasets/:name/import', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const { name } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なデータセット名' });
+  const meta = loadImageDataset(name);
+  if (!meta) return res.status(404).json({ error: 'データセットが見つかりません' });
+
+  const { format, data, imageId, imageWidth, imageHeight } = req.body || {};
+  try {
+    if (format === 'yolo') {
+      // YOLO: imageId 指定の1画像に対して適用 (正規化座標 → ピクセル座標)
+      const img = (meta.images || []).find(im => im.id === imageId);
+      if (!img) return res.status(404).json({ error: 'imageId が必要 (YOLO形式は画像単位)' });
+      if (!imageWidth || !imageHeight) return res.status(400).json({ error: 'imageWidth/imageHeight が必要' });
+      const lines = String(data).trim().split('\n').filter(Boolean);
+      const boxes = [];
+      for (const line of lines) {
+        const [ci, cx, cy, w, h] = line.trim().split(/\s+/).map(Number);
+        if (!Number.isInteger(ci) || ci < 0 || ci >= meta.classes.length) continue;
+        if ([cx, cy, w, h].some(v => !Number.isFinite(v))) continue;
+        // 正規化(中心x,中心y,幅,高さ) → ピクセル(x1,y1,x2,y2)
+        const px1 = (cx - w / 2) * imageWidth;
+        const py1 = (cy - h / 2) * imageHeight;
+        const px2 = (cx + w / 2) * imageWidth;
+        const py2 = (cy + h / 2) * imageHeight;
+        boxes.push({ classIndex: ci, x1: px1, y1: py1, x2: px2, y2: py2 });
+      }
+      img.boxes = boxes;
+      meta.updatedAt = Date.now();
+      saveImageDataset(name, meta);
+      log(ip, `[画像学習] YOLOインポート: ${name}/${imageId} (${boxes.length} boxes)`);
+      return res.json({ ok: true, boxCount: boxes.length });
+    } else if (format === 'coco') {
+      // COCO: ファイル名でマッチングして一括適用
+      const coco = typeof data === 'string' ? JSON.parse(data) : data;
+      const catIdToClassIndex = {};
+      // COCO categories → データセットのクラスインデックスにマッピング (名前一致)
+      for (const cat of coco.categories || []) {
+        const idx = meta.classes.indexOf(cat.name);
+        if (idx !== -1) catIdToClassIndex[cat.id] = idx;
+      }
+      // image_id → ファイル名
+      const imgIdToFile = {};
+      for (const cimg of coco.images || []) imgIdToFile[cimg.id] = cimg.file_name;
+      // ファイル名 → データセットの画像エントリ (originalName で照合)
+      const fileToEntry = {};
+      for (const im of meta.images) fileToEntry[im.originalName] = im;
+
+      let applied = 0;
+      const grouped = {};
+      for (const ann of coco.annotations || []) {
+        const ci = catIdToClassIndex[ann.category_id];
+        if (ci === undefined) continue;
+        const file = imgIdToFile[ann.image_id];
+        const entry = fileToEntry[file];
+        if (!entry) continue;
+        // COCO bbox = [x, y, width, height]
+        const [x, y, w, h] = ann.bbox;
+        if (!grouped[entry.id]) grouped[entry.id] = [];
+        grouped[entry.id].push({ classIndex: ci, x1: x, y1: y, x2: x + w, y2: y + h });
+      }
+      for (const [eid, boxes] of Object.entries(grouped)) {
+        const entry = meta.images.find(im => im.id === eid);
+        if (entry) { entry.boxes = boxes; applied++; }
+      }
+      meta.updatedAt = Date.now();
+      saveImageDataset(name, meta);
+      log(ip, `[画像学習] COCOインポート: ${name} (${applied}画像に適用)`);
+      return res.json({ ok: true, appliedImages: applied });
+    } else {
+      return res.status(400).json({ error: 'format は yolo または coco' });
+    }
+  } catch (e) {
+    res.status(500).json({ error: `インポート失敗: ${e.message}` });
+  }
+});
+
+// ─── 画像学習ジョブ (表データ学習とは別系統) ───
+let currentImageJob = null;  // { jobId, datasetName, modelName, proc, log: [] }
+
+const IMAGE_JOBS_FILE = path.join(ML_DIR, 'image_jobs.json');
+function loadImageJobs() {
+  if (!fs.existsSync(IMAGE_JOBS_FILE)) return [];
+  try { return JSON.parse(fs.readFileSync(IMAGE_JOBS_FILE, 'utf-8')); }
+  catch { return []; }
+}
+function saveImageJobs(jobs) {
+  fs.writeFileSync(IMAGE_JOBS_FILE, JSON.stringify(jobs.slice(0, 50), null, 2), 'utf-8');
+}
+
+// 学習対応のベースモデル
+const IMAGE_TRAIN_BASE_MODELS = [
+  { name: 'fasterrcnn_resnet50_fpn', label: 'Faster R-CNN (ResNet50)', note: '高精度・やや重い' },
+  { name: 'fasterrcnn_mobilenet_v3_large_fpn', label: 'Faster R-CNN (MobileNetV3)', note: '軽量・少量データ向き' },
+  { name: 'scratch', label: '事前学習なし (ゼロから学習)', note: '⚠️ 大量データ・多エポックが必要、少量では精度が出ません' },
+];
+
+app.get('/ml/image/train/models', requireAuth, requirePermission('ml:read'), (req, res) => {
+  res.json({ baseModels: IMAGE_TRAIN_BASE_MODELS });
+});
+
+// カスタムモデル学習を開始
+// body: { datasetName, modelName, baseModel?, epochs?, batchSize?, lr? }
+app.post('/ml/image/train', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  if (currentImageJob) {
+    return res.status(409).json({ error: `既に画像学習中: ${currentImageJob.modelName}` });
+  }
+  const { datasetName, modelName, baseModel, epochs, batchSize, lr } = req.body || {};
+  if (!isValidDatasetName(datasetName)) return res.status(400).json({ error: '無効なデータセット名' });
+  if (!isValidDatasetName(modelName)) return res.status(400).json({ error: 'モデル名は英数字・ハイフン・アンダースコア' });
+
+  const meta = loadImageDataset(datasetName);
+  if (!meta) return res.status(404).json({ error: 'データセットが見つかりません' });
+  const annotated = (meta.images || []).filter(im => (im.boxes || []).length > 0);
+  if (annotated.length === 0) {
+    return res.status(400).json({ error: 'アノテーション済みの画像がありません。矩形を描画してから学習してください' });
+  }
+  const base = (baseModel && IMAGE_TRAIN_BASE_MODELS.some(m => m.name === baseModel))
+    ? baseModel : 'fasterrcnn_resnet50_fpn';
+
+  const datasetDir = path.join(IMAGE_DATASETS_DIR, datasetName);
+  const outputDir = path.join(IMAGE_MODELS_DIR, modelName);
+  const pythonCmd = appConfig.pythonPath || 'python3';
+  const scriptPath = path.join(__dirname, 'image_train.py');
+  if (!fs.existsSync(scriptPath)) return res.status(500).json({ error: 'image_train.py が見つかりません' });
+
+  const jobId = `imgjob_${Date.now()}`;
+  const argv = [
+    scriptPath,
+    '--dataset-dir', datasetDir,
+    '--output-dir', outputDir,
+    '--base-model', base,
+    '--epochs', String(Math.min(Math.max(parseInt(epochs) || 10, 1), 200)),
+    '--batch-size', String(Math.min(Math.max(parseInt(batchSize) || 2, 1), 16)),
+    '--lr', String(typeof lr === 'number' ? lr : 0.005),
+    '--cache-dir', TORCH_CACHE_DIR,
+  ];
+
+  const { spawn } = require('child_process');
+  const proc = spawn(pythonCmd, argv, { cwd: __dirname, env: { ...process.env, PYTHONUNBUFFERED: '1' }, detached: true });
+
+  currentImageJob = { jobId, datasetName, modelName, baseModel: base, proc, log: [], startedAt: Date.now() };
+  log(ip, `[画像学習] 開始: ${modelName} (データセット: ${datasetName}, ${annotated.length}枚, ${base})`);
+
+  proc.stdout.on('data', d => { currentImageJob.log.push(d.toString()); });
+  proc.stderr.on('data', d => {
+    // 進捗バー以外を記録
+    const s = d.toString();
+    if (!/^\s*\d+%\|/.test(s)) currentImageJob.log.push(s);
+  });
+
+  proc.on('close', (code) => {
+    const fullLog = currentImageJob.log.join('');
+    const wasCancelled = currentImageJob.cancelled;  // キャンセルされたか
+    // RESULT_JSON: の行を探して結果を取り出す
+    let result = null;
+    const m = fullLog.match(/RESULT_JSON:(.+)/);
+    if (m) { try { result = JSON.parse(m[1]); } catch {} }
+
+    const jobs = loadImageJobs();
+    jobs.unshift({
+      jobId, datasetName, modelName, baseModel: base,
+      status: wasCancelled ? 'cancelled' : ((code === 0 && result?.status === 'completed') ? 'completed' : 'failed'),
+      finalLoss: result?.finalLoss ?? null,
+      device: result?.device ?? null,
+      note: result?.note ?? null,
+      error: wasCancelled ? null : (result?.error ?? (code !== 0 ? `exit ${code}` : null)),
+      startedAt: currentImageJob.startedAt,
+      finishedAt: Date.now(),
+      log: fullLog.slice(-5000),  // 末尾5000文字だけ保存
+    });
+    saveImageJobs(jobs);
+    log('-', `[画像学習] 終了: ${modelName} (exit ${code}, ${wasCancelled ? 'cancelled' : (result?.status || 'failed')})`);
+    currentImageJob = null;
+  });
+  proc.on('error', (err) => {
+    log('-', `[画像学習] プロセスエラー: ${err.message}`);
+    currentImageJob = null;
+  });
+
+  res.json({ ok: true, jobId });
+});
+
+// 学習ジョブの状態 + ログ
+app.get('/ml/image/train/status', requireAuth, requirePermission('ml:read'), (req, res) => {
+  if (currentImageJob) {
+    return res.json({
+      running: true,
+      jobId: currentImageJob.jobId,
+      modelName: currentImageJob.modelName,
+      datasetName: currentImageJob.datasetName,
+      log: currentImageJob.log.join(''),
+    });
+  }
+  // 直近の完了ジョブ
+  const jobs = loadImageJobs();
+  res.json({ running: false, recentJobs: jobs.slice(0, 10) });
+});
+
+// 学習中ジョブのキャンセル
+app.post('/ml/image/train/cancel', requireAuth, requirePermission('ml:write'), (req, res) => {
+  if (!currentImageJob) return res.status(400).json({ error: '学習中のジョブがありません' });
+  currentImageJob.cancelled = true;  // close ハンドラで cancelled として記録するため
+  const pid = currentImageJob.proc && currentImageJob.proc.pid;
+  // detached なのでプロセスグループ全体を kill (torchの子プロセスごと)
+  if (pid) {
+    try { process.kill(-pid, 'SIGKILL'); }
+    catch { try { currentImageJob.proc.kill('SIGKILL'); } catch {} }
+  }
+  res.json({ ok: true });
+});
+
+// カスタム学習済みモデル一覧
+app.get('/ml/image/custom-models', requireAuth, requirePermission('ml:read'), (req, res) => {
+  try {
+    const models = [];
+    for (const name of fs.readdirSync(IMAGE_MODELS_DIR)) {
+      const cfgPath = path.join(IMAGE_MODELS_DIR, name, 'config.json');
+      const modelPath = path.join(IMAGE_MODELS_DIR, name, 'model.pt');
+      if (fs.existsSync(cfgPath) && fs.existsSync(modelPath)) {
+        try {
+          const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+          let metrics = null;
+          const mpath = path.join(IMAGE_MODELS_DIR, name, 'metrics.json');
+          if (fs.existsSync(mpath)) { try { metrics = JSON.parse(fs.readFileSync(mpath, 'utf-8')); } catch {} }
+          models.push({
+            name,
+            classes: cfg.classes || [],
+            baseModel: cfg.baseModel,
+            datasetName: cfg.datasetName,
+            trainedAt: cfg.trainedAt,
+            finalLoss: metrics?.finalLoss ?? null,
+          });
+        } catch {}
+      }
+    }
+    models.sort((a, b) => (b.trainedAt || 0) - (a.trainedAt || 0));
+    res.json({ models });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// カスタムモデル削除
+app.delete('/ml/image/custom-models/:name', requireAuth, requirePermission('ml:write'), (req, res) => {
+  const { name } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なモデル名' });
+  const dir = path.join(IMAGE_MODELS_DIR, name);
+  if (!fs.existsSync(dir)) return res.status(404).json({ error: 'モデルが見つかりません' });
+  fs.rmSync(dir, { recursive: true, force: true });
+  res.json({ ok: true });
+});
+
+// カスタムモデルを zip でダウンロード
+// model.pt + config.json + metrics.json + predict_example.py + README.txt を固める
+app.get('/ml/image/custom-models/:name/download', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const { name } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なモデル名' });
+  const dir = path.join(IMAGE_MODELS_DIR, name);
+  const cfgPath = path.join(dir, 'config.json');
+  if (!fs.existsSync(cfgPath)) return res.status(404).json({ error: 'モデルが見つかりません' });
+
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8')); }
+  catch { return res.status(500).json({ error: 'config.json の読み込みに失敗' }); }
+
+  // 使い方サンプル (Python) を生成
+  const classesPy = JSON.stringify(cfg.classes || []);
+  const isScratch = cfg.baseModel === 'scratch';
+  const exampleScript = `#!/usr/bin/env python3
+"""
+${name} - OpenGeekLLMChat カスタム物体検出モデルの推論サンプル
+
+必要なパッケージ:
+  pip install torch torchvision pillow
+
+使い方:
+  python predict_example.py <画像ファイル>
+"""
+import sys
+import json
+import torch
+import torchvision
+from torchvision.io import read_image
+from torchvision.transforms.functional import convert_image_dtype
+
+# このモデルの情報 (config.json と同じ)
+CLASSES = ${classesPy}  # 0始まりのクラス名
+BASE_MODEL = ${JSON.stringify(cfg.baseModel || 'fasterrcnn_resnet50_fpn')}
+NUM_CLASSES = len(CLASSES) + 1  # +1 は背景クラス
+THRESHOLD = 0.5
+
+def build_model():
+    from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+    if BASE_MODEL == 'scratch':
+        # 事前学習なしで学習したモデル
+        model = torchvision.models.detection.fasterrcnn_resnet50_fpn(
+            weights=None, weights_backbone=None, num_classes=NUM_CLASSES)
+    else:
+        model_fn = getattr(torchvision.models.detection, BASE_MODEL)
+        model = model_fn(weights=None)
+        in_features = model.roi_heads.box_predictor.cls_score.in_features
+        model.roi_heads.box_predictor = FastRCNNPredictor(in_features, NUM_CLASSES)
+    return model
+
+def main():
+    if len(sys.argv) < 2:
+        print("使い方: python predict_example.py <画像ファイル>")
+        sys.exit(1)
+    image_path = sys.argv[1]
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = build_model()
+    model.load_state_dict(torch.load('model.pt', map_location='cpu'))
+    model.eval().to(device)
+
+    img = read_image(image_path)
+    if img.shape[0] == 1:
+        img = img.repeat(3, 1, 1)
+    elif img.shape[0] == 4:
+        img = img[:3, :, :]
+    img_f = convert_image_dtype(img, dtype=torch.float).to(device)
+
+    with torch.no_grad():
+        out = model([img_f])[0]
+
+    results = []
+    for box, label, score in zip(out['boxes'].tolist(), out['labels'].tolist(), out['scores'].tolist()):
+        if score < THRESHOLD:
+            continue
+        # labelId は 1始まり (背景0) → CLASSES は 0始まり
+        cls_name = CLASSES[label - 1] if 0 <= label - 1 < len(CLASSES) else f"id_{label}"
+        results.append({
+            'label': cls_name,
+            'score': round(score, 3),
+            'box': [round(v, 1) for v in box],
+        })
+    print(json.dumps({'detections': results, 'count': len(results)}, ensure_ascii=False, indent=2))
+
+if __name__ == '__main__':
+    main()
+`;
+
+  const readme = `OpenGeekLLMChat カスタム物体検出モデル: ${name}
+${'='.repeat(50)}
+
+このモデルについて:
+  ベースモデル : ${cfg.baseModel || '-'}${isScratch ? ' (事前学習なし)' : ''}
+  クラス       : ${(cfg.classes || []).join(', ')}
+  学習日時     : ${cfg.trainedAt ? new Date(cfg.trainedAt * 1000).toLocaleString('ja-JP') : '-'}
+
+含まれるファイル:
+  model.pt            学習済みの重み (PyTorch state_dict)
+  config.json         モデル設定 (クラス名・ベースモデル等)
+  metrics.json        学習指標 (loss推移)
+  predict_example.py  推論サンプルスクリプト
+
+使い方:
+  1. pip install torch torchvision pillow
+  2. python predict_example.py 画像.jpg
+
+注意:
+  - これは torchvision の Faster R-CNN 形式の state_dict です。
+  - predict_example.py と同じディレクトリに model.pt を置いてください。
+  - GPU(CUDA/ROCm)があれば自動で使われます。なければCPUで動作します。
+`;
+
+  // メモリ上で zip を生成 (外部コマンド・一時ファイル不要)
+  try {
+    const files = [];
+    files.push({ name: `${name}/model.pt`, data: fs.readFileSync(path.join(dir, 'model.pt')) });
+    files.push({ name: `${name}/config.json`, data: fs.readFileSync(cfgPath) });
+    const metricsPath = path.join(dir, 'metrics.json');
+    if (fs.existsSync(metricsPath)) {
+      files.push({ name: `${name}/metrics.json`, data: fs.readFileSync(metricsPath) });
+    }
+    files.push({ name: `${name}/predict_example.py`, data: Buffer.from(exampleScript, 'utf-8') });
+    files.push({ name: `${name}/README.txt`, data: Buffer.from(readme, 'utf-8') });
+
+    const zipBuf = buildZipBuffer(files);
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${name}.zip"`);
+    res.setHeader('Content-Length', zipBuf.length);
+    res.end(zipBuf);
+  } catch (e) {
+    log(getIP(req), `[画像学習] モデルDL失敗: ${name} - ${e.message}`);
+    if (!res.headersSent) res.status(500).json({ error: `zip生成に失敗: ${e.message}` });
+  }
+});
+
 function runMlPredict(modelName, features) {
   return new Promise((resolve, reject) => {
     if (!isValidModelName(modelName)) return reject(new Error('無効なモデル名'));
@@ -4666,11 +5606,9 @@ app.get('/rag/documents', requireAuth, requirePermission('ml:read'), (req, res) 
   res.json({ documents: idx.documents });
 });
 
-// uploads のファイルを RAG 登録
-// body: { filename: "manual.txt" }  または { filenames: ["a.txt", "b.md"] }
-app.post('/rag/documents', requireAuth, requirePermission('ml:write'), jsonParser, async (req, res) => {
-  const ip = getIP(req);
-  // 事前チェック: embedding が利用可能か
+// RAG系エンドポイント用: embedding が利用可能かチェックするミドルウェア
+// 利用不可なら 503 を返して後続に進ませない (各ハンドラでの重複チェックを排除)
+function requireEmbedding(req, res, next) {
   const emb = isEmbeddingAvailable();
   if (!emb.available) {
     return res.status(503).json({
@@ -4678,6 +5616,13 @@ app.post('/rag/documents', requireAuth, requirePermission('ml:write'), jsonParse
       embeddingAvailable: false,
     });
   }
+  next();
+}
+
+// uploads のファイルを RAG 登録
+// body: { filename: "manual.txt" }  または { filenames: ["a.txt", "b.md"] }
+app.post('/rag/documents', requireAuth, requirePermission('ml:write'), requireEmbedding, jsonParser, async (req, res) => {
+  const ip = getIP(req);
   const { filename, filenames } = req.body || {};
   const targets = filenames || (filename ? [filename] : []);
   if (targets.length === 0) {
@@ -4698,7 +5643,7 @@ app.post('/rag/documents', requireAuth, requirePermission('ml:write'), jsonParse
   res.json({ ingested: results, errors, count: results.length });
 });
 
-// RAG ドキュメント削除
+// RAG ドキュメント削除 (embedding不要: ファイル削除のみ)
 app.delete('/rag/documents/:docId', requireAuth, requirePermission('ml:write'), (req, res) => {
   const docId = req.params.docId;
   if (!/^[a-f0-9]{16}$/.test(docId)) return res.status(400).json({ error: '無効なdocId' });
@@ -4711,14 +5656,7 @@ app.delete('/rag/documents/:docId', requireAuth, requirePermission('ml:write'), 
 });
 
 // RAG 検索 (テスト用、agent_proxy も内部でこれと同じ ragSearch を使う)
-app.post('/rag/search', requireAuth, requirePermission('ml:read'), jsonParser, async (req, res) => {
-  const emb = isEmbeddingAvailable();
-  if (!emb.available) {
-    return res.status(503).json({
-      error: `RAG検索はembeddingサーバーが必要です。${emb.reason}`,
-      embeddingAvailable: false,
-    });
-  }
+app.post('/rag/search', requireAuth, requirePermission('ml:read'), requireEmbedding, jsonParser, async (req, res) => {
   const { query, topK } = req.body || {};
   if (!query) return res.status(400).json({ error: 'query が必要です' });
   try {

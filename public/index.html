@@ -707,9 +707,25 @@ function App() {
   // embedding (RAG用) が利用可能か
   const [apiEmbeddingAvailable, setApiEmbeddingAvailable] = useState(true);
   const [apiEmbeddingReason, setApiEmbeddingReason] = useState('');
+  // 永続RAG (サーバー側 ml/rag/) の状態
+  // embedding 利用可能 + 登録ドキュメント数 > 0 のとき、通常チャットでも自動的に
+  // search_persistent_documents ツールが追加される
+  const [persistentRagAvailable, setPersistentRagAvailable] = useState(false);
+  const [persistentRagDocCount, setPersistentRagDocCount] = useState(0);
+  const [persistentRagDocNames, setPersistentRagDocNames] = useState([]);
   const [apiBusy, setApiBusy] = useState(false);
   const [tokenSpeed, setTokenSpeed] = useState(null); // { tokPerSec, totalTokens }
   const tokenHistoryRef = useRef([]); // [{ tokens, durationNs }]
+
+  // 永続RAGの登録ドキュメント名を「a, b, c など N件」形式に要約する共通ヘルパー
+  // ツール定義の description と、ツール判断プロンプトの toolList で共用
+  function summarizePersistentRagDocs(maxShow = 10) {
+    const shown = persistentRagDocNames.slice(0, maxShow).join(', ');
+    return persistentRagDocNames.length > maxShow
+      ? `${shown} など${persistentRagDocCount}件`
+      : shown;
+  }
+
   // URLパスからチャットIDを取得（例: /chat/abc123 → "abc123"）
   function getChatIdFromUrl() {
     const m = window.location.pathname.match(/^\/chat\/([a-z0-9]+)$/i);
@@ -1161,7 +1177,28 @@ function App() {
               parameters: {
                 type: 'object',
                 properties: {
-                  query: { type: 'string', description: '検索クエリ（質問の核心を簡潔に。ファイル名そのものではなく、内容に関するキーワード）' }
+                  query: { type: 'string', description: '検索クエリ(質問の核心を簡潔に。ファイル名そのものではなく、内容に関するキーワード)' }
+                },
+                required: ['query']
+              }
+            }
+          });
+        }
+
+        // 永続RAG (サーバー側 ml/rag/ に登録済みのドキュメント)
+        // チャット添付ドキュメントとは独立した恒久的な知識ベース
+        // embedding 利用可能 + 登録ドキュメント数 > 0 のとき自動的にツールを追加
+        if (persistentRagAvailable && persistentRagDocCount > 0) {
+          const docSummary = summarizePersistentRagDocs(10);
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'search_persistent_documents',
+              description: `サーバーに恒久的に登録済みのRAGドキュメント (${docSummary}) から、embedding ベクトル類似度で関連箇所を検索する。社内文書・マニュアル・ポリシー・FAQ・ナレッジベース等、チャット添付ではなくサーバー側に保管された資料を参照するためのツール。テキストで関数呼び出しを書くのではなく、必ず実際のtool_callとして呼び出すこと。`,
+              parameters: {
+                type: 'object',
+                properties: {
+                  query: { type: 'string', description: '検索したい内容・キーワード (質問の核心を簡潔に)' }
                 },
                 required: ['query']
               }
@@ -1181,6 +1218,24 @@ function App() {
                   query: { type: 'string', description: '検索クエリ（簡潔で具体的に）' }
                 },
                 required: ['query']
+              }
+            }
+          });
+        }
+
+        // 物体検出ツール: 画像が添付されていて、かつ ML 機能が有効な時のみ提供
+        // 「何が写ってる」「物体検出」「画像を分析」等の質問で LLM が呼ぶ
+        if (hasImages && appConfig.ml?.enabled) {
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'detect_objects',
+              description: '添付された画像に対して物体検出を実行し、写っている物体 (人・車・動物・家具・食べ物など80種類) とその位置・個数を取得する。「何が写っているか」「物体を検出」「画像を分析」のような質問で使う。torchvision の COCO 事前学習モデルを使用。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  threshold: { type: 'number', description: '信頼度しきい値 (0〜1、デフォルト0.5)。低くすると多く検出、高くすると確実なものだけ' }
+                }
               }
             }
           });
@@ -1502,8 +1557,15 @@ function App() {
         if (documents.length > 0) {
           toolListLines.push(`- search_documents: チャット添付済みドキュメント (${docList}) から検索 ★「資料」「ドキュメント」「添付」関連の質問では最優先`);
         }
+        if (persistentRagAvailable && persistentRagDocCount > 0) {
+          const persistentSummary = summarizePersistentRagDocs(5);
+          toolListLines.push(`- search_persistent_documents: サーバー登録済みドキュメント (${persistentSummary}) から検索 ★社内文書・マニュアル・FAQ等の参照に使う`);
+        }
         if (webSearchActive) {
           toolListLines.push('- web_search: インターネット検索（最新情報が必要な場合）');
+        }
+        if (hasImages && appConfig.ml?.enabled) {
+          toolListLines.push('- detect_objects: 添付画像の物体検出（「何が写ってる」「物体を検出」「画像を分析」等で使う）');
         }
         if (appConfig.fileAccess !== false && wantsServerFileOps) {
           if (wantsFileWrite) {
@@ -1641,7 +1703,7 @@ function App() {
           }
           // パターン2: Python関数呼び出し形式 funcname(query='...')
           if ((!assistantMsg?.tool_calls || assistantMsg.tool_calls.length === 0) && assistantMsg?.content) {
-            const textCallMatch = assistantMsg.content.match(/(search_documents|web_search|read_file|list_files|write_file)\s*\(\s*([^)]*)\)/);
+            const textCallMatch = assistantMsg.content.match(/(search_documents|search_persistent_documents|web_search|read_file|list_files|write_file)\s*\(\s*([^)]*)\)/);
             if (textCallMatch) {
               const fname = textCallMatch[1];
               const argsStr = textCallMatch[2];
@@ -1833,6 +1895,118 @@ function App() {
                 ? results.map((c, i) => `[資料${i + 1}: ${c.docName}]\n${c.chunk}`).join('\n\n')
                 : '関連する資料が見つかりませんでした。';
               apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: resultText });
+
+            } else if (fnName === 'search_persistent_documents') {
+              // 永続RAG: サーバー側 ml/rag/ に登録済みのドキュメントから embedding 検索
+              const query = fnArgs.query || text;
+              searchQueries.push({ query: `永続RAG検索: ${query}`, resultCount: null, type: 'rag' });
+
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = {
+                  ...copy[copy.length - 1],
+                  agentStatus: `📚 永続RAG検索「${query}」中...`,
+                  searchQueries: [...searchQueries],
+                };
+                return copy;
+              });
+
+              let ragResults = [];
+              let ragError = null;
+              try {
+                const res = await fetch('/rag/search', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ query, topK: 5 }),
+                });
+                if (res.ok) {
+                  const data = await res.json();
+                  ragResults = data.results || [];
+                } else {
+                  const data = await res.json().catch(() => ({}));
+                  ragError = data.error || `HTTP ${res.status}`;
+                }
+              } catch (e) {
+                ragError = e.message;
+              }
+              searchQueries[searchQueries.length - 1].resultCount = ragResults.length;
+
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = {
+                  ...copy[copy.length - 1],
+                  agentStatus: null,
+                  searchQueries: [...searchQueries],
+                };
+                return copy;
+              });
+
+              let ragResultText;
+              if (ragError) {
+                ragResultText = `永続RAG検索エラー: ${ragError}`;
+              } else if (ragResults.length === 0) {
+                ragResultText = 'サーバー登録ドキュメントから関連する情報は見つかりませんでした。';
+              } else {
+                ragResultText = ragResults.map((r, i) =>
+                  `[サーバー資料${i + 1}: ${r.filename} (スコア: ${r.score.toFixed(3)})]\n${r.text}`
+                ).join('\n\n');
+              }
+              apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: ragResultText });
+
+            } else if (fnName === 'detect_objects') {
+              // 添付画像の物体検出 (Phase 1 の /ml/image/detect を再利用)
+              const th = typeof fnArgs.threshold === 'number' ? fnArgs.threshold : 0.5;
+              searchQueries.push({ query: '画像の物体検出', resultCount: null, type: 'image' });
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: '🖼️ 画像の物体検出中...', searchQueries: [...searchQueries] };
+                return copy;
+              });
+
+              let detectText;
+              try {
+                if (!pendingImages || pendingImages.length === 0) {
+                  detectText = '画像が添付されていません。物体検出には画像の添付が必要です。';
+                } else {
+                  // 最初の画像を検出対象にする
+                  const img0 = pendingImages[0];
+                  const dataUrl = img0.base64.startsWith('data:')
+                    ? img0.base64
+                    : `data:image/png;base64,${img0.base64}`;
+                  const res = await fetch('/ml/image/detect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image: dataUrl, threshold: th }),
+                  });
+                  const data = await res.json();
+                  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+                  if (data.count === 0) {
+                    detectText = `物体は検出されませんでした (しきい値 ${th})。画像サイズ: ${data.imageWidth}×${data.imageHeight}`;
+                  } else {
+                    // クラス別に集計
+                    const summary = {};
+                    data.detections.forEach(d => { summary[d.label] = (summary[d.label] || 0) + 1; });
+                    const summaryText = Object.entries(summary)
+                      .map(([cls, n]) => `${cls} × ${n}`).join('、');
+                    // 詳細 (上位10件)
+                    const detailText = data.detections.slice(0, 10).map((d, i) =>
+                      `${i + 1}. ${d.label} (信頼度 ${(d.score * 100).toFixed(0)}%, 位置 [${Math.round(d.box.x1)},${Math.round(d.box.y1)}]-[${Math.round(d.box.x2)},${Math.round(d.box.y2)}])`
+                    ).join('\n');
+                    detectText = `検出結果 (${data.count}個): ${summaryText}\n\n詳細:\n${detailText}\n\n画像サイズ: ${data.imageWidth}×${data.imageHeight}、使用デバイス: ${data.device}`;
+                  }
+                  searchQueries[searchQueries.length - 1].resultCount = data.count;
+                }
+              } catch (e) {
+                detectText = `物体検出エラー: ${e.message}`;
+              }
+
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: null, searchQueries: [...searchQueries] };
+                return copy;
+              });
+              apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: detectText });
 
             } else if (fnName === 'web_search') {
               const query = fnArgs.query || text;
@@ -2957,14 +3131,45 @@ function App() {
         const data = await r2.json();
         setApiHttpsAvailable(!!data.available);
       }
+      let embeddingAvailable = false;
       if (r3.ok) {
         const data = await r3.json();
-        setApiEmbeddingAvailable(!!data.available);
+        embeddingAvailable = !!data.available;
+        setApiEmbeddingAvailable(embeddingAvailable);
         setApiEmbeddingReason(data.reason || '');
         // 利用不可ならツール選択から rag を自動的に外す
-        if (!data.available) {
+        if (!embeddingAvailable) {
           setApiFormTools(prev => prev.filter(t => t !== 'rag'));
         }
+      }
+      return { embeddingAvailable };
+    } catch {
+      return { embeddingAvailable: false };
+    }
+  }
+
+  // 永続RAG (サーバー側 ml/rag/) の利用可否と登録ドキュメント数を確認
+  // embedding が利用可能 + 登録ドキュメント > 0 のとき、通常チャットでも
+  // search_persistent_documents ツールが自動的にLLMに提供される
+  // embeddingAvailable は loadExternalServers から渡される (重複fetch回避)
+  async function loadPersistentRagInfo(embeddingAvailable) {
+    try {
+      // embedding が使えないなら RAG ドキュメントの取得自体スキップ
+      if (!embeddingAvailable) {
+        setPersistentRagAvailable(false);
+        setPersistentRagDocCount(0);
+        setPersistentRagDocNames([]);
+        return;
+      }
+      const docRes = await fetch('/rag/documents');
+      const docs = docRes.ok ? await docRes.json() : { documents: [] };
+      const list = docs.documents || [];
+      const available = list.length > 0;
+      setPersistentRagAvailable(available);
+      setPersistentRagDocCount(list.length);
+      setPersistentRagDocNames(list.map(d => d.filename));
+      if (available) {
+        console.log(`[永続RAG] 利用可能: ${list.length}件 (${list.map(d => d.filename).join(', ')})`);
       }
     } catch {}
   }
@@ -3718,10 +3923,13 @@ ${conversationText}
   const settingsLoadedRef = useRef(false);
   useEffect(() => {
     if (!authenticated) return;
-    // 並行: チャット履歴・ファイル一覧・外部APIサーバー一覧・設定
+    // 並行: チャット履歴・ファイル一覧・外部APIサーバー一覧・設定・永続RAG情報
     loadChatList();
     loadFileList();
-    loadExternalServers();
+    // 外部APIサーバー情報を取得 → embedding 可否を永続RAG判定に渡す (fetch重複回避)
+    loadExternalServers().then(({ embeddingAvailable }) => {
+      loadPersistentRagInfo(embeddingAvailable);
+    });
     // URLに chat ID があればそのチャットを読み込み（失敗したらルートへリダイレクト）
     const urlId = getChatIdFromUrl();
     if (urlId) {
@@ -4162,6 +4370,21 @@ ${conversationText}
                 <button className="doc-remove" onClick={() => { setDocuments(prev => prev.filter((_, j) => j !== i)); messagesDirtyRef.current = true; }}>×</button>
               </div>
             ))}
+            {persistentRagAvailable && persistentRagDocCount > 0 && (
+              <div
+                className="doc-item"
+                style={{ background: 'var(--accent-dim, rgba(124,77,255,0.08))', cursor: 'help' }}
+                title={`サーバーに登録済みのRAGドキュメント (${persistentRagDocCount}件): ${persistentRagDocNames.join(', ')}\nLLMが自動的にこれらを検索します`}
+              >
+                <div className="doc-info">
+                  <div className="doc-icon">📚</div>
+                  <div className="doc-meta">
+                    <div className="doc-name">永続RAG (サーバー登録)</div>
+                    <div className="doc-stats">{persistentRagDocCount}件のドキュメントを自動検索</div>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </div>
         <a
