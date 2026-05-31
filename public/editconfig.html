@@ -44,6 +44,7 @@ function App() {
   const [view, setView] = useState('text'); // 'text' | 'tree'
   const [restartInfo, setRestartInfo] = useState(null);  // {isSystemd, pid, uptime}
   const [restarting, setRestarting] = useState(false);   // 再起動中フラグ
+  const [restartDone, setRestartDone] = useState(false); // 再起動完了(手動リロードボタン表示用)
   const textareaRef = useRef(null);
 
   // 認証チェック
@@ -124,7 +125,7 @@ function App() {
     } else {
       if (!confirm('OpenGeekLLMChat 本体を再起動します。\n\n- 進行中のチャット・ストリーミングは中断されます\n- 外部APIサーバーも全て一時停止します\n- 数秒以内に自動復活します\n\n続行しますか？')) return;
     }
-    setRestarting(true); setError(''); setSuccess('');
+    setRestarting(true); setError(''); setSuccess(''); setRestartDone(false);
     try {
       const r = await fetch('/restart', { method: 'POST' });
       const data = await r.json();
@@ -153,10 +154,12 @@ function App() {
           if (data.uptime != null && data.uptime < 30) {
             consecutiveOk++;
             if (consecutiveOk >= 2) {
-              setSuccess(`✓ 再起動完了（PID: ${data.pid}, uptime: ${data.uptime.toFixed(1)}秒）`);
+              setSuccess(`✓ 再起動完了（PID: ${data.pid}）。最新の状態に更新するため3秒後にページを再読み込みします…`);
               setRestartInfo(data);
               setRestarting(false);
-              setTimeout(() => setSuccess(''), 5000);
+              setRestartDone(true);  // 手動リロードボタンを表示
+              // 自動リロード (新しいJS/HTMLを確実に読み込むため)
+              setTimeout(() => { window.location.reload(); }, 3000);
               return;
             }
           }
@@ -359,7 +362,16 @@ function App() {
         </div>
 
         {error && <div className="message error">⚠ {error}</div>}
-        {success && <div className="message success">✓ {success}</div>}
+        {success && (
+          <div className="message success">
+            ✓ {success}
+            {restartDone && (
+              <button className="btn" style={{ marginLeft: 12 }} onClick={() => window.location.reload()}>
+                🔄 今すぐ再読み込み
+              </button>
+            )}
+          </div>
+        )}
         {parseError && view === 'text' && (
           <div className="message warning">JSON構文エラー: {parseError}</div>
         )}

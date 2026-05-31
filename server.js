@@ -3162,7 +3162,10 @@ app.post('/restart', requireAuth, (req, res) => {
     console.log('[RESTART] Exiting now for systemd to restart...');
     // 外部APIサーバーも停止しておく（自動でやってくれるが念のため）
     try { stopAllExternalServers(); } catch {}
-    process.exit(0);
+    // 注意: exit code は非ゼロ(1)にする。
+    // systemd の Restart=on-failure 設定だと exit 0 (正常終了) では再起動されない。
+    // 1 にしておけば Restart=always / on-failure のどちらでも確実に再起動する。
+    process.exit(1);
   }, 1500);
 });
 
