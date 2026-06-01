@@ -468,11 +468,35 @@ function DatasetManager({ datasets, onReload, onReloadDataset, onSelect, showToa
     }
   }
 
+  // クライアント側で対応外形式を事前判定する (TIFF/HEIC等はブラウザで表示できないため拒否)
+  // 拡張子 + MIMEタイプの両方をチェック (ブラウザによっては MIME が空のことがある)
+  const SUPPORTED_EXTS_RE = /\.(jpg|jpeg|png|bmp|webp)$/i;
+  const UNSUPPORTED_EXTS_RE = /\.(tif|tiff|heic|heif|raw|cr2|nef|arw|dng|gif)$/i;
+  function checkImageFile(file) {
+    const name = file.name || '';
+    if (UNSUPPORTED_EXTS_RE.test(name)) {
+      return `${name}: ${name.match(/\.([^.]+)$/)?.[1]?.toUpperCase() || 'この形式'} はブラウザで表示できないため非対応 (JPEG/PNGに変換してください)`;
+    }
+    if (!SUPPORTED_EXTS_RE.test(name)) {
+      // 拡張子が分からない場合も MIME で許可されたもののみ受ける
+      if (!file.type || !/image\/(jpeg|png|bmp|webp)/.test(file.type)) {
+        return `${name}: 対応していない形式です (JPEG / PNG / BMP / WebP のみ)`;
+      }
+    }
+    return null;  // OK
+  }
+
   async function addImages(name, files) {
     if (!files || files.length === 0) return;
     const images = [];
+    const skipped = [];
     for (const file of files) {
-      if (!file.type.startsWith('image/')) continue;
+      if (!file.type.startsWith('image/') && !SUPPORTED_EXTS_RE.test(file.name)) {
+        skipped.push(`${file.name}: 画像ファイルではありません`);
+        continue;
+      }
+      const err = checkImageFile(file);
+      if (err) { skipped.push(err); continue; }
       const data = await new Promise(resolve => {
         const reader = new FileReader();
         reader.onload = () => resolve(reader.result);
@@ -480,7 +504,14 @@ function DatasetManager({ datasets, onReload, onReloadDataset, onSelect, showToa
       });
       images.push({ name: file.name, data });
     }
-    if (images.length === 0) { showToast('画像ファイルがありません'); return; }
+    if (skipped.length > 0) {
+      // 最初の理由だけトーストで通知 (件数も)
+      showToast(`${skipped.length}件スキップ: ${skipped[0]}`);
+    }
+    if (images.length === 0) {
+      if (skipped.length === 0) showToast('画像ファイルがありません');
+      return;
+    }
     try {
       const res = await fetch(`/ml/image/datasets/${name}/images`, {
         method: 'POST',
@@ -530,7 +561,7 @@ function DatasetManager({ datasets, onReload, onReloadDataset, onSelect, showToa
             <div className="dataset-card-actions">
               <label className="btn small">
                 画像追加
-                <input type="file" accept="image/*" multiple style={{ display: 'none' }}
+                <input type="file" accept="image/jpeg,image/png,image/bmp,image/webp,.jpg,.jpeg,.png,.bmp,.webp" multiple style={{ display: 'none' }}
                   onChange={e => addImages(ds.name, Array.from(e.target.files))} />
               </label>
               <button className="btn small primary" onClick={() => onSelect(ds.name)}>✏️ アノテーション</button>
@@ -735,12 +766,52 @@ function AnnotateView({ datasetName, dataset, onReload, onBack, showToast }) {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [currentIdx, images.length, drawing, saving, boxes]);
 
+  // 画像を1枚削除 (アノテーションも一緒に削除される)
+  async function deleteImage(im, idx) {
+    const imName = im.originalName || im.file;
+    const hasBoxes = (im.boxes || []).length > 0 || (idx === currentIdx && boxes.length > 0);
+    const msg = hasBoxes
+      ? `画像「${imName}」を削除しますか?\nアノテーションも一緒に削除されます。`
+      : `画像「${imName}」を削除しますか?`;
+    if (!confirm(msg)) return;
+    try {
+      const res = await fetch(`/ml/image/datasets/${datasetName}/images/${im.id}`, { method: 'DELETE' });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error);
+      showToast(`画像を削除しました`);
+      // 削除した画像が現在表示中なら、安全な位置にカーソル移動
+      if (idx === currentIdx) {
+        const newLen = images.length - 1;
+        const nextIdx = idx >= newLen ? Math.max(0, newLen - 1) : idx;
+        setCurrentIdx(nextIdx);
+        setBoxes([]);  // 一旦空に (reloadで上書きされる)
+        setDrawing(null);
+      } else if (idx < currentIdx) {
+        // 削除した位置が現在より前なら、インデックスを1つ戻す (同じ画像を見続けるため)
+        setCurrentIdx(currentIdx - 1);
+      }
+      onReload();
+    } catch (e) {
+      showToast(`削除失敗: ${e.message}`);
+    }
+  }
+
   // アノテーション画面から直接画像を追加 (空データセットでもここで足せる)
   async function addImagesHere(files) {
     if (!files || files.length === 0) return;
+    // 対応外形式 (TIFF/HEIC等) は事前に拒否
+    const SUPPORTED = /\.(jpg|jpeg|png|bmp|webp)$/i;
+    const UNSUPPORTED = /\.(tif|tiff|heic|heif|raw|cr2|nef|arw|dng|gif)$/i;
     const imgs = [];
+    const skipped = [];
     for (const file of files) {
-      if (!file.type.startsWith('image/')) continue;
+      const name = file.name || '';
+      if (UNSUPPORTED.test(name)) {
+        skipped.push(`${name}: 非対応形式`); continue;
+      }
+      if (!SUPPORTED.test(name) && !/image\/(jpeg|png|bmp|webp)/.test(file.type || '')) {
+        skipped.push(`${name}: 画像ファイルではありません`); continue;
+      }
       const data = await new Promise(resolve => {
         const reader = new FileReader();
         reader.onload = () => resolve(reader.result);
@@ -748,7 +819,11 @@ function AnnotateView({ datasetName, dataset, onReload, onBack, showToast }) {
       });
       imgs.push({ name: file.name, data });
     }
-    if (imgs.length === 0) { showToast('画像ファイルがありません'); return; }
+    if (skipped.length > 0) showToast(`${skipped.length}件スキップ: ${skipped[0]}`);
+    if (imgs.length === 0) {
+      if (skipped.length === 0) showToast('画像ファイルがありません');
+      return;
+    }
     try {
       const res = await fetch(`/ml/image/datasets/${datasetName}/images`, {
         method: 'POST',
@@ -775,7 +850,7 @@ function AnnotateView({ datasetName, dataset, onReload, onBack, showToast }) {
           <div>このデータセットには画像がありません。</div>
           <label className="btn primary">
             📁 画像を追加
-            <input type="file" accept="image/*" multiple style={{ display: 'none' }}
+            <input type="file" accept="image/jpeg,image/png,image/bmp,image/webp,.jpg,.jpeg,.png,.bmp,.webp" multiple style={{ display: 'none' }}
               onChange={e => addImagesHere(Array.from(e.target.files))} />
           </label>
         </div>
@@ -807,7 +882,7 @@ function AnnotateView({ datasetName, dataset, onReload, onBack, showToast }) {
           <button className="btn small" onClick={() => gotoImage(currentIdx + 1)} disabled={currentIdx === images.length - 1}>次 ▶</button>
           <label className="btn small">
             ＋画像
-            <input type="file" accept="image/*" multiple style={{ display: 'none' }}
+            <input type="file" accept="image/jpeg,image/png,image/bmp,image/webp,.jpg,.jpeg,.png,.bmp,.webp" multiple style={{ display: 'none' }}
               onChange={e => addImagesHere(Array.from(e.target.files))} />
           </label>
         </div>
@@ -884,6 +959,9 @@ function AnnotateView({ datasetName, dataset, onReload, onBack, showToast }) {
                 <img src={`/ml/image/datasets/${datasetName}/images/${im.file}`} alt={`img${i}`} loading="lazy" />
                 <span className={`annotate-thumb-badge ${boxCount > 0 ? 'has-box' : ''}`}>{boxCount}</span>
                 <span className="annotate-thumb-idx">{i + 1}</span>
+                <button className="annotate-thumb-delete"
+                  onClick={(e) => { e.stopPropagation(); deleteImage(im, i); }}
+                  title="この画像を削除">×</button>
               </div>
             );
           })}
@@ -939,6 +1017,7 @@ function ImageTrainRunner({ datasets, onReload, showToast }) {
   const [trainLog, setTrainLog] = useState('');
   const [recentJobs, setRecentJobs] = useState([]);
   const [customModels, setCustomModels] = useState([]);
+  const [downloading, setDownloading] = useState(null);  // ダウンロード中のモデル名
   const pollRef = useRef(null);
 
   useEffect(() => {
@@ -1018,13 +1097,16 @@ function ImageTrainRunner({ datasets, onReload, showToast }) {
 
   // モデルを zip でダウンロード (認証付き fetch → blob → 保存)
   async function downloadModel(name) {
-    showToast('ダウンロードを準備中...');
+    setDownloading(name);
+    showToast('ダウンロードを準備中... (モデルサイズによっては数十秒かかります)');
     try {
       const res = await fetch(`/ml/image/custom-models/${name}/download`);
       if (!res.ok) {
         const d = await res.json().catch(() => ({}));
         throw new Error(d.error || `HTTP ${res.status}`);
       }
+      // Content-Length があれば進捗表示の参考に
+      const len = res.headers.get('Content-Length');
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -1034,9 +1116,12 @@ function ImageTrainRunner({ datasets, onReload, showToast }) {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      showToast('ダウンロードしました');
+      const sizeMb = (blob.size / 1024 / 1024).toFixed(1);
+      showToast(`ダウンロードしました (${sizeMb} MB)`);
     } catch (e) {
       showToast(`ダウンロード失敗: ${e.message}`);
+    } finally {
+      setDownloading(null);
     }
   }
 
@@ -1109,7 +1194,9 @@ function ImageTrainRunner({ datasets, onReload, showToast }) {
                 </div>
               </div>
               <div className="dataset-card-actions">
-                <button className="btn small" onClick={() => downloadModel(m.name)}>⬇ ダウンロード</button>
+                <button className="btn small" onClick={() => downloadModel(m.name)} disabled={downloading === m.name}>
+                  {downloading === m.name ? '⏳ 準備中…' : '⬇ ダウンロード'}
+                </button>
                 <button className="btn small danger" onClick={() => deleteModel(m.name)}>削除</button>
               </div>
             </div>
@@ -1288,7 +1375,7 @@ function ImageDetectView({ showToast }) {
             onChange={e => setThreshold(parseFloat(e.target.value))} className="image-detect-slider" />
         </div>
         <div className="image-detect-row">
-          <input type="file" accept="image/*" onChange={onFileSelect} className="image-detect-file" />
+          <input type="file" accept="image/jpeg,image/png,image/bmp,image/webp,.jpg,.jpeg,.png,.bmp,.webp" onChange={onFileSelect} className="image-detect-file" />
           <button className="btn primary" onClick={runDetect} disabled={!imageDataUrl || detecting}>
             {detecting ? '🔍 検出中...' : '🔍 物体検出を実行'}
           </button>

@@ -19,6 +19,9 @@
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<!-- PDF.js v3 (PDFテキスト抽出用、約1MB、初回PDF読込時のみダウンロードされる)
+     注意: cdnjs では v4系 は配信されていないため v3.11.174 (UMD形式、pdfjsLib グローバル提供) を使う -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script type="text/babel">
 const { useState, useRef, useEffect, useCallback } = React;
 
@@ -58,6 +61,41 @@ function cosineSim(a, b) {
     nb += b[i] * b[i];
   }
   return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-10);
+}
+
+// ─── PDFテキスト抽出 (PDF.js, OCR済みPDFのテキストレイヤーから抽出) ───
+// 大きいPDFでもページ単位で逐次処理するためメモリ効率が良い
+// onProgress(currentPage, totalPages) で進捗を通知
+async function extractPdfText(file, onProgress) {
+  if (typeof pdfjsLib === 'undefined') {
+    throw new Error('PDF.jsの読み込みに失敗しました (CDN https://cdnjs.cloudflare.com にアクセスできない可能性があります)');
+  }
+  // PDF.js の worker を指定 (同じバージョンのCDNを使う)
+  if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  }
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const parts = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    if (onProgress) onProgress(i, pdf.numPages);
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    // テキストアイテムを順番に連結 (PDF構造上の自然な順序)
+    const pageText = content.items.map(it => it.str).join(' ');
+    if (pageText.trim()) {
+      parts.push(`[Page ${i}]\n${pageText}`);
+    }
+    // メモリ解放
+    page.cleanup();
+  }
+  await pdf.destroy();
+  const fullText = parts.join('\n\n');
+  if (!fullText.trim()) {
+    throw new Error('PDFからテキストを抽出できませんでした。スキャン画像のみで OCR されていない可能性があります');
+  }
+  return fullText;
 }
 
 // ─── Marked.js 設定 ───
@@ -2913,6 +2951,23 @@ function App() {
           setChatImages(prev => [...prev, { name: file.name, base64, preview: dataUrl }]);
         };
         reader.readAsDataURL(file);
+      } else if (file.type === 'application/pdf' || /\.pdf$/i.test(file.name)) {
+        // PDF: PDF.js でテキスト抽出してから RAG に登録
+        // OCR済みのPDF (テキストレイヤー付き) なら正しく抽出できる。
+        // 大きいPDFはページ単位で処理されるのでメモリ効率も良い。
+        (async () => {
+          try {
+            setLoadingMessage(`PDFを解析中: ${file.name}`);
+            const text = await extractPdfText(file, (cur, total) => {
+              setLoadingMessage(`PDFを解析中: ${file.name} (${cur}/${total}ページ)`);
+            });
+            setLoadingMessage('');
+            addDocument(file.name, text);
+          } catch (e) {
+            setLoadingMessage('');
+            setError(`PDF解析失敗 (${file.name}): ${e.message}`);
+          }
+        })();
       } else {
         const reader = new FileReader();
         reader.onload = (e) => {
@@ -4339,7 +4394,7 @@ ${conversationText}
                 <div className="docs-empty-text">
                   ファイルをここにドロップ
                 </div>
-                <div className="docs-empty-sub">txt, md, csv, json, コードファイル, 画像 対応</div>
+                <div className="docs-empty-sub">txt, md, csv, json, コードファイル, PDF, 画像 対応</div>
               </div>
             )}
             {embeddingJobs.map((job) => (

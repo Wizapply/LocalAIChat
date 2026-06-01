@@ -4595,10 +4595,20 @@ function buildZipBuffer(files) {
     const nameBuf = Buffer.from(f.name, 'utf-8');
     const raw = Buffer.isBuffer(f.data) ? f.data : Buffer.from(f.data, 'utf-8');
     const crc = crc32(raw);
-    // 圧縮を試みて、縮まらなければ STORE
-    let comp = zlib.deflateRawSync(raw);
-    let method = 8;  // DEFLATE
-    if (comp.length >= raw.length) { comp = raw; method = 0; }  // STORE
+    // 圧縮判定:
+    //  - f.store === true が指定されていれば圧縮しない (model.pt 等、既に縮まないバイナリ)
+    //  - 8MB超のファイルは圧縮スキップ (deflateRawSync が大きいファイルで重く、
+    //    Node のメインスレッドをブロックして他リクエストが詰まる)
+    //  - それ以外は圧縮してみて、縮まなければ STORE にフォールバック
+    let comp, method;
+    const STORE_THRESHOLD = 8 * 1024 * 1024;
+    if (f.store === true || raw.length > STORE_THRESHOLD) {
+      comp = raw; method = 0;  // STORE (無圧縮)
+    } else {
+      comp = zlib.deflateRawSync(raw);
+      method = 8;  // DEFLATE
+      if (comp.length >= raw.length) { comp = raw; method = 0; }  // STORE
+    }
 
     // ローカルファイルヘッダ
     const lh = Buffer.alloc(30);
@@ -4668,7 +4678,7 @@ const IMAGE_DETECT_MODELS = [
 const IMAGE_DETECT_MODEL_NAMES = IMAGE_DETECT_MODELS.map(m => m.name);
 
 // 画像物体検出を実行 (base64画像 → 一時ファイル → image_detect.py)
-function runImageDetect(imageBase64, modelName, threshold, customModelName) {
+function runImageDetect(imageBase64, modelName, threshold, customModelName, opts) {
   return new Promise((resolve, reject) => {
     const isCustom = !!customModelName;
     if (isCustom) {
@@ -4914,14 +4924,56 @@ app.post('/ml/image/datasets/:name/images', requireAuth, requirePermission('ml:w
   if (!fs.existsSync(imagesDir)) fs.mkdirSync(imagesDir, { recursive: true });
   const added = [];
   const errors = [];
+
+  // ブラウザで表示でき、かつ torchvision でも安定して読める形式に限定する
+  // (TIFF / RAW / HEIC 等はブラウザの <img> タグで表示できないため拒否)
+  // 拡張子だけでなく、ファイル先頭バイナリ(マジックバイト)でも検証して
+  // 拡張子を偽装したファイルも弾く。
+  const SUPPORTED_EXTS = ['.jpg', '.jpeg', '.png', '.bmp', '.webp'];
+  const detectImageType = (buf) => {
+    if (!buf || buf.length < 12) return null;
+    // JPEG: FF D8 FF
+    if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'jpg';
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return 'png';
+    // BMP: 42 4D
+    if (buf[0] === 0x42 && buf[1] === 0x4D) return 'bmp';
+    // WebP: "RIFF" + 4byte size + "WEBP"
+    if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+        buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return 'webp';
+    // TIFF (拒否対象): 49 49 2A 00 (little-endian) または 4D 4D 00 2A (big-endian)
+    if ((buf[0] === 0x49 && buf[1] === 0x49 && buf[2] === 0x2A && buf[3] === 0x00) ||
+        (buf[0] === 0x4D && buf[1] === 0x4D && buf[2] === 0x00 && buf[3] === 0x2A)) return 'tiff';
+    // GIF: "GIF8"
+    if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'gif';
+    // HEIC: 4〜11バイト目に "ftypheic" 等
+    if (buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) return 'heic';
+    return null;
+  };
+
   for (const im of images) {
     try {
       const b64 = String(im.data || '').replace(/^data:image\/[a-zA-Z+]+;base64,/, '');
       const buf = Buffer.from(b64, 'base64');
       if (buf.length === 0) throw new Error('画像データが空');
       if (buf.length > MAX_FILE_SIZE) throw new Error('画像が大きすぎます');
-      // 安全なファイル名生成
-      const ext = (im.name && path.extname(im.name).toLowerCase().match(/\.(jpg|jpeg|png|bmp|webp)/)) ? path.extname(im.name).toLowerCase() : '.jpg';
+
+      // マジックバイトで実際の形式を判定 (拡張子偽装の防止)
+      const detected = detectImageType(buf);
+      if (!detected) {
+        throw new Error('画像として認識できません');
+      }
+      if (detected === 'tiff') {
+        throw new Error('TIFF はブラウザで表示できないため非対応です (JPEG / PNG に変換してください)');
+      }
+      if (detected === 'heic') {
+        throw new Error('HEIC はブラウザで表示できないため非対応です (JPEG / PNG に変換してください)');
+      }
+      if (detected === 'gif') {
+        throw new Error('GIF は学習に向かないため非対応です (JPEG / PNG に変換してください)');
+      }
+      // 拡張子は実際の形式に合わせる (元ファイル名が偽装でも安全な拡張子で保存)
+      const ext = detected === 'jpg' ? '.jpg' : `.${detected}`;
       const imgId = `img_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
       const fileName = `${imgId}${ext}`;
       fs.writeFileSync(path.join(imagesDir, fileName), buf);
@@ -4934,7 +4986,7 @@ app.post('/ml/image/datasets/:name/images', requireAuth, requirePermission('ml:w
   }
   meta.updatedAt = Date.now();
   saveImageDataset(name, meta);
-  log(ip, `[画像学習] ${name} に画像追加: ${added.length}件`);
+  log(ip, `[画像学習] ${name} に画像追加: ${added.length}件 (失敗: ${errors.length})`);
   res.json({ ok: true, added, errors });
 });
 
@@ -5371,7 +5423,9 @@ ${'='.repeat(50)}
   // メモリ上で zip を生成 (外部コマンド・一時ファイル不要)
   try {
     const files = [];
-    files.push({ name: `${name}/model.pt`, data: fs.readFileSync(path.join(dir, 'model.pt')) });
+    // model.pt は torch の state_dict で内部的に既に圧縮済み。DEFLATE しても縮まず
+    // 圧縮処理だけが重いので store: true で無圧縮指定する。
+    files.push({ name: `${name}/model.pt`, data: fs.readFileSync(path.join(dir, 'model.pt')), store: true });
     files.push({ name: `${name}/config.json`, data: fs.readFileSync(cfgPath) });
     const metricsPath = path.join(dir, 'metrics.json');
     if (fs.existsSync(metricsPath)) {
@@ -5380,7 +5434,10 @@ ${'='.repeat(50)}
     files.push({ name: `${name}/predict_example.py`, data: Buffer.from(exampleScript, 'utf-8') });
     files.push({ name: `${name}/README.txt`, data: Buffer.from(readme, 'utf-8') });
 
+    log(getIP(req), `[画像学習] モデルDL開始: ${name}`);
+    const t0 = Date.now();
     const zipBuf = buildZipBuffer(files);
+    log(getIP(req), `[画像学習] モデルDL zip生成: ${name} (${(zipBuf.length / 1024 / 1024).toFixed(1)}MB, ${Date.now() - t0}ms)`);
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="${name}.zip"`);
     res.setHeader('Content-Length', zipBuf.length);

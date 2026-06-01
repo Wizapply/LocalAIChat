@@ -68,6 +68,10 @@ def main():
     parser.add_argument('--device', default=None, help='cuda / cpu (省略時は自動)')
     parser.add_argument('--cache-dir', default=None, help='モデルweightのキャッシュ先 (書き込み可能なディレクトリ)')
     parser.add_argument('--custom-model-dir', default=None, help='カスタム学習済みモデルのディレクトリ (config.json + model.pt)')
+    parser.add_argument('--nms-iou', type=float, default=None,
+                        help='重複抑制(NMS)のIoU閾値。小さいほど重複を厳しく削除 (例: 0.2)。省略時はモデル既定値')
+    parser.add_argument('--max-per-class', type=int, default=None,
+                        help='クラスごとの最大検出数。信頼度の高い順に絞る (例: 顔1, 目2 など固定数なら有効)')
     args = parser.parse_args()
 
     # torch / torchvision は重みダウンロード時に「Downloading: ...」を stdout に
@@ -164,6 +168,18 @@ def main():
             base_model = model_fn(weights=weights, progress=False)
             base_model.eval()
 
+        # NMS (重複抑制) のIoU閾値を上書き (小さいほど重複矩形を厳しく削除)
+        # 目のような小さく密集した対象では 0.2〜0.3 が有効。デフォルトは 0.5。
+        # Faster R-CNN / RetinaNet / SSD で属性名が異なるので、存在するものに設定する。
+        if args.nms_iou is not None:
+            try:
+                if hasattr(base_model, 'roi_heads') and hasattr(base_model.roi_heads, 'nms_thresh'):
+                    base_model.roi_heads.nms_thresh = float(args.nms_iou)  # Faster R-CNN
+                elif hasattr(base_model, 'nms_thresh'):
+                    base_model.nms_thresh = float(args.nms_iou)  # RetinaNet / SSD
+            except Exception:
+                pass
+
         # 画像読み込み (RGB に正規化)
         img = read_image(args.image)
         if img.shape[0] == 1:
@@ -249,6 +265,20 @@ def main():
                     'x2': round(float(x2), 1), 'y2': round(float(y2), 1),
                 },
             })
+
+        # 既に torchvision の出力は信頼度の降順だが、念のため score でソートしてから
+        # クラスごとに最大検出数で打ち切る (顔1個・目2個など固定数の対象に有効)
+        if args.max_per_class is not None and args.max_per_class > 0:
+            detections.sort(key=lambda d: d['score'], reverse=True)
+            seen_per_class = {}
+            kept = []
+            for d in detections:
+                cls = d['label']
+                n = seen_per_class.get(cls, 0)
+                if n < args.max_per_class:
+                    kept.append(d)
+                    seen_per_class[cls] = n + 1
+            detections = kept
 
         # スコア降順
         detections.sort(key=lambda d: d['score'], reverse=True)
